@@ -1,0 +1,1037 @@
+//! 端到端冒烟测试：
+//! - 插件导入/启停在临时 DSH_HOME 上往返（不碰真实 ~/.dsh）
+
+use std::path::Path;
+
+/// 插件管理：临时 DSH_HOME + 构造 profile，验证列表/启停/移除（纯文件层，不跑 CLI）。
+#[test]
+fn plugin_management_roundtrip_temp_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let profiles = tmp.path().join("profiles");
+    let web = profiles.join("web");
+    std::fs::create_dir_all(&web).unwrap();
+    // package.json（web profile 形态）
+    std::fs::write(
+        web.join("package.json"),
+        serde_json::json!({
+            "name": "dsh-profile-web",
+            "private": true,
+            "dependencies": {
+                "@deepseek-ai/dsh-base": "0.1.0-rc.6",
+                "@deepseek-ai/dsh-web-app": "0.1.0-rc.6"
+            },
+            "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"] } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // cordis.patch.yml 空数组
+    std::fs::write(
+        web.join("cordis.patch.yml"),
+        "[]
+",
+    )
+    .unwrap();
+    std::fs::write(
+        web.join("cordis.yml"),
+        "[]
+",
+    )
+    .unwrap();
+
+    // 列表
+    let plugins = dsh_desktop::dsh::plugins::list_plugins(&web).unwrap();
+    assert_eq!(plugins.len(), 2);
+    let base = plugins
+        .iter()
+        .find(|p| p.name == "@deepseek-ai/dsh-base")
+        .unwrap();
+    assert!(base.is_bundle);
+    assert!(!base.disabled);
+
+    // 禁用 -> 列表反映
+    dsh_desktop::dsh::plugins::set_plugin_enabled(&web, "@deepseek-ai/dsh-base", false).unwrap();
+    let plugins = dsh_desktop::dsh::plugins::list_plugins(&web).unwrap();
+    assert!(
+        plugins
+            .iter()
+            .find(|p| p.name == "@deepseek-ai/dsh-base")
+            .unwrap()
+            .disabled
+    );
+
+    // 重新启用
+    dsh_desktop::dsh::plugins::set_plugin_enabled(&web, "@deepseek-ai/dsh-base", true).unwrap();
+    let plugins = dsh_desktop::dsh::plugins::list_plugins(&web).unwrap();
+    assert!(
+        !plugins
+            .iter()
+            .find(|p| p.name == "@deepseek-ai/dsh-base")
+            .unwrap()
+            .disabled
+    );
+
+    // 移除依赖
+    dsh_desktop::dsh::profile::remove_dependency(&web, "@deepseek-ai/dsh-web-app").unwrap();
+    let plugins = dsh_desktop::dsh::plugins::list_plugins(&web).unwrap();
+    assert_eq!(plugins.len(), 1);
+    assert!(Path::new(&web.join("cordis.patch.yml")).exists());
+}
+
+/// config：默认 DSH_HOME 解析与保存往返。
+#[test]
+fn config_roundtrip() {
+    let cfg = dsh_desktop::config::AppConfig::default();
+    assert!(
+        cfg.dsh_home.to_string_lossy().contains(".dsh")
+            || cfg.dsh_home.to_string_lossy().contains("dsh")
+    );
+    // shell 探测至少返回一个候选
+    assert!(!cfg.resolved_shell().is_empty());
+}
+
+/// 引擎：创建会话 → 发送消息（无 API key 时优雅报错，不 panic）。
+#[test]
+fn engine_create_session_and_error_path() {
+    use dsh_desktop::core::settings::EngineSettings;
+    use dsh_desktop::core::{DshEngine, EngineEvent};
+    // 隔离：指向不存在的 DSH_HOME，避免读到真实 credentials
+    std::env::set_var(
+        "DSH_HOME",
+        tempfile::tempdir().unwrap().path().to_str().unwrap(),
+    );
+    let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = None;
+    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    // 无 key 且无 DSH credentials → new 应成功（UI 可用），但发送时应报明确错误
+    let mut engine = DshEngine::new(settings, tx).expect("无 key 也应能创建引擎");
+    let sid = engine.create_session(None).unwrap();
+    let send = engine.send_message(&sid, "hi");
+    assert!(send.is_err(), "无 API key 时发送应报错");
+    assert!(send.unwrap_err().to_string().contains("API key"));
+}
+
+/// 引擎：带假 key 时能创建会话并列出。
+#[test]
+fn engine_session_crud() {
+    use dsh_desktop::core::settings::EngineSettings;
+    use dsh_desktop::core::{DshEngine, EngineEvent};
+    let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = Some("sk-test".into());
+    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let mut engine = DshEngine::new(settings, tx).expect("engine");
+    let id = engine.create_session(Some("测试会话")).unwrap();
+    // 打开并确认标题
+    let s = engine.open_session(&id).unwrap();
+    assert_eq!(s.title, "测试会话");
+    // 列出
+    let list = engine.list_sessions();
+    assert!(list.iter().any(|s| s.session_id == id));
+    let _ = rx;
+}
+
+/// 工作区：打开目录 → 会话绑定 cwd → 工具根目录切换。
+#[test]
+fn workspace_open_and_bind_session() {
+    use dsh_desktop::core::settings::EngineSettings;
+    use dsh_desktop::core::{DshEngine, EngineEvent};
+    use std::path::PathBuf;
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = None;
+    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let mut engine = DshEngine::new(settings, tx).expect("engine");
+
+    // 未设置时无工作区
+    assert!(engine.workspace_root().is_none());
+
+    // 打开工作区（带 .. 的路径应规范化）
+    let messy = dir.path().join("sub/../");
+    std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+    let opened = engine.set_workspace(&messy).expect("open workspace");
+    let expected = dsh_desktop::core::workspace::WorkspaceManager::strip_unc_prefix(
+        &dir.path().canonicalize().unwrap(),
+    );
+    assert_eq!(
+        PathBuf::from(&opened),
+        expected.clone(),
+        "set_workspace 应返回规范化路径（无 UNC 前缀）"
+    );
+    assert_eq!(
+        engine.workspace_root().map(|p| p.to_path_buf()),
+        Some(expected.clone())
+    );
+
+    // 新会话自动绑定工作区
+    let sid = engine.create_session(None).unwrap();
+    let s = engine.open_session(&sid).unwrap();
+    assert_eq!(
+        s.cwd.as_deref(),
+        Some(expected.as_path()),
+        "会话应绑定工作区 cwd"
+    );
+
+    // 不存在目录拒绝
+    let err = engine
+        .set_workspace(std::path::Path::new("C:/definitely/not/exist/xyz"))
+        .expect_err("不存在目录应失败");
+    assert!(!err.is_empty());
+
+    // 显式 cwd 覆盖工作区
+    let other = tempfile::tempdir().unwrap();
+    let sid2 = engine
+        .create_session_with_cwd(Some("手工绑定"), Some(other.path().to_path_buf()))
+        .unwrap();
+    let s2 = engine.open_session(&sid2).unwrap();
+    assert_eq!(s2.cwd.as_deref(), Some(other.path()));
+}
+
+/// Agent 预设：创建带预设的会话 → 重放恢复 → 切换。
+#[test]
+fn preset_sessions_created_restored_switched() {
+    use dsh_desktop::core::preset::AgentPreset;
+    use dsh_desktop::core::settings::EngineSettings;
+    use dsh_desktop::core::{DshEngine, EngineEvent};
+    let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = None;
+    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let data_dir = settings.data_dir.clone();
+    let mut engine = DshEngine::new(settings, tx).expect("engine");
+
+    // 默认标准模式
+    let sid = engine.create_session(Some("默认")).unwrap();
+    assert_eq!(
+        engine.open_session(&sid).unwrap().preset,
+        AgentPreset::Standard
+    );
+
+    // 显式 PTC
+    let sid2 = engine
+        .create_session_full(Some("PTC"), None, AgentPreset::Ptc)
+        .unwrap();
+    assert_eq!(engine.open_session(&sid2).unwrap().preset, AgentPreset::Ptc);
+
+    // 切换 → 极简
+    engine
+        .set_session_preset(&sid, AgentPreset::Minimal)
+        .expect("switch preset");
+    assert_eq!(
+        engine.open_session(&sid).unwrap().preset,
+        AgentPreset::Minimal
+    );
+
+    // 重放恢复：新引擎实例读同一 data_dir
+    let mut settings2 = EngineSettings::default();
+    settings2.api_key = None;
+    settings2.data_dir = data_dir;
+    let (tx2, _rx2) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut engine2 = DshEngine::new(settings2, tx2).expect("engine2");
+    assert_eq!(
+        engine2.open_session(&sid2).unwrap().preset,
+        AgentPreset::Ptc,
+        "重放后 preset 应恢复"
+    );
+}
+
+/// Agent 预设：工具目录随预设过滤（minimal 仅 3 个，PTC 含 run_code）。
+#[test]
+fn preset_tool_catalog_filtering() {
+    use dsh_desktop::core::preset::AgentPreset;
+    use dsh_desktop::core::tools::ToolRegistry;
+    use std::path::PathBuf;
+
+    let full = ToolRegistry::new(PathBuf::from(".")).tool_specs();
+    assert!(
+        full.len() >= 10,
+        "标准模式工具集应完整，实际 {}",
+        full.len()
+    );
+    assert!(!full.iter().any(|s| s.function.name == "run_code"));
+
+    let minimal = ToolRegistry::new(PathBuf::from("."))
+        .with_preset(AgentPreset::Minimal)
+        .tool_specs();
+    let names: Vec<_> = minimal.iter().map(|s| s.function.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["bash", "pwsh", "str_replace_editor"],
+        "极简模式只应有双工具 + 平台 shell"
+    );
+
+    let ptc = ToolRegistry::new(PathBuf::from("."))
+        .with_preset(AgentPreset::Ptc)
+        .tool_specs();
+    assert!(
+        ptc.iter().any(|s| s.function.name == "run_code"),
+        "PTC 模式应提供 run_code"
+    );
+    assert!(ptc.len() >= full.len(), "PTC 应包含标准全部工具 + run_code");
+}
+
+/// 回归：tool 消息必须紧跟带 tool_calls 的 assistant 消息（OpenAI 兼容 400 修复）。
+#[test]
+fn tool_messages_pair_with_assistant_tool_calls() {
+    use dsh_desktop::core::llm::{LlmClient, LlmRole};
+    use dsh_desktop::core::session::{FunctionCall, Message, ToolCall};
+    // 模拟 run_turn 一轮工具调用后的消息序列
+    let messages = vec![
+        Message::User {
+            content: "读文件".into(),
+        },
+        Message::Assistant {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"a.txt"}"#.into(),
+                },
+            }],
+        },
+        Message::Tool {
+            tool_call_id: "call_1".into(),
+            content: "文件内容".into(),
+        },
+    ];
+    let llm_msgs = LlmClient::to_llm_messages(&messages);
+    // assistant 必须携带 tool_calls
+    assert_eq!(llm_msgs[1].role, LlmRole::Assistant);
+    let tcs = llm_msgs[1]
+        .tool_calls
+        .as_ref()
+        .expect("assistant 消息必须带 tool_calls");
+    assert_eq!(tcs[0].id, "call_1");
+    // 纯工具调用回合：content 为空 → 必须为 null（OpenAI 兼容）
+    assert!(llm_msgs[1].content.is_none(), "空 content 应为 None");
+    // tool 消息配对
+    assert_eq!(llm_msgs[2].role, LlmRole::Tool);
+    assert_eq!(llm_msgs[2].tool_call_id.as_deref(), Some("call_1"));
+    // 序列化形状检查
+    let json = serde_json::to_value(&llm_msgs).unwrap();
+    assert_eq!(json[1]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(json[1]["tool_calls"][0]["function"]["name"], "read_file");
+}
+
+/// 回归：存储重放后 assistant.tool_calls 恢复（跨重启不再 400）。
+#[test]
+fn storage_replay_restores_assistant_tool_calls() {
+    use dsh_desktop::core::session::types;
+    use dsh_desktop::core::storage::SessionStore;
+    use dsh_desktop::core::{Message, SessionEvent};
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+    store
+        .append(
+            "t",
+            &SessionEvent::new(
+                types::USER_MESSAGE,
+                Some(serde_json::json!({"content": "hi"})),
+            ),
+        )
+        .unwrap();
+    store
+        .append(
+            "t",
+            &SessionEvent::new(
+                types::ASSISTANT_MESSAGE,
+                Some(serde_json::json!({
+                    "content": "",
+                    "reasoning_content": "",
+                    "tool_calls": [{"id":"call_9","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo hi\"}"}}],
+                })),
+            ),
+        )
+        .unwrap();
+    store
+        .append(
+            "t",
+            &SessionEvent::new(
+                types::TOOL_RESULT,
+                Some(serde_json::json!({"ok": true, "value": {}, "stderr": ""})),
+            ),
+        )
+        .unwrap();
+    let s = store.load_session("t").unwrap();
+    assert_eq!(s.messages.len(), 2);
+    match &s.messages[1] {
+        Message::Assistant { tool_calls, .. } => {
+            assert_eq!(tool_calls.len(), 1, "重放后应恢复 tool_calls");
+            assert_eq!(tool_calls[0].id, "call_9");
+            assert_eq!(tool_calls[0].function.name, "bash");
+        }
+        _ => panic!("第 2 条应为 assistant"),
+    }
+}
+
+/// 回归：重放后 tool/result 投影为 Tool 消息（修复 400 insufficient tool messages）。
+#[test]
+fn storage_replay_projects_tool_messages() {
+    use dsh_desktop::core::session::types;
+    use dsh_desktop::core::storage::SessionStore;
+    use dsh_desktop::core::{Message, SessionEvent};
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+    store
+        .append(
+            "t",
+            &SessionEvent::new(
+                types::USER_MESSAGE,
+                Some(serde_json::json!({"content": "hi"})),
+            ),
+        )
+        .unwrap();
+    store
+        .append(
+            "t",
+            &SessionEvent::new(
+                types::ASSISTANT_MESSAGE,
+                Some(serde_json::json!({
+                    "content": "",
+                    "reasoning_content": "",
+                    "tool_calls": [{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo hi\"}"}}],
+                })),
+            ),
+        )
+        .unwrap();
+    store
+        .append(
+            "t",
+            &SessionEvent::new(
+                types::TOOL_CALL,
+                Some(serde_json::json!({"call_id": "call_1", "name": "bash", "arguments": "{\"command\":\"echo hi\"}"})),
+            ),
+        )
+        .unwrap();
+    store
+        .append(
+            "t",
+            &SessionEvent::new(
+                types::TOOL_RESULT,
+                Some(serde_json::json!({"ok": true, "value": {"output": "hi"}, "stderr": ""})),
+            ),
+        )
+        .unwrap();
+    store
+        .append(
+            "t",
+            &SessionEvent::new(
+                types::ASSISTANT_MESSAGE,
+                Some(serde_json::json!({"content": "done", "reasoning_content": "", "tool_calls": []})),
+            ),
+        )
+        .unwrap();
+    let s = store.load_session("t").unwrap();
+    // user + assistant(tool_calls) + tool + assistant
+    assert_eq!(s.messages.len(), 4, "重放应含 Tool 消息: {:?}", s.messages);
+    match &s.messages[2] {
+        Message::Tool {
+            tool_call_id,
+            content,
+        } => {
+            assert_eq!(tool_call_id, "call_1", "tool 消息应配对 call_1");
+            assert!(
+                content.contains("hi"),
+                "tool 消息内容应来自 tool/result: {content}"
+            );
+        }
+        other => panic!("第 3 条应为 Tool 消息: {other:?}"),
+    }
+}
+
+/// 回归：to_llm_messages 防御裁剪（未响应尾部 / 用户打断 / 孤立 tool）。
+#[test]
+fn llm_messages_trim_unpaired_tool_calls() {
+    use dsh_desktop::core::llm::{LlmClient, LlmRole};
+    use dsh_desktop::core::session::{FunctionCall, Message, ToolCall};
+    let tc = |id: &str| ToolCall {
+        id: id.into(),
+        call_type: "function".into(),
+        function: FunctionCall {
+            name: "bash".into(),
+            arguments: "{}".into(),
+        },
+    };
+    // 1) 尾部未响应：assistant{tool_calls:[A]} 后无 tool →
+    //    裁剪后成为空壳（无 content 无 tool_calls）→ 整条移除（避免 400）
+    let msgs = vec![
+        Message::User {
+            content: "u".into(),
+        },
+        Message::Assistant {
+            content: String::new(),
+            tool_calls: vec![tc("call_a")],
+        },
+    ];
+    let out = LlmClient::to_llm_messages(&msgs);
+    assert_eq!(
+        out.len(),
+        1,
+        "空壳 assistant（无 content 无 tool_calls）应被移除，避免 API 400: {out:?}"
+    );
+    assert!(
+        out.iter().all(|m| m.role == LlmRole::User),
+        "剩余消息应只有 user: {out:?}"
+    );
+    // 2) 用户打断：assistant{tool_calls:[A]} + user → 前一条 assistant 裁剪为空壳 → 移除
+    let msgs = vec![
+        Message::User {
+            content: "u".into(),
+        },
+        Message::Assistant {
+            content: String::new(),
+            tool_calls: vec![tc("call_a")],
+        },
+        Message::User {
+            content: "打断".into(),
+        },
+    ];
+    let out = LlmClient::to_llm_messages(&msgs);
+    assert_eq!(
+        out.len(),
+        2,
+        "被打断的空壳 assistant 应移除（只剩 2 条 user）: {out:?}"
+    );
+    assert!(
+        out.iter().all(|m| m.role == LlmRole::User),
+        "不应存在空壳 assistant: {out:?}"
+    );
+    // 3) 孤立 tool：无对应 assistant tool_calls → 丢弃
+    let msgs = vec![
+        Message::User {
+            content: "u".into(),
+        },
+        Message::Tool {
+            tool_call_id: "call_orphan".into(),
+            content: "x".into(),
+        },
+    ];
+    let out = LlmClient::to_llm_messages(&msgs);
+    assert_eq!(out.len(), 1, "孤立 tool 消息应被丢弃");
+    // 4) 正常序列不受影响：assistant{tool_calls:[A,B]} + tool[A] + tool[B] 完整保留
+    let msgs = vec![
+        Message::User {
+            content: "u".into(),
+        },
+        Message::Assistant {
+            content: String::new(),
+            tool_calls: vec![tc("call_a"), tc("call_b")],
+        },
+        Message::Tool {
+            tool_call_id: "call_a".into(),
+            content: "ra".into(),
+        },
+        Message::Tool {
+            tool_call_id: "call_b".into(),
+            content: "rb".into(),
+        },
+    ];
+    let out = LlmClient::to_llm_messages(&msgs);
+    assert_eq!(out.len(), 4);
+    assert_eq!(out[1].tool_calls.as_ref().unwrap().len(), 2);
+    assert_eq!(out[3].tool_call_id.as_deref(), Some("call_b"));
+}
+
+/// 复现：切预设后再发送必须正常（用户反馈：切到创造模式后输入消息无反应）。
+#[test]
+fn send_after_preset_switch_works() {
+    use dsh_desktop::core::preset::AgentPreset;
+    use dsh_desktop::core::settings::EngineSettings;
+    use dsh_desktop::core::{DshEngine, EngineEvent};
+    let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = Some("sk-test".into());
+    settings.base_url = "http://127.0.0.1:1".into(); // 回合快速失败（连接拒绝）
+    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let mut engine = DshEngine::new(settings, tx).expect("engine");
+    let sid = engine.create_session(Some("测试")).unwrap();
+
+    // 第一次发送（回合后台失败并收尾复位）
+    engine.send_message(&sid, "first").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert!(!engine.open_session(&sid).unwrap().running);
+
+    // 切预设（用户操作：切到创造模式）
+    engine
+        .set_session_preset(&sid, AgentPreset::Cordis)
+        .unwrap();
+    assert_eq!(
+        engine.open_session(&sid).unwrap().preset,
+        AgentPreset::Cordis
+    );
+
+    // 第二次发送：不得报 already running / session not open
+    engine
+        .send_message(&sid, "second")
+        .expect("切预设后发送不应失败");
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let s = engine.open_session(&sid).unwrap();
+    assert!(!s.running, "第二回合结束应复位");
+    assert_eq!(s.preset, AgentPreset::Cordis, "预设应保持");
+    let _ = rx;
+}
+
+/// 回归：发送失败后 running 必须复位（第二次发送不再报 already running）。
+#[test]
+fn send_failure_does_not_stick_running() {
+    use dsh_desktop::core::settings::EngineSettings;
+    use dsh_desktop::core::{DshEngine, EngineEvent};
+    let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = Some("sk-test".into());
+    settings.base_url = "http://127.0.0.1:1".into(); // 连接立即失败
+    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let mut engine = DshEngine::new(settings, tx).expect("engine");
+    let sid = engine.create_session(None).unwrap();
+    // 第一次发送：回合在后台失败（连接拒绝）→ 收尾必须复位 running
+    engine.send_message(&sid, "hi").expect("send 应接受");
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let s = engine.open_session(&sid).unwrap();
+    assert!(
+        !s.running,
+        "LLM 失败后 running 应复位，实际 {:?}",
+        s.running
+    );
+    // 第二次发送：不得报 already running
+    engine
+        .send_message(&sid, "hello again")
+        .expect("第二次发送不应报 already running");
+}
+
+/// 回归：无 API key 发送失败不得污染会话状态（消息不入栈、running 不变）。
+#[test]
+fn no_key_does_not_pollute_state() {
+    use dsh_desktop::core::settings::EngineSettings;
+    use dsh_desktop::core::{DshEngine, EngineEvent};
+    let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = None;
+    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let mut engine = DshEngine::new(settings, tx).expect("engine");
+    let sid = engine.create_session(None).unwrap();
+    let err = engine.send_message(&sid, "x").unwrap_err();
+    assert!(err.to_string().contains("API key"));
+    let s = engine.open_session(&sid).unwrap();
+    assert!(!s.running, "无 key 失败后 running 不应为 true");
+    assert_eq!(s.messages.len(), 0, "无 key 时用户消息不应入栈");
+    // 再次发送仍报 key 错误（不是 already running）
+    let err2 = engine.send_message(&sid, "y").unwrap_err();
+    assert!(err2.to_string().contains("API key"));
+}
+
+/// 回归：部分响应的 tool_calls 裁剪后不产生孤儿 tool 消息（避免 400）。
+#[test]
+fn llm_messages_partial_response_no_orphans() {
+    use dsh_desktop::core::llm::{LlmClient, LlmRole};
+    use dsh_desktop::core::session::{FunctionCall, Message, ToolCall};
+    let tc = |id: &str| ToolCall {
+        id: id.into(),
+        call_type: "function".into(),
+        function: FunctionCall {
+            name: "bash".into(),
+            arguments: "{}".into(),
+        },
+    };
+    // assistant 声明 [A,B]，只响应了 A，然后用户打断
+    let msgs = vec![
+        Message::User {
+            content: "u".into(),
+        },
+        Message::Assistant {
+            content: String::new(),
+            tool_calls: vec![tc("call_a"), tc("call_b")],
+        },
+        Message::Tool {
+            tool_call_id: "call_a".into(),
+            content: "ra".into(),
+        },
+        Message::User {
+            content: "打断".into(),
+        },
+    ];
+    let out = LlmClient::to_llm_messages(&msgs);
+    assert_eq!(out.len(), 4, "user + assistant + tool + user");
+    // assistant 只保留已响应的 A
+    let tcs = out[1]
+        .tool_calls
+        .as_ref()
+        .expect("应保留已响应的 tool_calls");
+    assert_eq!(tcs.len(), 1);
+    assert_eq!(tcs[0].id, "call_a");
+    // tool[A] 保留且与 assistant 配对（非孤儿）
+    assert_eq!(out[2].role, LlmRole::Tool);
+    assert_eq!(out[2].tool_call_id.as_deref(), Some("call_a"));
+}
+
+/// 默认模式：新建会话默认标准模式；修改引擎默认后新建继承。
+#[test]
+fn default_preset_is_standard_and_configurable() {
+    use dsh_desktop::core::preset::AgentPreset;
+    use dsh_desktop::core::settings::EngineSettings;
+    use dsh_desktop::core::{DshEngine, EngineEvent};
+    let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = None;
+    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let mut engine = DshEngine::new(settings, tx).expect("engine");
+
+    // 默认 = 标准模式
+    assert_eq!(engine.default_preset(), AgentPreset::Standard);
+    let sid = engine.create_session(None).unwrap();
+    assert_eq!(
+        engine.open_session(&sid).unwrap().preset,
+        AgentPreset::Standard,
+        "新建会话应默认标准模式"
+    );
+
+    // 修改引擎默认 → 新建继承
+    engine.set_default_preset(AgentPreset::Ptc);
+    let sid2 = engine.create_session(None).unwrap();
+    assert_eq!(
+        engine.open_session(&sid2).unwrap().preset,
+        AgentPreset::Ptc,
+        "修改默认预设后新建会话应继承"
+    );
+
+    // 已存在会话不受影响
+    assert_eq!(
+        engine.open_session(&sid).unwrap().preset,
+        AgentPreset::Standard
+    );
+
+    // 无效配置回退标准模式
+    let mut settings2 = EngineSettings::default();
+    settings2.api_key = None;
+    settings2.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings2.default_preset = "bogus".into();
+    let (tx2, _rx2) = std::sync::mpsc::channel::<EngineEvent>();
+    let engine2 = DshEngine::new(settings2, tx2).expect("engine2");
+    assert_eq!(engine2.default_preset(), AgentPreset::Standard);
+}
+
+/// run_code：一次组合多步（写文件 + 读文件 + 替换），全部成功并汇总。
+#[test]
+fn run_code_combines_steps() {
+    use dsh_desktop::core::preset::AgentPreset;
+    use dsh_desktop::core::tools::ToolRegistry;
+    use serde_json::json;
+
+    let dir = tempfile::tempdir().unwrap();
+    let reg = ToolRegistry::new(dir.path().to_path_buf()).with_preset(AgentPreset::Ptc);
+    let file = dir.path().join("hello.txt");
+    let out = reg.dispatch(
+        "run_code",
+        &json!({"steps": [
+            {"op": "write_file", "path": "hello.txt", "content": "hello world"},
+            {"op": "read_file", "path": "hello.txt"},
+            {"op": "str_replace_editor", "command": "str_replace", "path": "hello.txt", "old_str": "world", "new_str": "rust"},
+            {"op": "read_file", "path": "hello.txt"},
+        ]}),
+    );
+    assert!(out.ok, "run_code 应成功: {}", out.value);
+    let results = out.value.get("results").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(results.len(), 4);
+    for (i, r) in results.iter().enumerate() {
+        assert_eq!(r["ok"], true, "step {i} 应成功: {r}");
+    }
+    let content = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(content, "hello rust");
+
+    // minimal 下 run_code 不可用
+    let reg2 = ToolRegistry::new(dir.path().to_path_buf()).with_preset(AgentPreset::Minimal);
+    let denied = reg2.dispatch("run_code", &json!({"steps": []}));
+    assert!(!denied.ok, "minimal 不应有 run_code");
+    let denied2 = reg2.dispatch("read_file", &json!({"path": "x"}));
+    assert!(!denied2.ok, "minimal 不应有 read_file");
+}
+
+/// 工作区：canonicalize 拒绝文件路径。
+#[test]
+fn workspace_rejects_file() {
+    use dsh_desktop::core::workspace::WorkspaceManager;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a.txt");
+    std::fs::write(&file, "x").unwrap();
+    let mut mgr = WorkspaceManager::default();
+    let err = mgr.open(&file).expect_err("文件不是目录");
+    assert!(!err.is_empty());
+}
+
+/// 桥：start_bridge 能拿到端口。
+#[test]
+fn bridge_starts() {
+    use dsh_desktop::bridge::start_bridge;
+    use dsh_desktop::core::settings::EngineSettings;
+    use dsh_desktop::core::{DshEngine, EngineEvent};
+    let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = Some("sk-test".into());
+    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let engine = std::sync::Arc::new(std::sync::Mutex::new(
+        DshEngine::new(settings, tx).expect("engine"),
+    ));
+    let port = start_bridge(engine).expect("bridge start");
+    assert!(port > 0);
+}
+
+/// 工具：bash echo 与 read/write 文件往返。
+#[test]
+fn tools_bash_and_fs() {
+    use dsh_desktop::core::tools::ToolRegistry;
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let tools = ToolRegistry::new(dir.path().to_path_buf());
+    // bash echo
+    let out = tools.dispatch("bash", &json!({"command": "echo hello_from_rust"}));
+    assert!(out.ok, "bash failed: {}", out.stderr);
+    assert!(out.value["stdout"]
+        .as_str()
+        .unwrap_or("")
+        .contains("hello_from_rust"));
+    // write + read
+    let f = dir.path().join("a.txt");
+    let out = tools.dispatch(
+        "write_file",
+        &json!({"path": "a.txt", "content": "line1\nline2"}),
+    );
+    assert!(out.ok);
+    assert!(f.exists());
+    let out = tools.dispatch("read_file", &json!({"path": "a.txt"}));
+    assert!(out.ok);
+    assert!(out.value["content"]
+        .as_str()
+        .unwrap_or("")
+        .contains("line1"));
+    // list_dir
+    let out = tools.dispatch("list_dir", &json!({}));
+    assert!(out.ok);
+    assert!(out.value["items"].as_array().unwrap().len() >= 1);
+}
+
+/// M1：str_replace_editor view/create/str_replace 往返。
+#[test]
+fn tools_str_replace_editor() {
+    use dsh_desktop::core::tools::ToolRegistry;
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let tools = ToolRegistry::new(dir.path().to_path_buf());
+    // create
+    let out = tools.dispatch(
+        "str_replace_editor",
+        &json!({
+            "command": "create", "path": "demo.txt", "file_text": "line1\nline2\nline3"
+        }),
+    );
+    assert!(out.ok, "create failed: {}", out.stderr);
+    // view
+    let out = tools.dispatch(
+        "str_replace_editor",
+        &json!({"command": "view", "path": "demo.txt"}),
+    );
+    assert!(out.ok);
+    assert!(out.value["content"]
+        .as_str()
+        .unwrap_or("")
+        .contains("line1"));
+    // str_replace 唯一匹配
+    let out = tools.dispatch(
+        "str_replace_editor",
+        &json!({
+            "command": "str_replace", "path": "demo.txt", "old_str": "line2", "new_str": "LINE2"
+        }),
+    );
+    assert!(out.ok, "replace failed: {}", out.stderr);
+    let out = tools.dispatch(
+        "str_replace_editor",
+        &json!({"command": "view", "path": "demo.txt"}),
+    );
+    assert!(out.value["content"]
+        .as_str()
+        .unwrap_or("")
+        .contains("LINE2"));
+    // 非唯一匹配应失败
+    let out = tools.dispatch(
+        "str_replace_editor",
+        &json!({
+            "command": "str_replace", "path": "demo.txt", "old_str": "l", "new_str": "x"
+        }),
+    );
+    assert!(!out.ok, "非唯一匹配应失败");
+    // create 已存在应失败
+    let out = tools.dispatch(
+        "str_replace_editor",
+        &json!({"command": "create", "path": "demo.txt", "file_text": "x"}),
+    );
+    assert!(!out.ok);
+}
+
+/// M1：fs_search 找到文件。
+#[test]
+fn tools_fs_search() {
+    use dsh_desktop::core::tools::ToolRegistry;
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alpha.rs"), "fn main() {}").unwrap();
+    std::fs::write(dir.path().join("beta.md"), "# doc").unwrap();
+    let tools = ToolRegistry::new(dir.path().to_path_buf());
+    let out = tools.dispatch("fs_search", &json!({"path": ".", "pattern": "alpha"}));
+    assert!(out.ok);
+    assert_eq!(out.value["count"].as_u64().unwrap_or(0), 1);
+}
+
+/// M1：pwsh 执行。
+#[test]
+fn tools_pwsh() {
+    use dsh_desktop::core::tools::ToolRegistry;
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let tools = ToolRegistry::new(dir.path().to_path_buf());
+    let out = tools.dispatch("pwsh", &json!({"command": "Write-Output hello_pwsh"}));
+    assert!(out.ok, "pwsh failed: {}", out.stderr);
+    assert!(out.value["stdout"]
+        .as_str()
+        .unwrap_or("")
+        .contains("hello_pwsh"));
+}
+
+/// M1：web_search 空 query 校验。
+#[test]
+fn tools_web_search_validation() {
+    use dsh_desktop::core::tools::ToolRegistry;
+    use serde_json::json;
+    let tools = ToolRegistry::new(tempfile::tempdir().unwrap().path().to_path_buf());
+    let out = tools.dispatch("web_search", &json!({"query": "   "}));
+    assert!(!out.ok, "空 query 应失败");
+    let out = tools.dispatch("web_search", &json!({"query": "rust"}));
+    assert!(out.ok);
+}
+
+/// M6：插件 loader 生命周期（Rust 版 cordis）。
+#[test]
+fn plugin_loader_lifecycle() {
+    use dsh_desktop::plugin::{EventBus, Loader, Plugin, PluginContext};
+
+    struct DemoPlugin;
+    impl Plugin for DemoPlugin {
+        fn name(&self) -> &str {
+            "demo-plugin"
+        }
+        fn mount(&self, ctx: &PluginContext) -> Result<(), String> {
+            assert_eq!(ctx.id, "demo-plugin");
+            Ok(())
+        }
+    }
+
+    let mut loader = Loader::default();
+    let bus = EventBus::default();
+    loader.mount(Box::new(DemoPlugin), &bus).unwrap();
+    assert_eq!(loader.len(), 1);
+    assert_eq!(
+        loader.get("demo-plugin").unwrap().state,
+        dsh_desktop::plugin::FiberState::Active
+    );
+    // 重复注册应失败
+    assert!(loader.mount(Box::new(DemoPlugin), &bus).is_err());
+    // 卸载
+    loader.unmount("demo-plugin");
+    assert_eq!(loader.len(), 0);
+}
+
+/// M6：插件组 + 事件总线。
+#[test]
+fn plugin_group_and_events() {
+    use dsh_desktop::plugin::{EventBus, Plugin, PluginContext, PluginEvent, PluginGroup};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct EchoPlugin(Arc<AtomicUsize>);
+    impl Plugin for EchoPlugin {
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn mount(&self, ctx: &PluginContext) -> Result<(), String> {
+            let counter = self.0.clone();
+            // 订阅事件（通过 ctx.bus 的 on——需要 &mut；这里用外部 bus 简化）
+            let _ = ctx;
+            let _ = counter;
+            Ok(())
+        }
+    }
+
+    let mut bus = EventBus::default();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits2 = hits.clone();
+    bus.on(
+        "test/event",
+        Box::new(move |_e: &PluginEvent| {
+            hits2.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    bus.emit(&PluginEvent {
+        name: "test/event".into(),
+        payload: serde_json::json!({}),
+    });
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // 组
+    let mut group = PluginGroup::new("g1");
+    group
+        .mount(Box::new(EchoPlugin(hits.clone())), &bus)
+        .unwrap();
+    assert_eq!(group.loader().len(), 1);
+}
+
+/// 回归：load_session 必须投影 assistant/message 到 messages。
+#[test]
+fn storage_load_projects_assistant() {
+    use dsh_desktop::core::session::{types, Message, SessionEvent};
+    use dsh_desktop::core::storage::SessionStore;
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+    store
+        .append(
+            "t",
+            &SessionEvent::new(
+                types::USER_MESSAGE,
+                Some(serde_json::json!({"content": "hi"})),
+            ),
+        )
+        .unwrap();
+    store.append("t", &SessionEvent::new(types::ASSISTANT_MESSAGE, Some(serde_json::json!({"content": "hello back", "reasoning_content": "", "tool_calls": []})))).unwrap();
+    store
+        .append("t", &SessionEvent::new(types::TURN_END, None))
+        .unwrap();
+    let s = store.load_session("t").unwrap();
+    assert_eq!(s.messages.len(), 2, "应投影 2 条消息, got {:?}", s.messages);
+    match &s.messages[1] {
+        Message::Assistant { content, .. } => assert_eq!(content, "hello back"),
+        _ => panic!("第 2 条应为 assistant"),
+    }
+}
+
+/// 回归：无 API key 且无 DSH credentials 时，引擎创建成功、UI 可用、发送报明确错误（不 panic）。
+#[test]
+fn engine_no_key_no_crash() {
+    use dsh_desktop::core::settings::EngineSettings;
+    use dsh_desktop::core::{DshEngine, EngineEvent};
+    std::env::set_var(
+        "DSH_HOME",
+        tempfile::tempdir().unwrap().path().to_str().unwrap(),
+    );
+    // 也清掉本地 engine-settings 的影响：直接构造无 key settings
+    let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = None;
+    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let mut engine = DshEngine::new(settings, tx).expect("无 key 创建引擎不应失败");
+    let sid = engine.create_session(None).expect("创建会话不应失败");
+    let err = engine.send_message(&sid, "hi").unwrap_err();
+    assert!(
+        err.to_string().contains("API key"),
+        "错误应提示 API key, got: {err}"
+    );
+}

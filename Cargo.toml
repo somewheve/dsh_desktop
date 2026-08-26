@@ -1,0 +1,65 @@
+[package]
+name = "dsh-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Rust 原生桌面终端 + DeepSeek Harness 集成（PTY 终端模拟 / DSH 插件管理）"
+license = "MIT"
+
+[[bin]]
+name = "dsh-desktop"
+path = "src/main.rs"
+
+[dependencies]
+# eframe：仅保留 Windows 需要的 feature（wgpu 渲染 + accesskit + 链接），
+# 去掉 wayland/x11/web_screen_reader 等平台无用项，显著减少依赖编译量
+eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "links", "wgpu"] }
+egui = "0.36"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+thiserror = "2"
+parking_lot = "0.12"
+# tokio：只开 rt-multi-thread（Runtime::new），不编 full 全家桶
+tokio = { version = "1", features = ["rt-multi-thread"] }
+futures-util = "0.3"
+xitca-web = { version = "0.8", features = ["params", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "rustls-native-certs", "webpki-roots", "blocking"] }
+rfd = { version = "0.17.2", default-features = false }
+# 对话消息 Markdown 渲染（标题/加粗/斜体/行内代码/代码块/列表/表格/链接）
+pulldown-cmark = "0.13"
+# 沙箱 capability SID 派生用（与官方 workspace-sid 哈希算法一致）
+sha2 = "0.10"
+# 对话消息内嵌图片解码（png/jpg/gif/webp → egui 纹理）
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
+# 纯 Rust Win32 restricted-token 沙箱（CreateRestrictedToken / CreateProcessAsUserW / ACL）
+# 替代官方 Node runner，彻底去掉 Node 依赖（agentic.md 铁律 #4）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Console",
+    "Win32_System_Environment",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+egui_kittest = { version = "0.36", features = ["wgpu"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# 依赖用轻度优化编译：增量编译主包不受影响，测试/调试运行更快
+[profile.dev.package."*"]
+opt-level = 1
