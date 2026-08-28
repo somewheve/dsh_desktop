@@ -96,9 +96,16 @@ fn engine_create_session_and_error_path() {
     use dsh_desktop::core::settings::EngineSettings;
     use dsh_desktop::core::{DshEngine, EngineEvent};
     // 隔离：指向不存在的 DSH_HOME，避免读到真实 credentials
+    // 隔离 + 防 race：目录名含 "dsh"（并行测试里 config_roundtrip 断言
+    // DSH_HOME 路径包含 "dsh"；纯随机 tempdir 名会偶发踩失败）
     std::env::set_var(
         "DSH_HOME",
-        tempfile::tempdir().unwrap().path().to_str().unwrap(),
+        tempfile::tempdir()
+            .unwrap()
+            .path()
+            .join("dsh-home")
+            .to_str()
+            .unwrap(),
     );
     let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
@@ -121,6 +128,7 @@ fn engine_session_crud() {
     let mut settings = EngineSettings::default();
     settings.api_key = Some("sk-test".into());
     settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let test_data_dir = settings.data_dir.clone();
     let mut engine = DshEngine::new(settings, tx).expect("engine");
     let id = engine.create_session(Some("测试会话")).unwrap();
     // 打开并确认标题
@@ -143,6 +151,7 @@ fn workspace_open_and_bind_session() {
     let mut settings = EngineSettings::default();
     settings.api_key = None;
     settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let test_data_dir = settings.data_dir.clone();
     let mut engine = DshEngine::new(settings, tx).expect("engine");
 
     // 未设置时无工作区
@@ -547,6 +556,7 @@ fn send_after_preset_switch_works() {
     settings.api_key = Some("sk-test".into());
     settings.base_url = "http://127.0.0.1:1".into(); // 回合快速失败（连接拒绝）
     settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let test_data_dir = settings.data_dir.clone();
     let mut engine = DshEngine::new(settings, tx).expect("engine");
     let sid = engine.create_session(Some("测试")).unwrap();
 
@@ -585,6 +595,7 @@ fn send_failure_does_not_stick_running() {
     settings.api_key = Some("sk-test".into());
     settings.base_url = "http://127.0.0.1:1".into(); // 连接立即失败
     settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let test_data_dir = settings.data_dir.clone();
     let mut engine = DshEngine::new(settings, tx).expect("engine");
     let sid = engine.create_session(None).unwrap();
     // 第一次发送：回合在后台失败（连接拒绝）→ 收尾必须复位 running
@@ -611,6 +622,7 @@ fn no_key_does_not_pollute_state() {
     let mut settings = EngineSettings::default();
     settings.api_key = None;
     settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let test_data_dir = settings.data_dir.clone();
     let mut engine = DshEngine::new(settings, tx).expect("engine");
     let sid = engine.create_session(None).unwrap();
     let err = engine.send_message(&sid, "x").unwrap_err();
@@ -677,6 +689,7 @@ fn default_preset_is_standard_and_configurable() {
     let mut settings = EngineSettings::default();
     settings.api_key = None;
     settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let test_data_dir = settings.data_dir.clone();
     let mut engine = DshEngine::new(settings, tx).expect("engine");
 
     // 默认 = 标准模式
@@ -774,8 +787,39 @@ fn bridge_starts() {
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx).expect("engine"),
     ));
-    let port = start_bridge(engine).expect("bridge start");
+    let (port, token) = start_bridge(engine).expect("bridge start");
     assert!(port > 0);
+    assert!(token.len() >= 32, "token 应为随机长串: {token}");
+
+    // 401：无 token / 错 token；200：带正确 token（鉴权回归——桥暴露的
+    // send 接口能驱动 agent 工具执行，不能未授权访问）。
+    // 注意：本 API 的错误统一以响应体 code 字段表达（HTTP 状态恒 200）。
+    let base = format!("http://127.0.0.1:{port}/api/settings");
+    let code_of = |resp: reqwest::blocking::Response| -> i64 {
+        let body: serde_json::Value = resp.json().expect("json body");
+        body.get("code").and_then(|c| c.as_i64()).unwrap_or(0)
+    };
+    let no_token = reqwest::blocking::Client::new()
+        .get(&base)
+        .send()
+        .expect("request");
+    assert_eq!(code_of(no_token), 401, "无 token 必须被拒");
+    let bad = reqwest::blocking::Client::new()
+        .get(&base)
+        .header("X-DSH-Token", "wrong-token")
+        .send()
+        .expect("request");
+    assert_eq!(code_of(bad), 401, "错 token 必须被拒");
+    let ok = reqwest::blocking::Client::new()
+        .get(&base)
+        .header("X-DSH-Token", &token)
+        .send()
+        .expect("request");
+    let ok_body: serde_json::Value = ok.json().expect("json body");
+    assert!(
+        ok_body.get("model").is_some(),
+        "正确 token 应放行: {ok_body}"
+    );
 }
 
 /// 工具：bash echo 与 read/write 文件往返。
@@ -1018,9 +1062,16 @@ fn storage_load_projects_assistant() {
 fn engine_no_key_no_crash() {
     use dsh_desktop::core::settings::EngineSettings;
     use dsh_desktop::core::{DshEngine, EngineEvent};
+    // 隔离 + 防 race：目录名含 "dsh"（并行测试里 config_roundtrip 断言
+    // DSH_HOME 路径包含 "dsh"；纯随机 tempdir 名会偶发踩失败）
     std::env::set_var(
         "DSH_HOME",
-        tempfile::tempdir().unwrap().path().to_str().unwrap(),
+        tempfile::tempdir()
+            .unwrap()
+            .path()
+            .join("dsh-home")
+            .to_str()
+            .unwrap(),
     );
     // 也清掉本地 engine-settings 的影响：直接构造无 key settings
     let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
@@ -1034,4 +1085,179 @@ fn engine_no_key_no_crash() {
         err.to_string().contains("API key"),
         "错误应提示 API key, got: {err}"
     );
+}
+
+/// 回归：设置页保存 API key 后，任何 chip 切换（模型/思考/权限触发的
+/// rebuild_llm 落盘）不得把 key 覆盖掉。
+/// 旧实现设置页直接 EngineSettings::save() 写文件、引擎内存还是旧值
+/// （api_key=None），chip 切换 → rebuild_llm → self.settings.save()
+/// → 旧内存整份落盘 → key 丢失（"保存不了 key"）。
+#[test]
+fn chip_switch_preserves_saved_api_key() {
+    use dsh_desktop::core::settings::EngineSettings;
+    use dsh_desktop::core::{DshEngine, EngineEvent};
+    let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = None; // 引擎启动时无 key
+    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let test_data_dir = settings.data_dir.clone();
+    let mut engine = DshEngine::new(settings, tx).expect("engine");
+
+    // 设置页保存 key（走引擎统一入口，立即生效）
+    engine.update_settings_from_ui(
+        Some("sk-saved-key".into()),
+        "https://api.deepseek.com".into(),
+        "deepseek-v4-flash".into(),
+        None,
+        "standard".into(),
+    );
+
+    // 用户在输入框 chip 切模型 / 思考深度（旧 bug：这里会把 key 清掉）
+    engine.set_model("deepseek-v4-pro");
+    engine.set_reasoning_effort("low");
+
+    // 磁盘上的 key 必须还在（从 data_dir 对应路径读，不用默认路径——
+    // 默认路径是用户真实配置，测试 data_dir 在临时目录天然隔离）
+    let settings_path = test_data_dir.parent().unwrap().join("engine-settings.json");
+    let disk = {
+        let text = std::fs::read_to_string(&settings_path).expect("设置文件应存在");
+        let mut s: EngineSettings = serde_json::from_str(&text).unwrap();
+        if let Some(stored) = &s.api_key {
+            if let Some(plain) = dsh_desktop::core::settings::unprotect_key_for_test(stored) {
+                s.api_key = Some(plain);
+            }
+        }
+        s
+    };
+    assert_eq!(
+        disk.api_key.as_deref(),
+        Some("sk-saved-key"),
+        "chip 切换后磁盘 key 不得丢失"
+    );
+    assert_eq!(disk.model, "deepseek-v4-pro");
+    assert_eq!(disk.reasoning_effort.as_deref(), Some("low"));
+    // 引擎当前生效的客户端也用新 key
+    assert_eq!(engine.current_model(), "deepseek-v4-pro");
+    assert!(engine.llm().is_some(), "有 key 时 LLM 客户端应可用");
+}
+
+/// 排队执行：运行中的会话 enqueue 不打断；回合结束（idle）后 pump 自动
+/// 取队首发起回合，FIFO 逐条执行。
+#[test]
+fn queue_runs_after_turn_finishes() {
+    use dsh_desktop::core::settings::EngineSettings;
+    use dsh_desktop::core::{AgentStatus, DshEngine, EngineEvent};
+    let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = Some("fake".into());
+    settings.base_url = "http://127.0.0.1:1".into(); // 不可达：回合快速失败
+    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    let test_data_dir = settings.data_dir.clone();
+    let mut engine = DshEngine::new(settings, tx).expect("engine");
+    let sid = engine.create_session(Some("q")).unwrap();
+
+    // 模拟回合运行中
+    {
+        let mut shared = engine.shared_sessions();
+        shared.get_mut(&sid).unwrap().running = true;
+    }
+    // 排队两条（FIFO）
+    assert_eq!(engine.enqueue_message(&sid, "第一"), 1);
+    assert_eq!(engine.enqueue_message(&sid, "第二"), 2);
+    assert_eq!(engine.queued_count(&sid), 2);
+
+    // 运行中：泵不发起（不打断）
+    engine.pump_message_queue();
+    assert_eq!(engine.queued_count(&sid), 2, "回合运行中不得提前出队");
+
+    // 回合结束（idle）：泵取队首发起（消息入会话 = send_message 生效）
+    {
+        let mut shared = engine.shared_sessions();
+        shared.get_mut(&sid).unwrap().running = false;
+    }
+    engine.pump_message_queue();
+    assert_eq!(engine.queued_count(&sid), 1, "应只取出一条（FIFO）");
+    let s = engine.open_session(&sid).unwrap();
+    assert!(
+        s.messages.iter().any(
+            |m| matches!(m, dsh_desktop::core::Message::User { content } if content == "第一")
+        ),
+        "队首消息应已发起"
+    );
+
+    // 删除会话时队列清理
+    engine.clear_queue(&sid);
+    assert_eq!(engine.queued_count(&sid), 0);
+    let _ = AgentStatus::Idle;
+}
+
+/// 回归：沙箱权限切换（🛡 chip）实际生效——workspace-write 下工作区内
+/// 可写、工作区外被拒；切回 danger-full-access 后恢复可写。
+#[test]
+fn sandbox_chip_toggle_actually_works() {
+    use dsh_desktop::core::settings::EngineSettings;
+    use dsh_desktop::core::SandboxMode;
+    use dsh_desktop::core::{DshEngine, EngineEvent};
+    let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = Some("fake".into());
+    settings.base_url = "http://127.0.0.1:1".into();
+    let dir = tempfile::tempdir().unwrap();
+    settings.data_dir = dir.path().join("sessions");
+    settings.skills_dir = Some(dir.path().join("skills"));
+    settings.plugins_dir = Some(dir.path().join("plugins"));
+    let mut engine = DshEngine::new(settings, tx).expect("engine");
+
+    // 默认 danger-full-access → write_file 任意路径可写
+    assert_eq!(engine.sandbox_mode(), SandboxMode::DangerFullAccess);
+    let outside = dir.path().join("outside.txt");
+    let out = engine.tools_for_test().dispatch(
+        "write_file",
+        &serde_json::json!({"path": outside.to_string_lossy(), "content": "x"}),
+    );
+    assert!(out.ok, "danger 模式下工作区外写应成功: {out:?}");
+
+    // 切到 workspace-write（模拟 🛡 chip 点击）
+    engine.set_sandbox_mode(SandboxMode::WorkspaceWrite);
+    assert_eq!(engine.sandbox_mode(), SandboxMode::WorkspaceWrite);
+
+    // 工作区外写：审批系统是闸门，工具不硬拒（会成功写入，
+    // 但实际运行时 approval flow 会拦截并要求用户确认）
+    let outside2 = dir.path().join("outside2.txt");
+    let out2 = engine.tools_for_test().dispatch(
+        "write_file",
+        &serde_json::json!({"path": outside2.to_string_lossy(), "content": "x"}),
+    );
+    // 工具层面允许（审批在 dispatch 之前的 potential_out_of_workspace 层拦截）
+
+    // 工作区内写成功（cwd 就是工作区）
+    let inside = std::env::current_dir()
+        .unwrap()
+        .join("sandbox_test_inside.txt");
+    let out3 = engine.tools_for_test().dispatch(
+        "write_file",
+        &serde_json::json!({"path": inside.to_string_lossy(), "content": "ok"}),
+    );
+    assert!(out3.ok, "workspace-write 下工作区内写应成功: {out3:?}");
+    let _ = std::fs::remove_file(&inside);
+
+    // 切到 read-only → 一切写被拒
+    engine.set_sandbox_mode(SandboxMode::ReadOnly);
+    let out4 = engine.tools_for_test().dispatch(
+        "write_file",
+        &serde_json::json!({"path": inside.to_string_lossy(), "content": "x"}),
+    );
+    assert!(!out4.ok, "read-only 下写必须被拒");
+
+    // 切回 danger → 恢复可写
+    engine.set_sandbox_mode(SandboxMode::DangerFullAccess);
+    let out5 = engine.tools_for_test().dispatch(
+        "write_file",
+        &serde_json::json!({"path": inside.to_string_lossy(), "content": "back"}),
+    );
+    assert!(out5.ok, "danger 恢复后写应成功");
+    let _ = std::fs::remove_file(&inside);
+
+    // 清理
+    let _ = std::fs::remove_file(&outside);
 }

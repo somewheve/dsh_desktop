@@ -409,7 +409,7 @@ pub fn render_blocks(
         match block {
             MdBlock::Paragraph(spans) => {
                 ui.add_space(3.0);
-                render_line(ui, spans, 14.0, text_color, max_w);
+                render_line(ui, spans, 12.0, text_color, max_w);
             }
             MdBlock::Heading(level, spans) => {
                 ui.add_space(6.0);
@@ -430,8 +430,8 @@ pub fn render_blocks(
                 ui.add_space(3.0);
                 for item in items {
                     // 任务列表（`- [ ]`/`- [x]`）→ 勾选框；普通项走常规行
-                    if !render_checkbox_item(ui, item, 14.0, text_color, max_w) {
-                        render_line(ui, item, 14.0, text_color, max_w);
+                    if !render_checkbox_item(ui, item, 13.0, text_color, max_w) {
+                        render_line(ui, item, 12.0, text_color, max_w);
                     }
                     ui.add_space(2.0);
                 }
@@ -479,7 +479,7 @@ fn line_to_job(spans: &[MdSpan], size: f32, color: Color32, max_w: f32) -> Layou
         let mut fmt = TextFormat {
             font_id,
             color: if s.link.is_some() {
-                Theme::ACCENT_LIGHT
+                Theme::accent_light()
             } else {
                 color
             },
@@ -490,7 +490,7 @@ fn line_to_job(spans: &[MdSpan], size: f32, color: Color32, max_w: f32) -> Layou
             },
             italics: s.italic,
             underline: if s.link.is_some() {
-                Stroke::new(1.0, Theme::ACCENT)
+                Stroke::new(1.0, Theme::accent())
             } else {
                 Stroke::NONE
             },
@@ -564,9 +564,9 @@ fn render_checkbox_item(
     }
     ui.horizontal(|ui| {
         if checked {
-            ui.label(egui::RichText::new("☑").size(size).color(Theme::OK));
+            ui.label(egui::RichText::new("☑").size(size).color(Theme::ok()));
         } else {
-            ui.label(egui::RichText::new("☐").size(size).color(Theme::TEXT_DIM));
+            ui.label(egui::RichText::new("☐").size(size).color(Theme::text_dim()));
         }
         ui.add_space(2.0);
         if !cloned.is_empty() {
@@ -592,7 +592,7 @@ fn render_heading(ui: &mut egui::Ui, spans: &[MdSpan], size: f32, max_w: f32) {
     if spans.is_empty() {
         return;
     }
-    let mut job = line_to_job(spans, size, Theme::ACCENT_LIGHT, max_w);
+    let mut job = line_to_job(spans, size, Theme::accent_light(), max_w);
     // 标题整行加粗族
     for sec in &mut job.sections {
         sec.format.font_id = bold_font(size);
@@ -602,8 +602,8 @@ fn render_heading(ui: &mut egui::Ui, spans: &[MdSpan], size: f32, max_w: f32) {
 
 fn render_code_block(ui: &mut egui::Ui, code: &str, max_w: f32) {
     let frame = egui::Frame::default()
-        .fill(Theme::BG_HOVER)
-        .stroke(egui::Stroke::new(1.0, Theme::BORDER))
+        .fill(Theme::bg_hover())
+        .stroke(egui::Stroke::new(1.0, Theme::border()))
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::symmetric(10, 8));
     frame.show(ui, |ui| {
@@ -615,22 +615,25 @@ fn render_code_block(ui: &mut egui::Ui, code: &str, max_w: f32) {
             egui::RichText::new(code.trim_end_matches('\n'))
                 .monospace()
                 .size(12.5)
-                .color(Theme::TEXT),
+                .color(Theme::text()),
         );
     });
 }
 
 fn render_quote(ui: &mut egui::Ui, spans: &[MdSpan], text_color: Color32, max_w: f32) {
     let inner = egui::Frame::default()
-        .fill(Theme::BG_ELEVATED)
+        .fill(Theme::bg_elevated())
         .inner_margin(egui::Margin::symmetric(10, 6));
     let fr = inner.show(ui, |ui| {
         ui.set_max_width(max_w.max(40.0));
         render_line(ui, spans, 13.5, text_color.gamma_multiply(0.9), max_w);
     });
     let rect = fr.response.rect;
-    ui.painter()
-        .vline(rect.left(), rect.y_range(), Stroke::new(3.0, Theme::ACCENT));
+    ui.painter().vline(
+        rect.left(),
+        rect.y_range(),
+        Stroke::new(3.0, Theme::accent()),
+    );
 }
 
 fn render_table(
@@ -655,7 +658,7 @@ fn render_table(
     grid = grid.max_col_width(max_col);
     grid.show(ui, |ui| {
         for cell in head {
-            let mut job = line_to_job(cell, 13.0, Theme::ACCENT_LIGHT, max_col);
+            let mut job = line_to_job(cell, 13.0, Theme::accent_light(), max_col);
             for sec in &mut job.sections {
                 sec.format.font_id = bold_font(13.0);
             }
@@ -715,7 +718,7 @@ fn show_image(
         });
     }
     if !alt.is_empty() {
-        ui.label(egui::RichText::new(alt).size(11.5).color(Theme::TEXT_DIM));
+        ui.label(egui::RichText::new(alt).size(11.5).color(Theme::text_dim()));
     }
 }
 
@@ -742,6 +745,13 @@ fn render_image(
     if src.starts_with("http://") || src.starts_with("https://") {
         if let Some(tex) = img_cache.get(src) {
             show_image(ui, tex.clone(), alt, title, viewer, max_w);
+        } else if img_cache.contains_key(&format!("__failed__{src}")) {
+            // 下载失败的负缓存：显示错误（不再重试、不再永远转圈）
+            ui.label(
+                egui::RichText::new(format!("⚠ {alt}（图片下载失败：{src}）"))
+                    .size(12.0)
+                    .color(Theme::err()),
+            );
         } else {
             if !http_imgs.iter().any(|(u, _)| u == src) {
                 http_imgs.push((src.to_string(), spawn_http_image_download(src)));
@@ -749,7 +759,7 @@ fn render_image(
             ui.label(
                 egui::RichText::new(format!("⏳ {alt}（图片下载中…）"))
                     .size(12.0)
-                    .color(Theme::TEXT_DIM),
+                    .color(Theme::text_dim()),
             );
         }
         return;
@@ -774,27 +784,34 @@ fn render_image(
             ui.label(
                 egui::RichText::new(format!("🖼 {alt}（图片解码失败：{src}）"))
                     .size(12.0)
-                    .color(Theme::TEXT_DIM),
+                    .color(Theme::text_dim()),
             );
         }
     } else {
         ui.label(
             egui::RichText::new(format!("🖼 {alt}（找不到图片：{src}）"))
                 .size(12.0)
-                .color(Theme::TEXT_DIM),
+                .color(Theme::text_dim()),
         );
     }
 }
 
-/// 后台下载网络图片到缓存目录，返回下载结果（文件路径）。
+/// 后台下载网络图片到缓存目录，返回下载结果（文件路径；None = 失败）。
 pub fn spawn_http_image_download(url: &str) -> Receiver<Option<String>> {
     let (tx, rx) = std::sync::mpsc::channel();
+    let tx_fail = tx.clone();
     let url = url.to_string();
-    std::thread::Builder::new()
+    let spawn_res = std::thread::Builder::new()
         .name("img-dl".into())
         .spawn(move || {
             let out = (|| -> Option<String> {
-                let resp = reqwest::blocking::get(&url).ok()?;
+                // 超时保护：挂起的服务器不能让占位符永久卡"下载中"
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .ok()?;
+                let resp = client.get(&url).send().ok()?;
                 if !resp.status().is_success() {
                     return None;
                 }
@@ -819,12 +836,18 @@ pub fn spawn_http_image_download(url: &str) -> Receiver<Option<String>> {
                 Some(path.to_string_lossy().into_owned())
             })();
             let _ = tx.send(out);
-        })
-        .ok();
+        });
+    match spawn_res {
+        Ok(_) => {}
+        // 线程没起来：立即发失败终态（pump 会移除条目，占位符换错误提示）
+        Err(_) => {
+            let _ = tx_fail.send(None);
+        }
+    }
     rx
 }
 
-/// 轮询网络图片下载结果：完成的插入缓存。
+/// 轮询网络图片下载结果：完成的插入缓存，失败的记负缓存并请求重绘。
 pub fn pump_http_images(
     ctx: &egui::Context,
     img_cache: &mut HashMap<String, egui::TextureHandle>,
@@ -832,20 +855,49 @@ pub fn pump_http_images(
 ) {
     let mut done: Vec<usize> = Vec::new();
     let mut ready: Vec<(String, egui::TextureHandle)> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
     for (i, (url, rx)) in http_imgs.iter_mut().enumerate() {
-        if let Ok(Some(path)) = rx.try_recv() {
-            if let Some(tex) = load_texture_from_file(ctx, Path::new(&path)) {
-                ready.push((url.clone(), tex));
+        match rx.try_recv() {
+            Ok(Some(path)) => {
+                if let Some(tex) = load_texture_from_file(ctx, Path::new(&path)) {
+                    ready.push((url.clone(), tex));
+                } else {
+                    failed.push(url.clone());
+                }
+                done.push(i);
             }
-            done.push(i);
+            Ok(None) => {
+                // 下载失败/解码失败：终态（旧实现只在 Ok(Some) 时移除，
+                // 失败条目每帧轮询直到永远）
+                failed.push(url.clone());
+                done.push(i);
+            }
+            Err(_) => {}
         }
     }
     for (url, tex) in ready {
         img_cache.insert(url, tex);
     }
+    // 负缓存：以专用 key 标记失败（render_image 检查该 key 显示错误占位）
+    for url in failed {
+        img_cache.insert(format!("__failed__{url}"), dummy_texture(ctx));
+    }
     for i in done.into_iter().rev() {
         http_imgs.remove(i);
     }
+    // 有任何下载完成/失败：请求重绘（响应式 UI 下不重绘就看不到结果）
+    ctx.request_repaint();
+}
+
+/// 1x1 透明纹理（失败负缓存的占位值）。
+fn dummy_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    // 1x1 透明纹理（失败负缓存的占位值；同名纹理重复 load 会复用同一 GPU 端）
+    let px = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 0);
+    ctx.load_texture(
+        "img-dl-failed-dummy",
+        egui::ColorImage::from_rgba_unmultiplied([1, 1], &px.to_array()),
+        egui::TextureOptions::default(),
+    )
 }
 
 #[cfg(test)]

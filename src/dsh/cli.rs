@@ -74,13 +74,16 @@ pub fn run_plugin_cmd(
 }
 
 /// 带 proxy 环境的版本（内部实现）。
+///
+/// 超时保护：dsh CLI 挂起/交互式等待输入时不能永久阻塞调用线程
+/// （默认 10 分钟——npm install 类操作可能较慢）。输出经排水线程并发读
+/// （防管道缓冲写满死锁），完成后逐行推给 UI。
 pub fn run_plugin_cmd_proxy(
     profile_name: &str,
     args: &[&str],
     tx: Option<&Sender<String>>,
     cfg: &crate::config::AppConfig,
 ) -> Result<PluginCmdResult> {
-    let _ = cfg;
     let dsh = find_dsh().context("dsh CLI not found on PATH")?;
     info!("dsh plugin --profile {profile_name} {args:?}");
     let mut cmd = Command::new(&dsh);
@@ -88,17 +91,73 @@ pub fn run_plugin_cmd_proxy(
         .arg("--profile")
         .arg(profile_name)
         .args(args);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // proxy 注入（设置页配置的 HTTP/HTTPS 代理对 dsh plugin 生效）
+    cfg.apply_proxy_env(&mut cmd);
     // 静默：不弹黑色控制台窗口（dsh.cmd 是批处理）
     crate::util::hide_console(&mut cmd);
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", dsh.display()))?;
 
-    // 用 wait_with_output 统一收尾，避免 child 被部分 move
-    let out = child.wait_with_output()?;
-    let stdout_text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr_text = String::from_utf8_lossy(&out.stderr).into_owned();
+    // 排水线程：并发读 stdout/stderr 防管道死锁
+    let (so_tx, so_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (se_tx, se_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn({
+        let pipe = child.stdout.take();
+        move || {
+            if let Some(mut r) = pipe {
+                let mut buf = Vec::new();
+                use std::io::Read;
+                let _ = r.read_to_end(&mut buf);
+                let _ = so_tx.send(buf);
+            }
+        }
+    });
+    std::thread::spawn({
+        let pipe = child.stderr.take();
+        move || {
+            if let Some(mut r) = pipe {
+                let mut buf = Vec::new();
+                use std::io::Read;
+                let _ = r.read_to_end(&mut buf);
+                let _ = se_tx.send(buf);
+            }
+        }
+    });
+
+    // 有界等待（10 分钟）
+    let timeout = std::time::Duration::from_secs(600);
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait()? {
+            Some(st) => break Some(st),
+            None => {
+                if started.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+    let timed_out = status.is_none();
+
+    let recv = |rx: &std::sync::mpsc::Receiver<Vec<u8>>| -> String {
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    };
+    let stdout_text = recv(&so_rx);
+    let mut stderr_text = recv(&se_rx);
+    if timed_out {
+        stderr_text.push_str(&format!(
+            "\n[dsh-desktop] dsh plugin 超时（>{timeout:?}），已终止"
+        ));
+    }
 
     // 若给了 tx，把输出逐行推给 UI（收尾后再推）
     if let Some(tx) = tx {
@@ -109,7 +168,11 @@ pub fn run_plugin_cmd_proxy(
             let _ = tx.send(line.to_string());
         }
     }
-    let code = out.status.code().unwrap_or(-1);
+    let code = if timed_out {
+        -1
+    } else {
+        status.and_then(|s| s.code()).unwrap_or(-1)
+    };
     if code != 0 {
         warn!("dsh plugin exited {code}: {stderr_text}");
     }

@@ -22,9 +22,8 @@ agent 闭环（LLM/工具/会话/JSONL 持久化，重写自 DSH 开源实现，
    `cordis.patch.yml` 之外的依赖元数据；cordis.patch.yml 只能**最小改写**（保留注释与无关条目）。
 4b. **proxy 配置**：AppConfig 的 http/https/no_proxy 必须注入 dsh plugin、dsh web、
    PTY shell 的环境变量；设置标签页保存；终端重启会话后生效。
-5. **构建环境**：沙箱 schannel TLS 不可用 → 依赖 `scripts/crates_proxy.py` 本地代理 +
-   项目 `.cargo/config.toml` 的 source 替换。代理必须常驻才能构建；构建完成后可 kill。
-   代理是开发期工具，不是运行期依赖（运行期 dsh-desktop 不联网依赖）。
+5. **构建环境**：直连 crates.io（无需代理；`scripts/crates_proxy.py` 仅为历史沙箱保留，
+   不要在构建流程中引用）。运行期 dsh-desktop 不联网依赖。
 6. **每环节留日志**：spawn/resize/read/write/plugin 命令必须打日志；日志要能定位问题。
 7. **先架构后代码**：架构变更必须先更新 ARCHITECTURE.md 再改实现；本文件与
    ARCHITECTURE.md/README.md 必须同步。

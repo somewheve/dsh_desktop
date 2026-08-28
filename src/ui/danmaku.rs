@@ -422,6 +422,12 @@ mod tests {
                 format!("msg {i}"),
             );
         }
-        assert!(layer.len() <= 200);
+        // 断言上限 = 真实常量（旧断言 <=200 而 MAX_DANMAKU=16：
+        // 上限失效到 200 条也会"绿"——回归防线形同虚设）
+        assert!(
+            layer.len() <= MAX_DANMAKU,
+            "同屏弹幕不得超过 MAX_DANMAKU={MAX_DANMAKU}，实际 {}",
+            layer.len()
+        );
     }
 }

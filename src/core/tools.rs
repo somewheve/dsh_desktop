@@ -65,6 +65,8 @@ pub struct ToolRegistry {
     sandbox: Option<crate::exec::acl::WindowsAclSandbox>,
     /// 工作区根（权限审批的写边界：写此目录外需用户确认）。
     workspace_root: Option<PathBuf>,
+    /// HTTP 代理（内置 web_search 走系统出口；None = 直连）
+    http_proxy: Option<String>,
 }
 
 impl ToolRegistry {
@@ -78,6 +80,7 @@ impl ToolRegistry {
             skills: Vec::new(),
             sandbox: None,
             workspace_root: None,
+            http_proxy: None,
         }
     }
 
@@ -98,6 +101,7 @@ impl ToolRegistry {
             skills: self.skills.clone(),
             sandbox: self.sandbox.clone(),
             workspace_root: self.workspace_root.clone(),
+            http_proxy: self.http_proxy.clone(),
         }
     }
 
@@ -105,6 +109,13 @@ impl ToolRegistry {
     pub fn with_workspace_root(&self, ws: Option<PathBuf>) -> Self {
         let mut r = self.clone_for_preset();
         r.workspace_root = ws;
+        r
+    }
+
+    /// 绑定 HTTP 代理（内置 web_search 使用）。
+    pub fn with_http_proxy(&self, proxy: Option<String>) -> Self {
+        let mut r = self.clone_for_preset();
+        r.http_proxy = proxy;
         r
     }
 
@@ -118,7 +129,11 @@ impl ToolRegistry {
     /// 绑定工作目录（工作区切换时生成新 registry，其余配置不变）。
     pub fn with_cwd(&self, cwd: PathBuf) -> Self {
         let mut r = self.clone_for_preset();
-        r.cwd = cwd;
+        r.cwd = cwd.clone();
+        // 工作区根同步更新（审批/写边界 = 当前工作目录；
+        // 旧实现只改 cwd 不改 workspace_root → 用户切了工作区但
+        // 审批弹窗还是显示旧路径）
+        r.workspace_root = Some(cwd);
         r
     }
 
@@ -129,9 +144,16 @@ impl ToolRegistry {
     /// 判定一次写工具调用是否可能写**工作区外**（需权限审批）。
     /// 返回 (目标路径, 原因)。只在配置了 workspace_root 时判定；
     /// 未配置 workspace_root 视为不拦截（无边界可判）。
-    /// bash/pwsh 用 `>`/`>>` 输出重定向直觉解析；write/str_replace 解析显式 path。
+    /// bash/pwsh 用输出重定向/写命令直觉解析；write/str_replace 解析显式 path；
+    /// run_code 逐子步判定（PTC 组合不能绕过写边界）；node_called 执行任意
+    /// JS（无法静态分析写目标）按潜在越权处理。
     pub fn potential_out_of_workspace(&self, name: &str, args: &Value) -> Option<(String, String)> {
         let ws = self.workspace_root.as_ref()?.clone();
+        log::debug!(
+            "approval check: tool={name} workspace_root={} cwd={}",
+            ws.display(),
+            self.cwd.display()
+        );
         let targets: Vec<String> = match name {
             "write_file" => vec![args
                 .get("path")
@@ -153,21 +175,89 @@ impl ToolRegistry {
             "bash" | "pwsh" => {
                 extract_redirect_targets(&args.get("command").and_then(Value::as_str).unwrap_or(""))
             }
+            // 任意 JS：无法静态判定写目标 → 每次都审批（AlwaysAllow 后免问）
+            "node_called" => {
+                return Some((
+                    NODE_WRITE_MARKER.to_string(),
+                    "node_called 可执行任意代码（含文件写入），需用户确认".into(),
+                ))
+            }
+            // PTC 组合执行：逐子步判定（旧实现只看顶层名，run_code 内嵌的
+            // write_file/bash 完全绕过审批）
+            "run_code" => {
+                let steps = args
+                    .get("steps")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for step in &steps {
+                    let op = step.get("op").and_then(Value::as_str).unwrap_or("");
+                    if op == "run_code" || op.is_empty() {
+                        continue;
+                    }
+                    if let Some((t, r)) = self.potential_out_of_workspace(op, step) {
+                        return Some((t, format!("run_code 子步越权：{r}")));
+                    }
+                }
+                return None;
+            }
             _ => Vec::new(),
         };
-        for t in targets {
+        // 详细链路日志
+        for t in &targets {
             if t.is_empty() {
+                continue;
+            }
+            let resolved = self.resolve(t);
+            log::info!("approval target: raw={t:?} resolved={}", resolved.display());
+        }
+        for t in targets {
+            if t.is_empty() || t == NODE_WRITE_MARKER {
                 continue;
             }
             let abs = self.resolve(&t);
             if !path_is_within_ws(&abs, &ws) {
                 return Some((
                     abs.display().to_string(),
-                    format!("写操作目标「{}」位于工作区之外", abs.display()),
+                    format!(
+                        "目标「{}」不在工作区「{}」内（工具 cwd：{}）",
+                        abs.display(),
+                        ws.display(),
+                        self.cwd.display()
+                    ),
                 ));
             }
         }
         None
+    }
+
+    /// 写工具的 OS 级 fail-closed 检查：沙箱受限时按策略裁决路径
+    /// （read-only 一律拒绝；workspace-write 拒绝工作区外——审批允许也不行，
+    /// 因为受限令牌在 OS 层没有对应写权限，提前给出可读错误）。
+    fn check_write_allowed(&self, path: &Path) -> Result<(), String> {
+        if let Some(sb) = &self.sandbox {
+            match sb.mode {
+                crate::exec::SandboxMode::ReadOnly => {
+                    return Err(
+                        "sandbox: read-only 模式禁止一切写操作（write_file/str_replace_editor）"
+                            .into(),
+                    );
+                }
+                crate::exec::SandboxMode::WorkspaceWrite => {
+                    // 工作区外的写：审批系统是唯一闸门（用户点"允许"后应执行）。
+                    // 此处只记日志不阻断——旧实现硬拒与审批冲突（用户已批准
+                    // 但 check_write_allowed 仍然拒绝 → "审批通过了但写入失败"）。
+                    if !path_is_within_ws(path, &sb.workspace_root) {
+                        log::warn!(
+                            "workspace-write: write outside workspace (approval-gated): {}",
+                            path.display()
+                        );
+                    }
+                }
+                crate::exec::SandboxMode::DangerFullAccess => {}
+            }
+        }
+        Ok(())
     }
     pub fn tool_specs(&self) -> Vec<crate::core::llm::ToolSpec> {
         use crate::core::llm::tool_spec;
@@ -214,7 +304,7 @@ impl ToolRegistry {
             ),
             tool_spec(
                 "web_search",
-                "搜索当前信息（对齐 dsh-tool-web，结果上限 8 条）。",
+                "联网搜索最新信息（DuckDuckGo，结果上限 8 条：标题/链接/摘要）。查事实、时效信息、文档时使用。",
                 json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}),
             ),
             tool_spec(
@@ -337,7 +427,15 @@ impl ToolRegistry {
 
     /// node_called：在 DSH 的 Node 环境中执行 JS（NODE_PATH 指向本机 DSH node_modules），
     /// 可 require 任意已安装的 DSH 官方插件并调用其能力。
+    /// 受限沙箱模式下拒绝：node 拿到的是父进程完整令牌，绕过 restricted-token
+    /// 就是绕过整个沙箱（历史漏洞：read-only/workspace-write 下仍可任意写）。
     fn tool_node_called(&self, args: &Value) -> ToolOutput {
+        if let Some(sb) = &self.sandbox {
+            return ToolOutput::err(format!(
+                "node_called 在沙箱模式（{}）下不可用：node 子进程持有完整令牌，无法受限执行。请切换 danger-full-access（需用户在输入框旁切换）或改用 bash/pwsh（受沙箱约束）",
+                sb.mode.as_str()
+            ));
+        }
         let code = args
             .get("code")
             .and_then(Value::as_str)
@@ -404,8 +502,51 @@ impl ToolRegistry {
     }
 
     fn resolve(&self, path: &str) -> PathBuf {
-        let p = PathBuf::from(path);
+        // Windows 路径统一：AI 模型常用 / 分隔，统一转为 \
+        let p = PathBuf::from(path.replace('/', "\\"));
         if p.is_absolute() {
+            // AI 常见错误：给了同盘符但不在工作区内的绝对路径
+            // （如 F:\f\x.txt 而工作区是 F:\AI）。
+            // 路径不存在且非系统目录时，把非盘符部分拼到工作区下
+            // （F:\AI\f\x.txt）——不再弹无意义审批。
+            if let Some(ws) = &self.workspace_root {
+                // 仅同盘符才纠正（F:\AI 工作区只纠正 F: 盘的错误路径，
+                // C:\Windows 等跨盘路径不碰——纠正了反而掩盖真正的越权写入）
+                let same_drive = p
+                    .components()
+                    .next()
+                    .and_then(|c| match c {
+                        std::path::Component::Prefix(pf) => {
+                            Some(pf.as_os_str().to_string_lossy().to_lowercase())
+                        }
+                        _ => None,
+                    })
+                    .zip(ws.components().next().and_then(|c| match c {
+                        std::path::Component::Prefix(pf) => {
+                            Some(pf.as_os_str().to_string_lossy().to_lowercase())
+                        }
+                        _ => None,
+                    }))
+                    .map(|(a, b)| a == b)
+                    .unwrap_or(false);
+                if same_drive && !p.starts_with(ws) && !p.exists() {
+                    let rest: PathBuf = p.components().skip(2).collect();
+                    // 深度限制：非盘符部分 ≤3 级才纠正（短路径 = AI 可能拼错；
+                    // 深层路径 = 用户真实绝对路径，不该纠正）
+                    let depth = rest.components().count();
+                    if !rest.as_os_str().is_empty() && depth <= 3 {
+                        let corrected = ws.join(&rest);
+                        if corrected.starts_with(ws) {
+                            log::info!(
+                                "path auto-corrected: {} -> {} (same-drive, not exists)",
+                                p.display(),
+                                corrected.display()
+                            );
+                            return corrected;
+                        }
+                    }
+                }
+            }
             p
         } else {
             self.cwd.join(p)
@@ -474,6 +615,20 @@ impl ToolRegistry {
             Some(p) => self.resolve(p),
             None => return ToolOutput::err("missing path"),
         };
+        // 大小上限：模型选中的路径可能是多 GB 日志——read_to_string 会把
+        // 整个文件拉进内存（卡死/OOM）。超限给出可操作的错误。
+        const MAX_FILE_BYTES: u64 = 8 << 20; // 8MB
+        match std::fs::metadata(&path) {
+            Ok(md) if md.len() > MAX_FILE_BYTES => {
+                return ToolOutput::err(format!(
+                    "文件过大（{} 字节 > 上限 {}）：请用 bash 分段读取（more/findstr/PowerShell -TotalCount），或说明需要的区段",
+                    md.len(),
+                    MAX_FILE_BYTES
+                ));
+            }
+            Err(e) => return ToolOutput::err(e.to_string()),
+            Ok(_) => {}
+        }
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -489,8 +644,11 @@ impl ToolRegistry {
                     .cloned()
                     .collect::<Vec<_>>()
                     .join("\n");
+                // line_count = 窗口内行数（旧语义返回的是 offset 后剩余总数，
+                // 与实际返回内容不符）
+                let shown = lines.iter().take(limit).count();
                 ToolOutput::ok(
-                    json!({"path": path.display().to_string(), "content": content, "line_count": lines.len()}),
+                    json!({"path": path.display().to_string(), "content": content, "line_count": shown, "remaining_after_offset": lines.len()}),
                 )
             }
             Err(e) => ToolOutput::err(e.to_string()),
@@ -505,6 +663,9 @@ impl ToolRegistry {
             (Some(p), Some(c)) => (self.resolve(p), c),
             _ => return ToolOutput::err("missing path/content"),
         };
+        if let Err(e) = self.check_write_allowed(&path) {
+            return ToolOutput::err(e);
+        }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -579,6 +740,9 @@ impl ToolRegistry {
                 if path.exists() {
                     return ToolOutput::err("create 不能覆盖已存在文件");
                 }
+                if let Err(e) = self.check_write_allowed(&path) {
+                    return ToolOutput::err(e);
+                }
                 let content = args.get("file_text").and_then(Value::as_str).unwrap_or("");
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -595,6 +759,9 @@ impl ToolRegistry {
                 let new_str = args.get("new_str").and_then(Value::as_str).unwrap_or("");
                 if old_str.is_empty() {
                     return ToolOutput::err("old_str 不能为空");
+                }
+                if let Err(e) = self.check_write_allowed(&path) {
+                    return ToolOutput::err(e);
                 }
                 match std::fs::read_to_string(&path) {
                     Ok(text) => {
@@ -672,23 +839,356 @@ impl ToolRegistry {
         if query.is_empty() {
             return ToolOutput::err("query 不能为空");
         }
-        // TODO(M5): 接入宿主搜索（DeepSeek 搜索 API / 本地索引）
-        ToolOutput::ok(json!({
-            "query": query,
-            "sources": [],
-            "note": "web_search 由宿主提供；当前无搜索提供商，请在设置中配置",
-        }))
+        match web_search_impl(query, self.search_max_results, self.http_proxy.as_deref()) {
+            Ok(hits) => ToolOutput::ok(json!({
+                "query": query,
+                "sources": hits,
+                "count": hits.len(),
+            })),
+            Err(e) => ToolOutput::err(format!("搜索失败: {e}")),
+        }
     }
 }
 
-/// 从 shell 命令里提取 `>`/`>>` 输出重定向的目标路径（简易解析）。
+/// 双引擎搜索：优先 DuckDuckGo（国际网络零依赖）；不可达时降级 Bing
+/// （国内网络可达 cn.bing.com，同样无需 API key）。插件可用同名 web_search
+/// 工具覆盖整个实现（接入 SearxNG / Tavily / DeepSeek 搜索 API 等）。
+fn web_search_impl(query: &str, max: usize, proxy: Option<&str>) -> Result<Vec<SearchHit>, String> {
+    match web_search_ddg(query, max, proxy) {
+        Ok(hits) if !hits.is_empty() => Ok(hits),
+        first_err => web_search_bing(query, max, proxy).map_err(|bing_err| {
+            format!(
+                "DuckDuckGo: {first_err:?}; Bing: {bing_err}（两者都不可达，可配置代理或安装搜索插件）"
+            )
+        }),
+    }
+}
+
+/// Bing 网页搜索（`https://www.bing.com/search?q=`，重定向至 cn.bing.com 亦可用）。
+fn web_search_bing(query: &str, max: usize, proxy: Option<&str>) -> Result<Vec<SearchHit>, String> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .timeout(Duration::from_secs(20))
+        .connect_timeout(Duration::from_secs(8));
+    if let Some(p) = proxy {
+        builder = builder.proxy(reqwest::Proxy::all(p).map_err(|e| format!("代理配置无效: {e}"))?);
+    }
+    let client = builder.build().map_err(|e| e.to_string())?;
+    let url = format!(
+        "https://www.bing.com/search?q={}&count={max}",
+        urlencode(query)
+    );
+    let resp = client
+        .get(&url)
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .send()
+        .map_err(|e| format!("{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let html = resp.text().map_err(|e| e.to_string())?;
+    let hits = parse_bing_html(&html, max);
+    if hits.is_empty() {
+        return Err("Bing 未返回可解析结果".into());
+    }
+    Ok(hits)
+}
+
+/// 解析 Bing 结果页：每条为 `<li class="b_algo"><h2><a href="真实URL">标题</a></h2>`
+/// + 摘要 `<p class="b_lineclamp…">…</p>`（宽松取块内首个 <p> 文本）。
+pub fn parse_bing_html(html: &str, max: usize) -> Vec<SearchHit> {
+    let mut out = Vec::new();
+    let mut rest = html;
+    while out.len() < max {
+        // 精确匹配 `b_algo"`（class 值结尾引号）：b_algoSlug 含 b_algo 前缀，
+        // 宽匹配会把摘要 class 误当下一个结果块起点截断块
+        let Some(li) = rest.find("b_algo\"") else {
+            break;
+        };
+        let block_start = li;
+        // 块结尾：下一个 b_algo" 或 5KB 截断（防异常页面死循环）
+        let seg = &rest[block_start..];
+        let seg_end = seg[8..]
+            .find("b_algo\"")
+            .map(|i| 8 + i)
+            .unwrap_or(seg.len().min(5000));
+        let block = &seg[..seg_end];
+        // 链接：h2 内首个 <a ... href="URL">
+        let (url, title) = match block.find("<h2") {
+            Some(h2) => {
+                let after = &block[h2..];
+                let Some(a) = after.find("<a ") else { break };
+                let aa = &after[a..];
+                let Some(href) = aa.find("href=\"") else {
+                    break;
+                };
+                let hs = href + 6;
+                let Some(hl) = aa[hs..].find('"') else { break };
+                let url = &aa[hs..hs + hl];
+                let Some(gt) = aa[hs + hl..].find('>') else {
+                    break;
+                };
+                let te = hs + hl + gt + 1;
+                let Some(ca) = aa[te..].find("</a>") else {
+                    break;
+                };
+                (url, &aa[te..te + ca])
+            }
+            None => break,
+        };
+        // 摘要：块内 class 含 b_lineclamp 或 b_caption 后的首个 <p>
+        let snippet = ["b_lineclamp", "b_caption", "b_algoSlug"]
+            .iter()
+            .find_map(|k| {
+                block.find(k).and_then(|p| {
+                    let pa = &block[p..];
+                    pa.find('>').and_then(|g| {
+                        let s0 = p + g + 1;
+                        pa[g + 1..].find("</p>").map(|c| &block[s0..s0 + c])
+                    })
+                })
+            })
+            .unwrap_or("");
+        if !url.is_empty() && url.starts_with("http") {
+            out.push(SearchHit {
+                title: strip_tags(title),
+                url: decode_html_entities(url),
+                snippet: strip_tags(snippet),
+            });
+        }
+        rest = &seg[seg_end..];
+    }
+    out
+}
+
+/// 去除内联标签（<em> 等 Bing 高亮标记）并解码实体。
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    decode_html_entities(&out)
+}
+
+/// 一条搜索结果。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchHit {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+/// DuckDuckGo HTML 端点搜索（无需 API key 的零配置方案；官方 API 与
+/// 其它提供商可经插件提供同名 web_search 工具覆盖本实现）。
+/// `https://html.duckduckgo.com/html/` POST q=<query>，结果为静态 HTML。
+fn web_search_ddg(query: &str, max: usize, proxy: Option<&str>) -> Result<Vec<SearchHit>, String> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .timeout(Duration::from_secs(20))
+        .connect_timeout(Duration::from_secs(8));
+    if let Some(p) = proxy {
+        builder = builder.proxy(reqwest::Proxy::all(p).map_err(|e| format!("代理配置无效: {e}"))?);
+    }
+    let client = builder.build().map_err(|e| e.to_string())?;
+    let resp = client
+        .post("https://html.duckduckgo.com/html/")
+        .body(format!("q={}", urlencode(query)))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .send()
+        .map_err(|e| format!("{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let html = resp.text().map_err(|e| e.to_string())?;
+    Ok(parse_ddg_html(&html, max))
+}
+
+/// 解析 DuckDuckGo HTML 结果页：每条结果为
+/// `<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=<编码URL>...">标题</a>`
+/// 与 `<a class="result__snippet"...>摘要</a>`。
+/// 无 HTML 解析依赖，用受控字符串扫描（DDG 页面结构稳定）。
+pub fn parse_ddg_html(html: &str, max: usize) -> Vec<SearchHit> {
+    let mut out = Vec::new();
+    let mut rest = html;
+    while out.len() < max {
+        // 找下一个结果标题链接
+        let Some(a_pos) = rest.find("result__a") else {
+            break;
+        };
+        let after = &rest[a_pos..];
+        let Some(href_pos) = after.find("href=\"") else {
+            break;
+        };
+        let href_start = href_pos + 6;
+        let Some(href_len) = after[href_start..].find('"') else {
+            break;
+        };
+        let href_raw = &after[href_start..href_start + href_len];
+        // 标题 = 链接闭合 `>` 后到 `</a>`
+        let Some(gt) = after[href_start + href_len..].find('>') else {
+            break;
+        };
+        let tag_end = href_start + href_len + gt + 1;
+        let Some(close_a) = after[tag_end..].find("</a>") else {
+            break;
+        };
+        let title_raw = &after[tag_end..tag_end + close_a];
+        // 摘要：标题之后最近的 result__snippet 块（在本结果与下个结果之间找）
+        let seg_end = after[tag_end..]
+            .find("result__a")
+            .map(|i| tag_end + i)
+            .unwrap_or(after.len());
+        let snippet_raw = after[tag_end..seg_end]
+            .find("result__snippet")
+            .and_then(|sp| {
+                let sn = &after[tag_end + sp..];
+                sn.find('>').and_then(|g| {
+                    let s0 = tag_end + sp + g + 1;
+                    sn[g + 1..].find("</a>").map(|c| &after[s0..s0 + c])
+                })
+            })
+            .unwrap_or("");
+        let url = decode_ddg_href(href_raw);
+        if !url.is_empty() {
+            out.push(SearchHit {
+                title: decode_html_entities(title_raw),
+                url,
+                snippet: decode_html_entities(snippet_raw),
+            });
+        }
+        rest = &after[seg_end.min(after.len())..];
+    }
+    out
+}
+
+/// DDG 跳转链接 `//duckduckgo.com/l/?uddg=<percent-encoded>&rut=...`
+/// → 解码出真实 URL；非 uddg 形态原样返回（清理首部 //）。
+fn decode_ddg_href(href: &str) -> String {
+    let Some(pos) = href.find("uddg=") else {
+        return href.trim_start_matches("//").to_string();
+    };
+    let enc = &href[pos + 5..];
+    let enc = enc.split('&').next().unwrap_or(enc);
+    percent_decode(enc)
+}
+
+/// 极简 percent-decode（%XX + '+' -> 空格）。
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = |b: u8| -> Option<u8> {
+                    match b {
+                        b'0'..=b'9' => Some(b - b'0'),
+                        b'a'..=b'f' => Some(b - b'a' + 10),
+                        b'A'..=b'F' => Some(b - b'A' + 10),
+                        _ => None,
+                    }
+                };
+                if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    out.push(h * 16 + l);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 极简 percent-encode（表单提交用）。
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// 最小 HTML 实体解码（标题/摘要中常见集合）。
+fn decode_html_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&#x2F;", "/")
+        .trim()
+        .to_string()
+}
+
+/// node_called 审批的固定目标标记（AlwaysAllow 一次后续免问）。
+const NODE_WRITE_MARKER: &str = "<node_called:任意代码执行>";
+
+/// 从 shell 命令里直觉解析可能写文件的目标路径。
+/// 覆盖：`>`/`>>`/`1>`/`2>`/`n>` 重定向、`>path` 无空格形式，
+/// 以及常见写命令（cmd: copy/move/del/ren；PowerShell: Copy-Item/Move-Item/
+/// Set-Content/Add-Content/Out-File/tee；unix 工具: sed -i/cp/mv/rm/install）。
+/// 启发式解析注定不完备——真正的强制由沙箱模式（workspace-write/read-only）
+/// 在 OS 层提供；danger 模式下这里是唯一的写闸门，宁可多问不能漏。
 fn extract_redirect_targets(command: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let toks = command.split_whitespace();
+    // 写命令关键字：其后的参数里取**最后一个**非参数 token 作写目标
+    // （copy/mv src dst 的目标是 dst；sed -i script file 的目标是 file；
+    //  Set-Content -Path x -Value y 取最后一个参数值——宁可多问不能漏）
+    const WRITE_CMDS: &[&str] = &[
+        "copy", "move", "del", "erase", "ren", "rename", "md", "mkdir", "rd", "cp", "mv", "rm",
+        "tee", "install", "truncate", "shred",
+    ];
+    const POWERSHELL_WRITE_CMDS: &[&str] = &[
+        "copy-item",
+        "move-item",
+        "set-content",
+        "add-content",
+        "out-file",
+        "new-item",
+        "remove-item",
+        "clear-content",
+    ];
+    let toks: Vec<&str> = command.split_whitespace().collect();
     let mut prev_is_redirect = false;
+    let mut in_write_cmd = false; // 已出现写命令关键字，后续非参数 token 记为候选目标
     for t in toks {
+        let lower = t.to_lowercase();
+        // `2>file` / `1>file` / `3>>file` 等带 fd 前缀的重定向
+        if let Some(rest) = strip_fd_redirect(&lower) {
+            prev_is_redirect = true;
+            in_write_cmd = false;
+            if !rest.is_empty() {
+                out.push(rest.trim_matches('"').to_string());
+            }
+            continue;
+        }
         if t.starts_with(">>") || t.starts_with('>') {
             prev_is_redirect = true;
+            in_write_cmd = false;
             let rest = t.trim_start_matches('>').trim();
             if !rest.is_empty() {
                 out.push(rest.trim_matches('"').to_string());
@@ -700,7 +1200,26 @@ fn extract_redirect_targets(command: &str) -> Vec<String> {
             prev_is_redirect = false;
             continue;
         }
-        // ">path" 无空格形式也抓
+        // 写命令关键字（含 PowerShell 动词-参数形式，如 Copy-Item）
+        let base = lower
+            .trim_end_matches(',')
+            .trim_matches(|c: char| c == '(' || c == '|');
+        if POWERSHELL_WRITE_CMDS.contains(&base) || WRITE_CMDS.contains(&base) || base == "sed" {
+            in_write_cmd = true;
+            continue;
+        }
+        // 写命令后一律跳过 /- 和 --- 开头的 token（命令行标志，非文件路径）：
+        // del /f /q → /f 是 force 标志不是路径（历史 bug：被当目标 → F:/f 审批）
+        if in_write_cmd && (t.starts_with('-') || t.starts_with('/')) {
+            continue;
+        }
+        if in_write_cmd {
+            // 写命令后的非参数 token 全部记为候选目标（copy/mv 的 dst、
+            // sed 的文件、cmdlet 的参数值——宁多问不漏；读侧多触发只是多一次确认）
+            out.push(t.trim_matches(['"', '\'']).to_string());
+            continue;
+        }
+        // ">path" 无空格形式也抓（含 `2>path`）
         if let Some(idx) = t.find('>') {
             let after = &t[idx + 1..];
             if !after.is_empty() && !after.contains('"') && !after.starts_with('&') {
@@ -709,6 +1228,20 @@ fn extract_redirect_targets(command: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// `2>file`/`1>>file` 形式：返回去掉 fd 前缀后的目标（无文件目标返回空串；
+/// 非该形式返回 None）。`2>&1` 合并流无文件目标。
+fn strip_fd_redirect(tok: &str) -> Option<String> {
+    let b = tok.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_digit() && b[1] == b'>' {
+        let rest = tok[1..].trim_start_matches('>');
+        if rest.is_empty() || rest.starts_with('&') {
+            return Some(String::new());
+        }
+        return Some(rest.trim_matches('"').to_string());
+    }
+    None
 }
 
 /// 路径是否落在工作区内（防御 `..` 穿越）。
@@ -757,11 +1290,16 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 带超时 + 输出上限的命令执行。
 ///
-/// 并发读 stdout/stderr 防管道死锁；超时杀进程；输出截断到 1MB 防 OOM。
+/// 并发读 stdout/stderr 防管道死锁；超时杀进程（Windows 下用 Job Object
+/// 杀整棵进程树——`child.kill()` 只杀直接子进程，cmd /c 启动的孙进程会存活
+/// 并持有管道写端，导致排水线程的 join 永久阻塞、回合线程卡死）；
+/// 排水线程 join 带限时兜底；输出截断到 1MB 防 OOM。
 fn run_command_timeout(mut cmd: Command, timeout: Duration) -> ToolOutput {
     const MAX_OUT: usize = 1 << 20; // 1MB
                                     // 静默：不弹黑色控制台窗口（cmd/powershell 子进程）
     crate::util::hide_console(&mut cmd);
+    // stdin 置 null：子进程读 stdin（pause/more/REPL）会一直挂到超时
+    cmd.stdin(Stdio::null());
 
     fn drain<R: Read>(pipe: Option<R>) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -787,14 +1325,33 @@ fn run_command_timeout(mut cmd: Command, timeout: Duration) -> ToolOutput {
         Ok(c) => c,
         Err(e) => return ToolOutput::err(format!("spawn failed: {e}")),
     };
-    let stdout_th = std::thread::spawn({
+    // Windows：进程入 Job Object（KILL_ON_JOB_CLOSE）——超时终止整棵进程树
+    // （`child.kill()` 只杀直接子进程，cmd /c 的孙进程会存活并持有管道写端）
+    let job = attach_tree_kill_job(&child);
+
+    // 排水线程 → 通道：join 换成 recv_timeout，孙进程残留句柄把管道
+    // 撑住时不再永久阻塞回合线程
+    let (so_tx, so_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (se_tx, se_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn({
         let pipe = child.stdout.take();
-        move || drain(pipe)
+        move || {
+            let _ = so_tx.send(drain(pipe));
+        }
     });
-    let stderr_th = std::thread::spawn({
+    std::thread::spawn({
         let pipe = child.stderr.take();
-        move || drain(pipe)
+        move || {
+            let _ = se_tx.send(drain(pipe));
+        }
     });
+
+    // 排水收拢限时：进程退出后管道应很快 EOF；孙进程持句柄时放弃等待
+    //（线程残留可接受，回合线程绝不能被挂死）
+    const JOIN_DEADLINE: Duration = Duration::from_secs(5);
+    let recv_pipe = |rx: &std::sync::mpsc::Receiver<Vec<u8>>| -> Vec<u8> {
+        rx.recv_timeout(JOIN_DEADLINE).unwrap_or_default()
+    };
 
     let start = Instant::now();
     let status = loop {
@@ -802,10 +1359,12 @@ fn run_command_timeout(mut cmd: Command, timeout: Duration) -> ToolOutput {
             Ok(Some(st)) => break st,
             Ok(None) => {
                 if start.elapsed() > timeout {
+                    // 树杀：关闭 Job 句柄（KILL_ON_JOB_CLOSE）；无 Job 时退化为杀直接子进程
+                    drop(job);
                     let _ = child.kill();
                     let _ = child.wait();
-                    let so = stdout_th.join().unwrap_or_default();
-                    let se = stderr_th.join().unwrap_or_default();
+                    let so = recv_pipe(&so_rx);
+                    let se = recv_pipe(&se_rx);
                     return ToolOutput {
                         ok: false,
                         value: json!({
@@ -818,14 +1377,16 @@ fn run_command_timeout(mut cmd: Command, timeout: Duration) -> ToolOutput {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(e) => {
+                drop(job);
                 let _ = child.kill();
                 let _ = child.wait();
                 return ToolOutput::err(format!("wait failed: {e}"));
             }
         }
     };
-    let stdout = stdout_th.join().unwrap_or_default();
-    let stderr = stderr_th.join().unwrap_or_default();
+    drop(job);
+    let stdout = recv_pipe(&so_rx);
+    let stderr = recv_pipe(&se_rx);
     ToolOutput {
         ok: status.success(),
         value: json!({
@@ -834,6 +1395,20 @@ fn run_command_timeout(mut cmd: Command, timeout: Duration) -> ToolOutput {
         }),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
     }
+}
+
+/// 把子进程挂进"关闭即杀树"的 Job Object（Win32 细节封装在 exec::winacl）。
+#[cfg(windows)]
+fn attach_tree_kill_job(
+    child: &std::process::Child,
+) -> Option<crate::exec::winacl::KillOnCloseJob> {
+    use std::os::windows::io::AsRawHandle;
+    crate::exec::winacl::KillOnCloseJob::attach(child.as_raw_handle())
+}
+
+#[cfg(not(windows))]
+fn attach_tree_kill_job(_child: &std::process::Child) -> Option<()> {
+    None
 }
 
 #[cfg(test)]
@@ -864,29 +1439,187 @@ mod tests {
     }
 
     /// node_called 可 require DSH 官方插件（NODE_PATH 指向本机 dsh node_modules）。
-    /// 若本机没有 dsh 环境则跳过断言（仅验证工具不报错）。
+    /// 本机没有 DSH 环境时 require 失败（Cannot find module）是预期——
+    /// 仅验证执行链路正常（不因环境缺失而挂）。
     #[test]
     fn node_called_can_require_dsh_packages() {
         let reg = ToolRegistry::new(std::env::temp_dir());
         let out = reg.tool_node_called(&json!({
             "code": "try { const p = require('@deepseek-ai/dsh-base'); console.log('ok:' + typeof p); } catch (e) { console.log('norequire:' + e.message); }"
         }));
+        assert!(out.ok, "node_called 执行链路应正常: {}", out.stderr);
         let stdout = out
             .value
             .get("stdout")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let dsh_missing = stdout.contains("norequire:Cannot find module");
+        if !dsh_missing {
+            assert!(stdout.starts_with("ok:"), "require 应成功: stdout={stdout}");
+        }
+    }
+
+    /// 沙箱模式下 node_called 必须拒绝（完整令牌子进程 = 绕过沙箱）。
+    #[test]
+    fn node_called_rejected_under_sandbox() {
+        let reg = ToolRegistry::new(std::env::temp_dir()).with_sandbox(Some(
+            crate::exec::acl::WindowsAclSandbox::new(
+                crate::exec::SandboxMode::ReadOnly,
+                std::env::temp_dir(),
+            ),
+        ));
+        let out = reg.tool_node_called(&json!({"code": "console.log(1)"}));
+        assert!(!out.ok, "read-only 沙箱下 node_called 必须拒绝");
         assert!(
-            !stdout.contains("norequire") || out.stderr.contains("Cannot find"),
-            "require 应成功或明确失败: stdout={stdout} stderr={}",
+            out.stderr.contains("沙箱"),
+            "错误应说明沙箱限制: {}",
             out.stderr
         );
+
+        let reg = ToolRegistry::new(std::env::temp_dir()).with_sandbox(Some(
+            crate::exec::acl::WindowsAclSandbox::new(
+                crate::exec::SandboxMode::WorkspaceWrite,
+                std::env::temp_dir(),
+            ),
+        ));
+        let out = reg.tool_node_called(&json!({"code": "console.log(1)"}));
+        assert!(!out.ok, "workspace-write 沙箱下 node_called 必须拒绝");
+    }
+
+    /// run_code 的写子步不得绕过越权审批（历史漏洞：顶层名匹配不到
+    /// run_code → 内嵌 write_file 直写工作区外零确认）。
+    #[test]
+    fn run_code_steps_cannot_bypass_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let reg = ToolRegistry::new(ws.clone()).with_workspace_root(Some(ws.clone()));
+        let outside = dir.path().join("escape.txt");
+        let hit = reg
+            .potential_out_of_workspace(
+                "run_code",
+                &json!({"steps": [
+                    {"op": "read_file", "path": "a.txt"},
+                    {"op": "write_file", "path": outside.to_string_lossy(), "content": "x"},
+                ]}),
+            )
+            .expect("run_code 内嵌工作区外写必须触发审批");
+        assert!(hit.0.contains("escape.txt"), "target: {}", hit.0);
+
+        // 内嵌 bash 重定向越权同样触发
+        let cmd = format!("echo hi > \"{}\"", outside.display());
+        let hit = reg
+            .potential_out_of_workspace(
+                "run_code",
+                &json!({"steps": [{"op": "bash", "command": cmd}]}),
+            )
+            .expect("run_code 内嵌 bash 重定向越权必须触发审批");
+        assert!(hit.0.contains("escape.txt"), "target: {}", hit.0);
+
+        // 全部子步都在工作区内 → 不触发
+        assert!(reg
+            .potential_out_of_workspace(
+                "run_code",
+                &json!({"steps": [{"op": "write_file", "path": ws.join("ok.txt").to_string_lossy(), "content": "x"}]}),
+            )
+            .is_none());
+    }
+
+    /// node_called 按潜在越权处理（任意代码 → 每次审批，AlwaysAllow 后免问）。
+    #[test]
+    fn node_called_needs_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let reg = ToolRegistry::new(ws.clone()).with_workspace_root(Some(ws));
+        let hit = reg
+            .potential_out_of_workspace("node_called", &json!({"code": "console.log(1)"}))
+            .expect("node_called 应触发审批");
+        assert_eq!(hit.0, NODE_WRITE_MARKER);
+    }
+
+    /// 写工具在受限沙箱下 fail-closed（read-only 拒绝一切写；
+    /// workspace-write 拒绝工作区外写）。
+    #[test]
+    fn write_tools_fail_closed_under_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        // read-only
+        let ro = ToolRegistry::new(ws.clone()).with_sandbox(Some(
+            crate::exec::acl::WindowsAclSandbox::new(
+                crate::exec::SandboxMode::ReadOnly,
+                ws.clone(),
+            ),
+        ));
+        let out = ro
+            .tool_write_file(&json!({"path": ws.join("x.txt").to_string_lossy(), "content": "x"}));
+        assert!(!out.ok, "read-only 模式 write_file 必须拒绝");
+        let out = ro.tool_str_replace(&json!({
+            "command": "create", "path": ws.join("y.txt").to_string_lossy(), "file_text": "x"
+        }));
+        assert!(!out.ok, "read-only 模式 str_replace create 必须拒绝");
+        assert!(!ws.join("x.txt").exists());
+        assert!(!ws.join("y.txt").exists());
+
+        // workspace-write：审批系统是闸门（区外写经用户批准后执行，
+        // check_write_allowed 只记日志不阻断——旧实现与审批冲突）
+        let ww = ToolRegistry::new(ws.clone()).with_sandbox(Some(
+            crate::exec::acl::WindowsAclSandbox::new(
+                crate::exec::SandboxMode::WorkspaceWrite,
+                ws.clone(),
+            ),
+        ));
+        let inside = ws.join("inside.txt");
+        let out = ww.tool_write_file(&json!({"path": inside.to_string_lossy(), "content": "ok"}));
+        assert!(out.ok, "workspace-write 区内写应允许: {}", out.stderr);
+        // 区外写：不再硬拒（审批系统处理）——验证工具不额外阻断
+        let outside = dir.path().join("outside_check.txt");
+        let out2 = ww.tool_write_file(&json!({"path": outside.to_string_lossy(), "content": "x"}));
+        assert!(
+            out2.ok,
+            "workspace-write 区外写应由审批系统决定，工具不应硬拒: {out2:?}"
+        );
+    }
+
+    /// 重定向启发式：常见写命令变体都识别（历史绕过：`2> file`、
+    /// `Set-Content`、`cp/mv/del`、`sed -i`）。
+    #[test]
+    fn redirect_heuristic_covers_write_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let reg = ToolRegistry::new(ws.clone()).with_workspace_root(Some(ws));
+        let outside = dir.path().join("o.txt");
+        let o = outside.to_string_lossy().to_string();
+
+        let cases = [
+            format!("cmd /C 2> \"{o}\""), // stderr 重定向
+            format!("powershell Set-Content -Path \"{o}\" -Value x"),
+            format!("copy src \"{o}\""), // cmd copy
+            format!("mv src \"{o}\""),   // unix mv
+            format!("sed -i s/a/b/ \"{o}\""),
+            format!("echo x 1> \"{o}\""),
+        ];
+        for cmd in cases {
+            assert!(
+                reg.potential_out_of_workspace("bash", &json!({"command": cmd.clone()}))
+                    .is_some(),
+                "写命令变体应触发审批: {cmd}"
+            );
+        }
+        // 纯读命令不触发
+        assert!(reg
+            .potential_out_of_workspace("bash", &json!({"command": "dir"}))
+            .is_none());
+        assert!(reg
+            .potential_out_of_workspace("bash", &json!({"command": "type a.txt"}))
+            .is_none());
     }
 
     /// 权限审批：写工作区外识别（potential_out_of_workspace）。
     #[test]
     fn approval_detects_outside_workspace() {
-        use std::path::PathBuf;
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("workspace");
         std::fs::create_dir_all(&ws).unwrap();
@@ -934,5 +1667,76 @@ mod tests {
         assert!(reg
             .potential_out_of_workspace("bash", &json!({"command": cmd_in}))
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod web_search_tests {
+    use super::*;
+
+    /// DDG HTML 解析器：fixture 页面 → 标题/真实 URL/摘要提取 + uddg 解码。
+    #[test]
+    fn parse_ddg_html_fixture() {
+        let html = r#"<div class="result results_links">
+ <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww rust-lang org%2Flearn&amp;rut=abc123">Learn Rust &amp; Programming</a>
+ <a class="result__snippet">The official &quot;guide&quot; to &#x27;Rust&#x27;</a>
+</div>
+<div class="result">
+ <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample com%2Fa+b&amp;rut=xyz">Second Result</a>
+ <a class="result__snippet">Second snippet</a>
+</div>"#;
+        let hits = parse_ddg_html(html, 8);
+        assert_eq!(hits.len(), 2, "应解析出 2 条: {hits:?}");
+        assert_eq!(hits[0].title, "Learn Rust & Programming");
+        assert_eq!(
+            hits[0].url, "https://www rust-lang org/learn",
+            "uddg percent-decode + &amp; 还原"
+        );
+        assert_eq!(hits[0].snippet, "The official \"guide\" to 'Rust'");
+        assert_eq!(hits[1].title, "Second Result");
+        assert_eq!(hits[1].url, "https://example com/a b", "+ 解码为空格");
+    }
+
+    /// 上限截断。
+    #[test]
+    fn parse_ddg_html_max() {
+        let one = r#"<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fx%2F1">T1</a><a class="result__snippet">s</a>"#;
+        let page = one.repeat(5);
+        assert_eq!(parse_ddg_html(&page, 3).len(), 3);
+    }
+
+    /// 无结果页面返回空（不 panic）。
+    #[test]
+    fn parse_ddg_html_empty() {
+        assert!(parse_ddg_html("<html><body>no results</body></html>", 8).is_empty());
+    }
+
+    /// Bing 解析器：fixture → 标题/URL/摘要（含 <em> 高亮剥离）。
+    #[test]
+    fn parse_bing_html_fixture() {
+        let html = r#"<li class="b_algo"><h2><a href="https://learn.microsoft.com/rust" h="1">Learn <em>Rust</em> &amp; Grow</a></h2><div class="b_caption"><p class="b_lineclamp4">Official <em>Rust</em> docs</p></div></li>
+<li class="b_algo"><h2><a href="https://example.org/page">Second</a></h2><p class="b_algoSlug">slug text</p></li>"#;
+        let hits = parse_bing_html(html, 8);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].title, "Learn Rust & Grow");
+        assert_eq!(hits[0].url, "https://learn.microsoft.com/rust");
+        assert_eq!(hits[0].snippet, "Official Rust docs");
+        assert_eq!(hits[1].snippet, "slug text");
+    }
+
+    /// Bing 空页面不 panic。
+    #[test]
+    fn parse_bing_html_empty() {
+        assert!(parse_bing_html("<html>nothing</html>", 8).is_empty());
+    }
+
+    /// 真实网络搜索（忽略：CI/离线环境跑不了；本地验证用）。
+    #[test]
+    #[ignore]
+    fn web_search_ddg_live() {
+        // 双引擎链：DDG 不可达时自动落 Bing（国内网络）
+        let hits = web_search_impl("rust programming language", 5, None).expect("live search");
+        assert!(!hits.is_empty(), "应至少返回一条结果");
+        assert!(hits[0].url.starts_with("http"), "URL 应可解析: {hits:?}");
     }
 }

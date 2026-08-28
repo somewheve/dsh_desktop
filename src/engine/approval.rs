@@ -42,6 +42,8 @@ impl ApprovalDecision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub id: String,
+    /// 审批所属会话（跨会话队列渲染时标识归属）
+    pub session_id: String,
     /// 越权目标路径（展示给用户）
     pub target: String,
     /// 原因说明
@@ -80,26 +82,38 @@ impl ApprovalRegistry {
     pub fn request(
         &mut self,
         id: String,
+        session_id: String,
         target: String,
         reason: String,
     ) -> tokio::sync::oneshot::Receiver<ApprovalDecision> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending
-            .insert(id.clone(), (ApprovalRequest { id, target, reason }, tx));
+        self.pending.insert(
+            id.clone(),
+            (
+                ApprovalRequest {
+                    id,
+                    session_id,
+                    target: canonical_target(&target),
+                    reason,
+                },
+                tx,
+            ),
+        );
         rx
     }
 
-    /// 检查目标路径是否已在"总是放行"集合。
+    /// 检查目标路径是否已在"总是放行"集合（两侧都规范化：
+    /// 大小写/分隔符变体不得重复弹卡）。
     pub fn should_skip(&self, target: &str) -> bool {
-        self.always_allow.contains(target)
+        self.always_allow.contains(&canonical_target(target))
     }
 
     /// 用户回传决定。
     pub fn resolve(&mut self, id: &str, decision: ApprovalDecision) -> bool {
         if let Some((req, tx)) = self.pending.remove(id) {
-            // AlwaysAllow：记录目标路径
+            // AlwaysAllow：记录目标路径（规范化）
             if decision == ApprovalDecision::AlwaysAllow {
-                self.always_allow.insert(req.target.clone());
+                self.always_allow.insert(canonical_target(&req.target));
             }
             let _ = tx.send(decision);
             true
@@ -126,6 +140,13 @@ impl ApprovalRegistry {
     }
 }
 
+/// 审批目标的规范化键（路径变体统一：大小写不敏感 + 分隔符统一 +
+/// 去尾部斜杠；目标可能是非路径文本，规范化失败时原样返回）。
+fn canonical_target(t: &str) -> String {
+    let trimmed = t.trim_end_matches(['/', '\\']);
+    trimmed.replace('\\', "/").to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,7 +154,12 @@ mod tests {
     #[test]
     fn request_resolve_flow() {
         let mut reg = ApprovalRegistry::new();
-        let rx = reg.request("a1".into(), "C:\\outside".into(), "写工作区外".into());
+        let rx = reg.request(
+            "a1".into(),
+            "s-1".into(),
+            "C:\\Outside".into(),
+            "写工作区外".into(),
+        );
         assert_eq!(reg.pending_count(), 1);
         assert!(!reg.should_skip("C:\\outside"));
 
@@ -148,9 +174,11 @@ mod tests {
     #[test]
     fn always_allow_records_target() {
         let mut reg = ApprovalRegistry::new();
-        let _rx = reg.request("a2".into(), "C:\\sys".into(), "敏感".into());
+        let _rx = reg.request("a2".into(), "s-1".into(), "C:\\Sys".into(), "敏感".into());
         reg.resolve("a2", ApprovalDecision::AlwaysAllow);
-        assert!(reg.should_skip("C:\\sys"));
+        // 大小写/分隔符/尾斜杠变体不再重复弹卡
+        assert!(reg.should_skip("c:/sys"));
+        assert!(reg.should_skip("C:\\Sys\\"));
     }
 
     #[test]

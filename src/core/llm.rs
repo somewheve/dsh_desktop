@@ -48,6 +48,16 @@ pub struct FunctionSpec {
     pub parameters: serde_json::Value,
 }
 
+/// DeepSeek API 模型表（2026-08 官方价目页；legacy 名称保留兼容旧配置）。
+pub const DEEPSEEK_MODELS: &[&str] = &[
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash-vision-exp",
+];
+
+/// 思考深度档位（对齐官方 reasoning_effort 值域；none = 关闭思考）。
+pub const REASONING_EFFORTS: &[&str] = &["none", "low", "high", "max"];
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -57,6 +67,16 @@ pub struct ChatRequest {
     pub tools: Option<Vec<ToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// 思考模式开关（V4 官方参数 thinking.type = enabled/disabled；
+    /// effort=none → disabled，其余 enabled）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+}
+
+/// `{"thinking": {"type": "enabled" | "disabled"}}`。
+#[derive(Debug, Clone, Serialize)]
+pub struct ThinkingConfig {
+    pub r#type: String,
 }
 
 /// 流式 chunk（OpenAI SSE data 行）。
@@ -124,6 +144,16 @@ pub struct LlmClient {
     reasoning_effort: Option<String>,
 }
 
+/// 单次流式请求的结果（stream 内部用）。
+enum StreamOutcome {
+    Done,
+    Failed {
+        err: anyhow::Error,
+        /// 是否可安全重试（未发出任何流事件 + 瞬态故障）
+        retryable: bool,
+    },
+}
+
 impl LlmClient {
     pub fn new(
         base_url: String,
@@ -132,7 +162,12 @@ impl LlmClient {
         reasoning_effort: Option<String>,
         proxy: Option<String>,
     ) -> Result<Self> {
-        let mut builder = Client::builder().timeout(std::time::Duration::from_secs(300));
+        // 超时策略：连接超时 + 读空闲超时（两次数据之间），**不用总超时**——
+        // 总超时是"从发请求到流读完"的死线，长 reasoning 生成会被腰斩，
+        // 已流式输出的文本随回合失败全部丢失。
+        let mut builder = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .read_timeout(std::time::Duration::from_secs(180));
         if let Some(p) = proxy {
             builder = builder.proxy(reqwest::Proxy::all(&p).context("invalid proxy")?);
         }
@@ -147,6 +182,9 @@ impl LlmClient {
     }
 
     /// 流式 chat.completions。
+    ///
+    /// 连接失败 / 429 / 5xx 自动重试（指数退避，最多 3 次）——重试只发生在
+    /// **任何流事件发出之前**（幂等），半途断流不重试（避免 UI 内容重复）。
     pub async fn stream(
         &self,
         messages: &[LlmMessage],
@@ -159,29 +197,109 @@ impl LlmClient {
             messages: messages.to_vec(),
             stream: true,
             tools: tools.map(|t| t.to_vec()),
-            reasoning_effort: self.reasoning_effort.clone(),
+            // none 档不发 effort（发 thinking disabled 关闭思考）
+            reasoning_effort: match self.reasoning_effort.as_deref() {
+                Some("none") | None => None,
+                Some(e) => Some(e.to_string()),
+            },
+            thinking: Some(ThinkingConfig {
+                r#type: match self.reasoning_effort.as_deref() {
+                    Some("none") => "disabled".into(),
+                    _ => "enabled".into(),
+                },
+            }),
         };
-        let resp = self
+        let mut on_event = on_event;
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.stream_once(&url, &req, &mut on_event).await {
+                StreamOutcome::Done => return Ok(()),
+                StreamOutcome::Failed { err, retryable } => {
+                    let retryable = retryable && attempt + 1 < MAX_ATTEMPTS;
+                    if !retryable {
+                        return Err(err);
+                    }
+                    // 瞬态故障：陈旧 keep-alive 连接、限流、网关抖动。
+                    // 退避取短档（连接拒绝等确定性失败也要快速确认后失败，
+                    // 不能让用户等秒级重试）
+                    let backoff_ms = [400u64, 800][attempt as usize];
+                    log::warn!(
+                        "llm attempt {}/{} failed (will retry in {backoff_ms}ms): {err:#}",
+                        attempt + 1,
+                        MAX_ATTEMPTS
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    last_err = Some(err);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("llm stream failed")))
+    }
+
+    /// 单次流式请求。任何流事件（Chunk/Reasoning/ToolCallAccum）发出后
+    /// 再失败即不可重试。
+    async fn stream_once(
+        &self,
+        url: &str,
+        req: &ChatRequest,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) -> StreamOutcome {
+        let resp = match self
             .client
-            .post(&url)
+            .post(url)
             .bearer_auth(&self.api_key)
-            .json(&req)
+            .json(req)
             .send()
             .await
-            .with_context(|| format!("llm request failed: {url}"))?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // 连接层失败：仅**超时**重试（服务器慢/网络抖动）。
+                // 连接拒绝是确定性失败（Windows loopback 拒绝一次 ~2s 的
+                // SYN 重试，再乘重试次数会让用户干等），立即失败。
+                let retryable = e.is_timeout();
+                return StreamOutcome::Failed {
+                    err: anyhow::anyhow!("llm request failed ({url}): {e}"),
+                    retryable,
+                };
+            }
+        };
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("llm error {status}: {body}");
+            let retryable = status.as_u16() == 429 || status.is_server_error();
+            return StreamOutcome::Failed {
+                err: anyhow::anyhow!("llm error {status}: {body}"),
+                retryable,
+            };
         }
 
-        let mut on_event = on_event;
         let mut tool_acc: std::collections::HashMap<usize, (String, String, String)> =
             Default::default();
         let mut stream = resp.bytes_stream();
         let mut buf = Vec::new();
+        // 是否已向调用方发过流事件（发过 → 断流不可重试，重试会内容重复）
+        let mut emitted = false;
+        let mut had_payload = false; // 收到过任何 delta（content/reasoning/tool）
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("llm stream read failed")?;
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    let partial = emitted;
+                    return StreamOutcome::Failed {
+                        err: anyhow::anyhow!(
+                            "llm stream read failed{}: {e}",
+                            if partial {
+                                "（已有部分输出）"
+                            } else {
+                                ""
+                            }
+                        ),
+                        retryable: false,
+                    };
+                }
+            };
             buf.extend_from_slice(&chunk);
             // 按行解析 SSE（data: {...}）
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -193,7 +311,7 @@ impl LlmClient {
                 }
                 let data = line.strip_prefix("data:").map(|s| s.trim()).unwrap_or(line);
                 if data == "[DONE]" {
-                    // 收尾：把累积的工具调用发出去
+                    // 收尾：把累积的工具调用发出去（此处 emitted 已无后续读点）
                     for (idx, (id, name, args)) in tool_acc.drain() {
                         on_event(StreamEvent::ToolCallAccum {
                             index: idx,
@@ -203,22 +321,28 @@ impl LlmClient {
                         });
                     }
                     on_event(StreamEvent::Done);
-                    return Ok(());
+                    return StreamOutcome::Done;
                 }
                 match serde_json::from_str::<StreamChunk>(data) {
                     Ok(parsed) => {
                         for choice in parsed.choices {
                             if let Some(c) = choice.delta.content {
                                 if !c.is_empty() {
+                                    had_payload = true;
+                                    emitted = true;
                                     on_event(StreamEvent::Chunk(c));
                                 }
                             }
                             if let Some(r) = choice.delta.reasoning_content {
                                 if !r.is_empty() {
+                                    had_payload = true;
+                                    emitted = true;
                                     on_event(StreamEvent::Reasoning(r));
                                 }
                             }
                             if let Some(tcs) = choice.delta.tool_calls {
+                                had_payload = true;
+                                emitted = true;
                                 for tc in tcs {
                                     let entry = tool_acc.entry(tc.index).or_insert_with(|| {
                                         (String::new(), String::new(), String::new())
@@ -244,18 +368,25 @@ impl LlmClient {
                 }
             }
         }
-        // 连接结束但没有 [DONE]：视为异常截断，不把半截内容/未完成的工具调用当成功
-        if !buf.is_empty() || !tool_acc.is_empty() {
-            on_event(StreamEvent::Error(
-                "LLM 流提前结束（未收到 [DONE]）".to_string(),
-            ));
-            anyhow::bail!(
-                "llm stream ended without [DONE] ({} bytes buffered)",
+        // 连接结束但没有 [DONE]：截断——无论缓冲区/工具累积是否为空，
+        // 服务端或代理在生成中途断开都会走到这里；把半截内容当成功会让
+        // 被腰斩的回复静默进入历史（旧实现只在缓冲非空时报错，纯文本流
+        // 的截断会漏检）。
+        let hint = if had_payload {
+            "（已有部分输出被丢弃/降级保留）"
+        } else {
+            "（未收到任何内容）"
+        };
+        on_event(StreamEvent::Error(format!(
+            "LLM 流提前结束（未收到 [DONE]）{hint}"
+        )));
+        StreamOutcome::Failed {
+            err: anyhow::anyhow!(
+                "llm stream ended without [DONE] ({} bytes buffered){hint}",
                 buf.len()
-            );
+            ),
+            retryable: false,
         }
-        on_event(StreamEvent::Done);
-        Ok(())
     }
 
     /// 从 session Message 转换 LLM 消息（带防御性配对修复）。

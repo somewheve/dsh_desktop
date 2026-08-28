@@ -68,30 +68,18 @@ impl WindowsAclSandbox {
         if matches!(self.mode, SandboxMode::DangerFullAccess) {
             return None;
         }
-        // 受限 token 的限制 SID：
-        //  - workspace-write：logon + Everyone + workspace capability SID（已授权目录写）
-        //  - read-only：logon + Everyone（无写 SID → 一切写被拒）
-        let extra: Vec<winacl::RawSid> = if matches!(self.mode, SandboxMode::WorkspaceWrite) {
-            match winacl::capability_sid_from_path(&self.workspace_root) {
-                Ok(s) => {
-                    // 授权 workspace 目录可写（幂等）
-                    if let Err(e) = winacl::grant_dir_write(&self.workspace_root, &s) {
-                        return Some(AclResult::denied(format!(
-                            "sandbox fail-closed: 给工作区授权写失败: {e}"
-                        )));
-                    }
-                    vec![s]
-                }
-                Err(e) => {
-                    return Some(AclResult::denied(format!(
-                        "sandbox fail-closed: capability SID 派生失败: {e}"
-                    )));
-                }
-            }
-        } else {
-            Vec::new()
-        };
-
+        // workspace-write：用正常用户令牌执行（不再修改文件系统 ACL）。
+        // 历史 bug：grant_dir_write 每次执行都 SetNamedSecurityInfoW 修改
+        // 工作区目录 DACL → 破坏继承链 → 子文件权限损坏（空 DACL = 拒绝所有人）。
+        // 应用层 check_write_allowed 已限制写路径（OS 层不需要再改 ACL）。
+        if matches!(self.mode, SandboxMode::WorkspaceWrite) {
+            log::info!(
+                "sandbox workspace-write: normal token, app-level path check only (no ACL modification)"
+            );
+            return None;
+        }
+        // read-only：restricted token（Everyone 限制 SID → 系统级只读）
+        let extra: Vec<winacl::RawSid> = Vec::new();
         let token = match winacl::build_restricted_token(&extra) {
             Ok(t) => t,
             Err(e) => {

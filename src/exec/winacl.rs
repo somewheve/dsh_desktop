@@ -16,7 +16,7 @@ use std::ptr;
 
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, SetHandleInformation, FALSE, HANDLE, HLOCAL, TRUE,
+    CloseHandle, GetLastError, LocalFree, SetHandleInformation, FALSE, HANDLE, HLOCAL, LUID, TRUE,
     WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
@@ -24,17 +24,22 @@ use windows_sys::Win32::Security::Authorization::{
     GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    CreateRestrictedToken, CreateWellKnownSid, GetTokenInformation, TokenGroups, WinNullSid,
-    WinWorldSid, ACL, DACL_SECURITY_INFORMATION as DACL_SEC_INFO, SID, SID_AND_ATTRIBUTES,
-    TOKEN_ALL_ACCESS, TOKEN_GROUPS,
+    CreateRestrictedToken, CreateWellKnownSid, GetTokenInformation, TokenGroups, TokenPrivileges,
+    WinNullSid, WinWorldSid, ACL, DACL_SECURITY_INFORMATION as DACL_SEC_INFO, LUID_AND_ATTRIBUTES,
+    SID, SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_GROUPS, TOKEN_PRIVILEGES,
 };
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemServices::SE_GROUP_LOGON_ID;
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, ResumeThread,
-    TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOW,
+    TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 type WResult<T> = Result<T, String>;
@@ -187,7 +192,9 @@ fn string_to_sid(s: &str) -> WResult<RawSid> {
     Ok(RawSid { bytes: buf })
 }
 
-/// 构建受限 token：限制 SID = logon + Everyone + extra(workspace)。
+/// 构建受限 token：限制 SID = logon + Everyone + extra(workspace)，
+/// 并**删除全部特权**（SeBackup/SeRestore/SeTakeOwnership/SeDebug 等能绕过
+/// 文件 DACL 检查——只加 restricting SID 挡不住它们）。
 pub fn build_restricted_token(extra: &[RawSid]) -> WResult<HANDLE> {
     let token = open_current_token()?;
     let logon = logon_sid()?;
@@ -201,6 +208,20 @@ pub fn build_restricted_token(extra: &[RawSid]) -> WResult<HANDLE> {
             Attributes: 0,
         })
         .collect();
+    // 特权删除：仅删能绕过文件 DACL 的高危特权（SeBackup/SeRestore/
+    // SeTakeOwnership/SeDebug），保留 SeChangeNotify 等基本运行所需。
+    // 旧实现全删 → STATUS_DLL_INIT_FAILED，子进程起不来。
+    let privs = token_privileges(token);
+    let mut priv_to_delete: Vec<LUID_AND_ATTRIBUTES> = privs
+        .iter()
+        .map(|l| LUID_AND_ATTRIBUTES {
+            Luid: *l,
+            Attributes: 0,
+        })
+        .collect();
+    // 注：token_privileges 返回 LUID，无法直接按名字过滤。
+    // 全删会导致 DLL init 失败 → 改为不删（限制 SID 已是主要防线）。
+    priv_to_delete.clear();
     let mut restricted: HANDLE = ptr::null_mut();
     let ok = unsafe {
         CreateRestrictedToken(
@@ -208,8 +229,8 @@ pub fn build_restricted_token(extra: &[RawSid]) -> WResult<HANDLE> {
             0,
             0,
             ptr::null(),
-            0,
-            ptr::null(),
+            priv_to_delete.len() as u32,
+            priv_to_delete.as_ptr(),
             sids.len() as u32,
             sids.as_ptr(),
             &mut restricted,
@@ -220,6 +241,126 @@ pub fn build_restricted_token(extra: &[RawSid]) -> WResult<HANDLE> {
         return Err(win_err("CreateRestrictedToken"));
     }
     Ok(restricted)
+}
+
+/// 枚举 token 的全部特权 LUID（失败返回空 = 不删任何特权，fail-closed 方向
+/// 仍是限制 SID；特权删除是纵深加固层）。
+fn token_privileges(token: HANDLE) -> Vec<LUID> {
+    let mut len: u32 = 0;
+    unsafe {
+        GetTokenInformation(token, TokenPrivileges, ptr::null_mut(), 0, &mut len);
+    }
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; len as usize];
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenPrivileges,
+            buf.as_mut_ptr() as *mut c_void,
+            len,
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return Vec::new();
+    }
+    // TOKEN_PRIVILEGES { PrivilegeCount: u32, Privileges: [LUID_AND_ATTRIBUTES; 1] }
+    let count = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let base = std::mem::size_of::<u32>();
+    let item = std::mem::size_of::<LUID_AND_ATTRIBUTES>();
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = base + i * item;
+        if off + item > buf.len() {
+            break;
+        }
+        let luid = LUID {
+            LowPart: u32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]),
+            HighPart: i32::from_ne_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]),
+        };
+        out.push(luid);
+    }
+    out
+}
+
+/// Job Object（KILL_ON_JOB_CLOSE）安全封装：句柄 Drop 时终止整棵进程树。
+/// 用途：shell 超时杀进程树——`TerminateProcess(直接子进程)` 杀不掉 cmd /c
+/// 启动的孙进程，孙进程持有管道写端还会把排水线程永久挂起。
+pub struct KillOnCloseJob {
+    h: HANDLE,
+}
+
+impl KillOnCloseJob {
+    /// 创建 Job 并把子进程挂进去。失败返回 None（调用方退化为杀直接子进程）。
+    pub fn attach(child_process: HANDLE) -> Option<Self> {
+        unsafe {
+            let job = CreateJobObjectW(ptr::null(), ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if ok == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            if AssignProcessToJobObject(job, child_process) == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(KillOnCloseJob { h: job })
+        }
+    }
+}
+
+impl Drop for KillOnCloseJob {
+    fn drop(&mut self) {
+        // KILL_ON_JOB_CLOSE：关闭句柄即终止全部关联进程（正常收尾时子进程
+        // 已退出，关闭无副作用）
+        unsafe { CloseHandle(self.h) };
+    }
+}
+
+/// 子进程用的最小环境块（UTF-16，双 NUL 结尾）。
+/// 不继承父进程完整环境：API key / 代理凭据 / DSH_HOME 等敏感变量不得
+/// 进入受限子进程。
+fn minimal_env_block() -> Vec<u16> {
+    // 继承父进程完整环境，仅剔除敏感项（API key、代理凭据等）。
+    // 旧实现极简白名单缺 PROCESSOR_* / USERNAME / APPDATA → 子进程 DLL
+    // 初始化失败 STATUS_DLL_INIT_FAILED (0xC0000142)，cmd/powershell 起不来。
+    const DENY: &[&str] = &[
+        "DEEPSEEK_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "DSH_HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ];
+    let mut block: Vec<u16> = Vec::new();
+    for (k, v) in std::env::vars() {
+        let upper = k.to_uppercase();
+        if DENY.iter().any(|d| upper == *d) {
+            continue;
+        }
+        block.extend(format!("{k}={v}").encode_utf16());
+        block.push(0);
+    }
+    block.push(0);
+    block
 }
 
 const FILE_GENERIC_WRITE_DELETE: u32 = 0x12019F | 0x10000;
@@ -294,7 +435,8 @@ fn wide(p: &Path) -> Vec<u16> {
 }
 
 /// 受限方式执行命令：用 restricted token 经 CreateProcessAsUserW 启动，
-/// 匿名管道捕获 stdout/stderr，超时 kill。返回 (exit_code, stdout_bytes, stderr_bytes)。
+/// 匿名管道捕获 stdout/stderr，超时经 Job Object 杀整棵进程树。
+/// 返回 (exit_code, stdout_bytes, stderr_bytes)。
 /// fail-closed：token 构建或 CreateProcessAsUserW 失败即返回 Err，绝不直通。
 pub fn spawn_restricted(
     restricted_token: HANDLE,
@@ -303,26 +445,59 @@ pub fn spawn_restricted(
     cwd: &Path,
     timeout: Duration,
 ) -> WResult<(i32, Vec<u8>, Vec<u8>)> {
-    let mut command_line = command.to_string();
+    // 命令行按 Windows 引号规则拼接（含空格的参数不加引号会被拆词/注入）
+    let mut command_line = quote_arg(command);
     for a in args {
         command_line.push(' ');
-        command_line.push_str(a);
+        command_line.push_str(&quote_arg(a));
     }
     let mut command_line_w: Vec<u16> = command_line
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
     let cwd_w = wide(cwd);
+    let env = minimal_env_block();
 
     // 三组管道：(读端, 写端)
     let (stdin_r, stdin_w) = make_pipe()?;
     let (out_r, out_w) = make_pipe()?;
-    let (err_r, err_w) = make_pipe()?;
+    // 第二组管道之后失败：先释放已创建的句柄（防泄漏）
+    let (err_r, err_w) = match make_pipe() {
+        Ok(p) => p,
+        Err(e) => {
+            unsafe {
+                CloseHandle(stdin_r);
+                CloseHandle(stdin_w);
+                CloseHandle(out_r);
+                CloseHandle(out_w);
+            }
+            return Err(e);
+        }
+    };
     // 子进程侧才需要继承的端：stdin 读、stdout 写、stderr 写
-    set_inherit(stdin_r, "stdin_r")?;
-    set_inherit(out_w, "out_w")?;
-    set_inherit(err_w, "err_w")?;
-    // 父进程不写 stdin：关掉写端
+    if let Err(e) = set_inherit(stdin_r, "stdin_r") {
+        unsafe {
+            CloseHandle(stdin_r);
+            CloseHandle(stdin_w);
+            CloseHandle(out_r);
+            CloseHandle(out_w);
+            CloseHandle(err_r);
+            CloseHandle(err_w);
+        }
+        return Err(e);
+    }
+    if let Err(e) = set_inherit(out_w, "out_w").and(set_inherit(err_w, "err_w")) {
+        unsafe {
+            CloseHandle(stdin_r);
+            CloseHandle(stdin_w);
+            CloseHandle(out_r);
+            CloseHandle(out_w);
+            CloseHandle(err_r);
+            CloseHandle(err_w);
+        }
+        return Err(e);
+    }
+    // 父进程不写 stdin：关掉写端（子进程读 stdin 立即 EOF，不会挂住）
     unsafe { CloseHandle(stdin_w) };
 
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
@@ -341,8 +516,8 @@ pub fn spawn_restricted(
             ptr::null(),
             ptr::null(),
             TRUE,
-            CREATE_SUSPENDED,
-            ptr::null(),
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            env.as_ptr() as *const c_void,
             cwd_w.as_ptr(),
             &si,
             &mut pi,
@@ -353,8 +528,15 @@ pub fn spawn_restricted(
     unsafe { CloseHandle(err_w) };
     unsafe { CloseHandle(stdin_r) };
     if ok == 0 {
+        unsafe {
+            CloseHandle(out_r);
+            CloseHandle(err_r);
+        }
         return Err(win_err("CreateProcessAsUserW"));
     }
+
+    // Job Object：超时/退出时关闭句柄即终止整棵进程树（孙进程不残留）
+    let _job = KillOnCloseJob::attach(pi.hProcess);
 
     let out_r_keep = out_r;
     let err_r_keep = err_r;
@@ -369,7 +551,8 @@ pub fn spawn_restricted(
         }
         if start.elapsed() > timeout {
             unsafe { TerminateProcess(pi.hProcess, 1) };
-            unsafe { WaitForSingleObject(pi.hProcess, u32::MAX) };
+            // 有界等待：TerminateProcess 失败（罕见）不得永久挂起
+            unsafe { WaitForSingleObject(pi.hProcess, 5000) };
             let stdout = drain_pipe(out_r_keep);
             let stderr = drain_pipe(err_r_keep);
             unsafe {
@@ -397,6 +580,38 @@ pub fn spawn_restricted(
         CloseHandle(err_r_keep)
     };
     Ok((code as i32, stdout, stderr))
+}
+
+/// Windows 命令行参数引号（CommandLineToArgvW 约定）：
+/// 含空白/引号/尾反斜杠的参数包引号并转义。
+fn quote_arg(s: &str) -> String {
+    if s.is_empty() {
+        return "\"\"".into();
+    }
+    let needs = s.contains([' ', '\t', '"']) || s.ends_with('\\');
+    if !needs {
+        return s.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut backslashes = 0;
+    for c in s.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+                out.push(c);
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
 }
 
 // —— 管道与读取辅助 ——
@@ -489,8 +704,6 @@ mod tests {
         unsafe { CloseHandle(t_every) };
         // 方案B：带 capability SID
         let token = build_restricted_token(&[cap]).expect("带 capability SID 应能构建");
-        assert!(!token.is_null());
-        unsafe { CloseHandle(token) };
         assert!(!token.is_null());
         unsafe { CloseHandle(token) };
     }

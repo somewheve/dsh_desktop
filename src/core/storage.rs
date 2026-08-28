@@ -92,11 +92,12 @@ impl SessionStore {
 
     /// 恢复会话（events → messages 投影）。
     ///
-    /// tool/call + tool/result 按出现顺序 FIFO 配对投影为 Message::Tool，
-    /// 保证重放序列满足 OpenAI 兼容约束：assistant 的 tool_calls 后必须有
-    /// 对应 tool_call_id 的 tool 消息响应（否则 API 返回 400）。
+    /// tool/result 带 call_id 时按 id 精确配对（交错/中断回合的 FIFO 配对
+    /// 会把结果错配给别的调用）；旧格式（无 call_id）退化为 FIFO。
+    /// 工具结果内容按在线同样的 8000 字符上限截断（否则重启重载后完整
+    /// stdout 进上下文，撑爆请求）。
     pub fn load_session(&self, session_id: &str) -> Result<Session> {
-        use super::session::types::{TOOL_CALL, TOOL_RESULT};
+        use super::session::types::{TOOL_CALL, TOOL_RESULT, TURN_START};
         let events = self.load_events(session_id);
         let mut session = Session::new(session_id.to_string());
         let mut pending_calls: VecDeque<String> = VecDeque::new();
@@ -104,30 +105,64 @@ impl SessionStore {
             session.events.push(ev.clone());
             if let Some(data) = &ev.data {
                 match ev.r#type.as_str() {
+                    TURN_START => {
+                        // 新回合开始：旧回合遗留的未执行 tool/call 不应配给
+                        // 后续 result（中断回合的孤儿声明）
+                        pending_calls.clear();
+                    }
                     TOOL_CALL => {
                         if let Some(cid) = data.get("call_id").and_then(|v| v.as_str()) {
                             pending_calls.push_back(cid.to_string());
                         }
                     }
                     TOOL_RESULT => {
-                        if let Some(cid) = pending_calls.pop_front() {
-                            let content =
-                                data.get("value").map(|v| v.to_string()).unwrap_or_default();
+                        let declared = data.get("call_id").and_then(|v| v.as_str());
+                        let cid = match declared {
+                            Some(s) => {
+                                // 按 id 精确取（不在队头也行；找不到 = 孤儿 result）
+                                pending_calls
+                                    .iter()
+                                    .position(|c| c == s)
+                                    .map(|pos| pending_calls.remove(pos).unwrap_or_default())
+                            }
+                            None => pending_calls.pop_front(), // 旧格式 FIFO
+                        };
+                        if let Some(cid) = cid {
+                            let content = data
+                                .get("value")
+                                .map(|v| truncate_for_llm(&v.to_string()))
+                                .unwrap_or_default();
                             session.messages.push(Message::Tool {
                                 tool_call_id: cid,
                                 content,
                             });
                         } else {
-                            warn!("tool/result 无对应 tool/call，忽略（{session_id}）");
+                            log::warn!("tool/result 无对应 tool/call，忽略（{session_id}）");
                         }
                     }
                     _ => project_event(&mut session, &ev.r#type, data),
                 }
+            } else if ev.r#type == TURN_START {
+                pending_calls.clear();
             }
         }
         session.updated_at = events.last().map(|e| e.time).unwrap_or(session.updated_at);
         Ok(session)
     }
+}
+
+/// 工具结果进 LLM 上下文的截断（防超长 JSON 撑爆上下文）。
+/// 在线（agent.rs）与重放（load_session）共用同一上限。
+pub fn truncate_for_llm(s: &str) -> String {
+    const MAX: usize = 8000;
+    if s.chars().count() <= MAX {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(MAX).collect();
+    format!(
+        "{head}\n…（结果过长，已截断 {} 字符）",
+        s.chars().count() - MAX
+    )
 }
 
 /// 事件 → session 消息投影（对齐 DSH 前端 fold 语义的核心子集）。
@@ -173,6 +208,21 @@ fn project_event(session: &mut Session, event_type: &str, data: &serde_json::Val
         SESSION_CWD => {
             if let Some(cwd) = data.get("cwd").and_then(|c| c.as_str()) {
                 session.cwd = Some(std::path::PathBuf::from(cwd));
+            }
+        }
+        SESSION_SANDBOX => {
+            if let Some(m) = data.get("sandbox").and_then(|c| c.as_str()) {
+                session.sandbox_mode = Some(m.to_string());
+            }
+        }
+        SESSION_MODEL => {
+            if let Some(m) = data.get("model").and_then(|c| c.as_str()) {
+                session.model = Some(m.to_string());
+            }
+        }
+        SESSION_EFFORT => {
+            if let Some(e) = data.get("effort").and_then(|c| c.as_str()) {
+                session.effort = Some(e.to_string());
             }
         }
         _ => {}

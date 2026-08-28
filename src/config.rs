@@ -29,6 +29,8 @@ pub struct AppConfig {
     pub last_workspace: Option<PathBuf>,
     /// 界面语言（"zh" 中文 / "en" English）
     pub lang: String,
+    /// 界面主题名（ThemeManager 名单内的调色盘名；默认 "dark"）
+    pub theme: String,
 }
 
 impl Default for AppConfig {
@@ -45,6 +47,7 @@ impl Default for AppConfig {
             no_proxy: None,
             last_workspace: None,
             lang: "zh".into(),
+            theme: "dark".into(),
         }
     }
 }

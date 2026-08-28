@@ -33,8 +33,20 @@ pub struct ChatTab {
     event_rx: Receiver<EngineEvent>,
     sessions: Vec<SessionSummary>,
     current: Option<String>,
+    /// 当前会话（引擎 pump/open 更新；渲染用快照见 render_session）
     current_session: Option<Session>,
+    /// 渲染快照（current_session 变化时重建；messages 用 Arc 共享，
+    /// 避免 30fps 弹幕重绘期间每帧深拷贝全部历史消息）
+    render_session: Option<RenderSession>,
+    /// current_session 有变化，下一帧重建 render_session
+    render_dirty: bool,
     input: String,
+    /// 待发送附件（📎 选择后暂存，发送时读取内容注入消息）
+    attachments: Vec<std::path::PathBuf>,
+    /// 发送模式（插话 / 排队）
+    send_mode: SendMode,
+    /// 会话搜索输入
+    session_search: String,
     /// 弹幕层（AI 思考过程）
     danmaku: DanmakuLayer,
     /// markdown 解析结果缓存（key=消息内容；弹幕动画期间整窗 30fps 重绘，
@@ -72,12 +84,10 @@ pub struct ChatTab {
     user_scroll_pending: bool,
     /// 待用户回答的问题（ask_user 交互：AI 提问 UI 渲染选项按钮
     pending_question: Option<PendingQuestion>,
-    /// 待用户确认的越权写操作（权限审批：串行，一次一个）
-    pending_approval: Option<PendingApproval>,
     /// 待确认删除的会话 id（第一次点🗑 进入确认态，再点执行
     pending_delete: Option<String>,
     /// 标题行卡片（单选：同一时间只开一张）
-    card: CardKind,
+    pub card: CardKind,
     /// 计划模式状态（fold plan/mode 事件
     plan_mode: crate::engine::plan::PlanMode,
     /// 最近计划内容（plan_write 写入
@@ -117,7 +127,12 @@ impl ChatTab {
             sessions: Vec::new(),
             current: None,
             current_session: None,
+            render_session: None,
+            render_dirty: false,
             input: String::new(),
+            attachments: Vec::new(),
+            send_mode: SendMode::Interject,
+            session_search: String::new(),
             danmaku: DanmakuLayer::new(),
             md_parse_cache: std::collections::HashMap::new(),
             user_width_cache: std::collections::HashMap::new(),
@@ -134,7 +149,6 @@ impl ChatTab {
             msg_count_prev: 0,
             user_scroll_pending: false,
             pending_question: None,
-            pending_approval: None,
             pending_delete: None,
             card: CardKind::None,
             plan_mode: crate::engine::plan::PlanMode::Inactive,
@@ -165,6 +179,9 @@ impl ChatTab {
             Ok(s) => {
                 self.current = Some(session_id.to_string());
                 self.current_session = Some(s.clone());
+                // 清掉该会话上次中断回合的流式残留（防"幽灵消息"）
+                self.stream_buf.remove(session_id);
+                self.render_dirty = true;
                 // 从会话事件恢复计划状态（重放后计划卡片内容仍在）
                 let (mode, content) = crate::engine::plan::fold_plan_state(&s.events);
                 self.plan_mode = mode;
@@ -198,8 +215,9 @@ impl ChatTab {
         }
     }
 
-    /// 每帧处理引擎事件
-    fn pump(&mut self, ui_ctx: &egui::Context) {
+    /// 每帧处理引擎事件（app 顶层无条件调用——任何标签页都要泵，
+    /// 否则后台回合事件积压在无界通道里、状态不更新）
+    pub fn pump(&mut self, ui_ctx: &egui::Context) {
         let mut any = false;
         while let Ok(ev) = self.event_rx.try_recv() {
             any = true;
@@ -211,16 +229,12 @@ impl ChatTab {
                     }
                 }
                 EngineEvent::ApprovalRequested {
-                    session_id,
-                    id,
-                    target,
-                    reason,
+                    session_id, target, ..
                 } => {
-                    // 权限审批：记录待确认项（串行，UI 渲染确认卡片）
-                    if self.current.as_deref() == Some(session_id.as_str()) {
-                        info!("approval requested for {session_id}: {target}");
-                        self.pending_approval = Some(PendingApproval { id, target, reason });
-                    }
+                    // 审批卡片改由引擎注册表快照驱动（render_main 每帧读取）：
+                    // 旧实现只在"恰好当前会话"时捕获，切走会话/多审批并发时
+                    // 卡片丢失，引擎侧死等 300s 超时。这里仅记日志（触发重绘）。
+                    info!("approval requested for {session_id}: {target}");
                 }
                 EngineEvent::Event { session_id, event } => {
                     let is_reasoning = event
@@ -300,6 +314,7 @@ impl ChatTab {
                         if let Some(s) = &mut self.current_session {
                             s.push_event(event.clone());
                             project(&mut s.messages, &event);
+                            self.render_dirty = true;
                             // 重命名：本地同步标题（列表刷新依赖 store，但标题栏即时更新）
                             if event.r#type == types::SESSION_TITLE {
                                 if let Some(t) = event
@@ -417,11 +432,23 @@ impl ChatTab {
                         if let Some(s) = &mut self.current_session {
                             s.running = status == crate::core::AgentStatus::Running;
                         }
+                        self.render_dirty = true;
+                    }
+                    // 回合结束（空闲/停止）：清掉流式缓冲残留——中断/失败的回合
+                    // 不会有 ASSISTANT_MESSAGE 来清它，残留文本会在下一回合
+                    // 混入流式气泡变成"幽灵消息"
+                    if status != crate::core::AgentStatus::Running {
+                        self.stream_buf.remove(&session_id);
                     }
                     self.refresh_sessions();
                 }
                 EngineEvent::Error { message, .. } => {
                     self.error = Some(message);
+                }
+                EngineEvent::ScheduledTaskDue { id, name } => {
+                    // 定时任务到期（后台线程驱动）：状态栏提示（调度面板 M 后续）
+                    info!("scheduled task due in UI: {id} ({name})");
+                    self.status = format!("⏰ {name}");
                 }
             }
         }
@@ -431,7 +458,256 @@ impl ChatTab {
         }
     }
 
+    /// 会话列表（在主侧栏"会话"导航下展开渲染）：＋新建 / 列表
+    /// （点击打开、双击重命名、✕ 两级删除确认）/ 运行中 ⚡ 标记。
+    /// 从 Chat 中央区抽出——中央区全宽给消息区，列表收纳进左侧导航。
+    /// 会话列表（文件树风格，渲染在主侧栏"会话"导航下）：
+    /// 紧凑行（26px）、整行点击、hover 整行浅底、选中左侧 2px 强调条、
+    /// 删除 ✕ 常驻但极淡（hover 变亮；两级确认）、双击重命名、
+    /// 运行中 ⚡ 右缘标记；＋ 新建在列表尾部（树追加语义）。
+    pub fn ui_session_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        max_height: Option<f32>,
+    ) -> Option<String> {
+        const ROW_H: f32 = 26.0;
+        let lang = self.lang;
+        // 搜索框（有会话时才显示）
+        if self.sessions.len() > 3 {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.session_search)
+                    .hint_text(
+                        egui::RichText::new(tr(lang, "搜索会话…", "Search…"))
+                            .size(10.5)
+                            .color(Theme::text_faint()),
+                    )
+                    .desired_width(ui.available_width().max(60.0))
+                    .font(egui::FontId::proportional(10.5)),
+            );
+            ui.add_space(4.0);
+        }
+        // 搜索过滤（标题/ID 子串匹配；空 = 全部）
+        let search_lower = self.session_search.to_lowercase();
+        let sessions: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|s| {
+                search_lower.is_empty()
+                    || s.title.to_lowercase().contains(&search_lower)
+                    || s.session_id.contains(&search_lower)
+            })
+            .cloned()
+            .collect();
+        // 本帧被点击打开/新建的会话（返回给侧栏：非 Chat 页时切回 Chat 页）
+        let mut opened: Option<String> = None;
+        let mut sa = ScrollArea::vertical().id_salt("session_list_scroll");
+        if let Some(h) = max_height {
+            sa = sa.max_height(h);
+        }
+        sa.show(ui, |ui| {
+            let mut to_delete: Option<String> = None;
+            let mut to_open: Option<String> = None;
+            let full_w = ui.available_width().max(60.0);
+            for s in &sessions {
+                ui.horizontal(|ui| {
+                    let selected = self.current.as_deref() == Some(s.session_id.as_str());
+                    let row_w = full_w - 8.0; // 两侧留 4px（树缩进感）
+                                              // 占位推进布局；交互响应用 interact（allocate 响应的
+                                              // widget_info 在 accessibility 树中不上报，interact 稳定）
+                    let (alloc, _) =
+                        ui.allocate_exact_size(egui::vec2(full_w, ROW_H), egui::Sense::hover());
+                    let row = egui::Rect::from_min_size(
+                        egui::pos2(alloc.left() + 4.0, alloc.top()),
+                        egui::vec2(row_w, ROW_H),
+                    );
+                    let row_resp = ui.interact(
+                        row,
+                        ui.id().with(("row", &s.session_id)),
+                        egui::Sense::click(),
+                    );
+                    let del_rect = egui::Rect::from_min_max(
+                        egui::pos2(row.right() - ROW_H, row.top()),
+                        row.right_bottom(),
+                    );
+                    let del_resp = ui.interact(
+                        del_rect,
+                        ui.id().with(("del", &s.session_id)),
+                        egui::Sense::click(),
+                    );
+                    let is_confirm = self.pending_delete.as_deref() == Some(s.session_id.as_str());
+                    let row_lit = row_resp.hovered() || selected || is_confirm;
+
+                    // 整行底色：hover / 选中
+                    if row_lit {
+                        ui.painter().rect_filled(row, 6.0, Theme::bg_hover());
+                    }
+                    // 选中：左侧 2px 强调条（与主导航一致）
+                    if selected {
+                        let bar = egui::Rect::from_min_max(
+                            egui::pos2(row.left() + 2.0, row.top() + 5.0),
+                            egui::pos2(row.left() + 4.0, row.bottom() - 5.0),
+                        );
+                        ui.painter().rect_filled(bar, 1.0, Theme::accent());
+                    }
+
+                    // 双击重命名
+                    if row_resp.double_clicked() {
+                        self.renaming = Some(s.session_id.clone());
+                        self.rename_input = s.title.clone();
+                        self.rename_focus_pending = true;
+                        to_open = None;
+                    }
+                    let is_renaming = self.renaming.as_deref() == Some(s.session_id.as_str());
+                    if is_renaming {
+                        let mut edit = ui.new_child(
+                            egui::UiBuilder::new().max_rect(row.shrink2(egui::vec2(6.0, 3.0))),
+                        );
+                        let resp = edit.add(
+                            egui::TextEdit::singleline(&mut self.rename_input)
+                                .font(egui::FontId::proportional(11.5))
+                                .desired_width(row_w - 16.0),
+                        );
+                        if self.rename_focus_pending {
+                            resp.request_focus();
+                            self.rename_focus_pending = false;
+                        }
+                        let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let escape_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        let lost = resp.lost_focus();
+                        let submitted =
+                            enter_pressed || (lost && !escape_pressed && !enter_pressed);
+                        if submitted || escape_pressed {
+                            let id = s.session_id.clone();
+                            let name = self.rename_input.trim().to_string();
+                            self.renaming = None;
+                            if submitted && !name.is_empty() {
+                                let mut engine = self.engine.lock().unwrap();
+                                match engine.rename_session(&id, &name) {
+                                    Ok(()) => {
+                                        drop(engine);
+                                        self.refresh_sessions();
+                                    }
+                                    Err(e) => self.error = Some(format!("重命名失败：{e:#}")),
+                                }
+                            }
+                        }
+                    } else {
+                        // 标题（截断到可用宽；右侧预留 ⚡ 与 ✕ 位）
+                        let text_w = row_w - ROW_H - 46.0 - if s.running { 16.0 } else { 0.0 };
+                        let text = truncate_to_width(
+                            ui,
+                            &s.title,
+                            text_w.max(30.0),
+                            &egui::FontId::proportional(11.5),
+                        );
+                        let text_color = if selected {
+                            Theme::text()
+                        } else {
+                            Theme::text_dim()
+                        };
+                        ui.painter().text(
+                            egui::pos2(row.left() + 30.0, row.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            text.clone(),
+                            egui::FontId::proportional(11.5),
+                            text_color,
+                        );
+                        row_resp.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                true,
+                                format!("{text}{}", if s.running { " \u{26a1}" } else { "" }),
+                            )
+                        });
+                        // 运行中 ⚡（右缘、✕ 左侧）
+                        if s.running {
+                            ui.painter().text(
+                                egui::pos2(del_rect.left() - 10.0, row.center().y),
+                                egui::Align2::RIGHT_CENTER,
+                                "\u{26a1}",
+                                egui::FontId::proportional(10.0),
+                                Theme::warn(),
+                            );
+                        }
+                        if row_resp.clicked() {
+                            to_open = Some(s.session_id.clone());
+                        }
+                    }
+
+                    // 删除 ✕：常驻但极淡（hover 行/自身时亮起）；两级确认
+                    let (del_label, del_color) = if is_confirm {
+                        ("OK", Theme::err())
+                    } else if del_resp.hovered() || row_resp.hovered() {
+                        ("\u{2715}", Theme::text_dim())
+                    } else {
+                        ("\u{2715}", Theme::text_faint().gamma_multiply(0.6))
+                    };
+                    if del_resp.hovered() || is_confirm {
+                        ui.painter()
+                            .rect_filled(del_rect, 6.0, Theme::bg_elevated());
+                    }
+                    ui.painter().text(
+                        del_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        del_label,
+                        egui::FontId::proportional(11.0),
+                        del_color,
+                    );
+                    del_resp.clone().widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, del_label)
+                    });
+                    let _ = del_resp.clone().on_hover_text(if is_confirm {
+                        tr(lang, "再次点击确认删除", "Click again to confirm")
+                    } else {
+                        tr(lang, "删除会话", "Delete session")
+                    });
+                    if del_resp.clicked() {
+                        if is_confirm {
+                            to_delete = Some(s.session_id.clone());
+                        } else {
+                            self.pending_delete = Some(s.session_id.clone());
+                        }
+                    }
+                });
+            }
+            // 删除执行 + 当前会话切换
+            if let Some(id) = to_delete {
+                self.pending_delete = None;
+                let mut engine = self.engine.lock().unwrap();
+                match engine.delete_session(&id) {
+                    Ok(()) => {
+                        drop(engine);
+                        self.stream_buf.remove(&id);
+                        if self.current.as_deref() == Some(id.as_str()) {
+                            self.current = None;
+                            self.current_session = None;
+                            self.render_session = None;
+                            self.pending_question = None;
+                        }
+                        self.refresh_sessions();
+                        if self.current.is_none() {
+                            let first_id = self.sessions.first().map(|s| s.session_id.clone());
+                            if let Some(fid) = first_id {
+                                self.open(&fid);
+                            }
+                        }
+                    }
+                    Err(e) => self.error = Some(format!("删除会话失败：{e:#}")),
+                }
+            }
+            if let Some(id) = to_open {
+                self.pending_delete = None;
+                self.open(&id);
+                opened = Some(id);
+            }
+        });
+        opened
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        // pump：app 顶层已无条件调用（所有标签页统一泵事件）；
+        // 此处再泵一次是幂等的（try_recv 清空），兼容直接调 chat.ui() 的
+        // 测试与独立使用场景
         self.pump(&ui.ctx().clone());
         if !self.http_imgs.is_empty() {
             crate::ui::markdown::pump_http_images(
@@ -440,279 +716,47 @@ impl ChatTab {
                 &mut self.http_imgs,
             );
         }
+        // 会话列表收纳在主侧栏（app.sidebar → chat.ui_session_list）：
+        // 中央区全宽给弹幕 + 消息 + 输入
         let full = ui.available_size();
-        let sep = 8.0;
-        // 左栏随窗口收缩（140-200），保证右栏有空
-        let list_width = if full.x < 480.0 {
-            (full.x * 0.28).clamp(100.0, 200.0)
-        } else {
-            200.0
-        };
-        // 右栏 = 实际剩余空间=0），任何窗口宽度都不溢出
-        let right_w = (full.x - list_width - sep - 2.0).max(0.0);
-
-        // ===== 左侧：会话列=====
-        let (left_rect, _) = ui.allocate_exact_size(vec2(list_width, full.y), egui::Sense::hover());
-        let mut left_ui = ui.new_child(egui::UiBuilder::new().max_rect(left_rect));
-        left_ui.set_clip_rect(left_rect);
-        {
-            left_ui.add_space(4.0);
-            left_ui.horizontal(|ui| {
-                ui.label(Theme::section_title(&tr(self.lang, "会话", "Chats")));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .button(RichText::new("＋").color(Theme::ACCENT_LIGHT))
-                        .on_hover_text(tr(self.lang, "新建会话", "New session"))
-                        .clicked()
-                    {
-                        let mut engine = self.engine.lock().unwrap();
-                        match engine.create_session(None) {
-                            Ok(id) => {
-                                drop(engine);
-                                self.refresh_sessions();
-                                self.open(&id);
-                            }
-                            Err(e) => self.error = Some(format!("{e:#}")),
-                        }
-                    }
-                });
-            });
-            left_ui.add_space(6.0);
-            left_ui.separator();
-            let sessions = self.sessions.clone();
-            ScrollArea::vertical().show(&mut left_ui, |ui| {
-                let mut to_delete: Option<String> = None;
-                let mut to_open: Option<String> = None;
-                for s in &sessions {
-                    let selected = self.current.as_deref() == Some(s.session_id.as_str());
-                    let running = if s.running { " ⚡" } else { "" };
-                    let label = format!("{}{}", s.title, running);
-                    ui.horizontal(|ui| {
-                        // 会话按钮：名painter 左对+ 超长按宽度截断显".."
-                        // 注意：不能用 put/scope_builder 添加 Label（其Ui 会拦
-                        // allocate 的点击响应——历史回归：点击会话项无法切换）
-                        // 名字painter 绘制（不产生 widget），点击allocate 响应处理
-                        // accesskit 标签widget_info 补上（不参与交互）
-                        let avail = ui.available_width();
-                        let del_w = if avail < 120.0 { 24.0 } else { 28.0 };
-                        let btn_w = (avail - del_w - 8.0).max(40.0);
-                        let (btn_rect, btn_resp) =
-                            ui.allocate_exact_size(vec2(btn_w, 32.0), egui::Sense::click());
-                        if btn_resp.hovered() || selected {
-                            ui.painter().rect_filled(btn_rect, 8.0, Theme::BG_HOVER);
-                        }
-                        let text_color = if selected {
-                            Theme::ACCENT_LIGHT
-                        } else {
-                            Theme::TEXT_DIM
-                        };
-                        // 实际字体宽度"截断（emoji/宽字符与估算偏差会导致文本溢出，
-                        // 挤占右侧删除按钮的空间）
-                        let font = egui::FontId::proportional(13.0);
-                        // 双击会话项：进入重命名（编辑态显示输入框替换名称）
-                        if btn_resp.double_clicked() {
-                            self.renaming = Some(s.session_id.clone());
-                            self.rename_input = s.title.clone();
-                            self.rename_focus_pending = true;
-                            to_open = None;
-                        }
-                        let is_renaming = self.renaming.as_deref() == Some(s.session_id.as_str());
-                        if is_renaming {
-                            // 编辑态：输入框占按钮区域（右侧仍保留删除按钮）
-                            let mut edit = ui.new_child(
-                                egui::UiBuilder::new()
-                                    .max_rect(btn_rect.shrink2(egui::vec2(4.0, 4.0))),
-                            );
-                            let resp = edit.add(
-                                egui::TextEdit::singleline(&mut self.rename_input)
-                                    .font(font.clone())
-                                    .desired_width(btn_w - 12.0),
-                            );
-                            // 仅进入编辑态的首帧请求焦点（否则每帧抢焦点，
-                            // 点击其他控件无法失焦提交）
-                            if self.rename_focus_pending {
-                                resp.request_focus();
-                                self.rename_focus_pending = false;
-                            }
-                            // Enter 提交（singleline 按 Enter 会 lost_focus，
-                            // 但不同 egui 版本时序略有差异——Enter 按下即提交更稳）
-                            let submitted =
-                                ui.input(|i| i.key_pressed(egui::Key::Enter)) && resp.lost_focus();
-                            // Enter 提交（不依赖 lost_focus——kittest/部分平台
-                            // 焦点时序不同，Enter 键按下即提交最稳）
-                            let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            let escape_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                            let lost = resp.lost_focus();
-                            let submitted =
-                                enter_pressed || (lost && !escape_pressed && !enter_pressed);
-                            let cancelled = escape_pressed;
-                            if submitted || cancelled {
-                                let id = s.session_id.clone();
-                                let name = self.rename_input.trim().to_string();
-                                self.renaming = None;
-                                if submitted && !name.is_empty() {
-                                    let mut engine = self.engine.lock().unwrap();
-                                    match engine.rename_session(&id, &name) {
-                                        Ok(()) => {
-                                            // 立即刷新列表（事件限频可能跳过首帧）
-                                            drop(engine);
-                                            self.refresh_sessions();
-                                        }
-                                        Err(e) => {
-                                            self.error = Some(format!("重命名失败：{e:#}"));
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            let text =
-                                truncate_to_width(ui, &format!("💬 {label}"), btn_w - 24.0, &font);
-                            // 画名字：clip 到按钮矩形（即使测量偏差也不会画出按钮区域）
-                            ui.painter().with_clip_rect(btn_rect).text(
-                                egui::pos2(btn_rect.left() + 8.0, btn_rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                text.clone(),
-                                font,
-                                text_color,
-                            );
-                            btn_resp.widget_info(|| {
-                                egui::WidgetInfo::labeled(
-                                    egui::WidgetType::Button,
-                                    true,
-                                    text.clone(),
-                                )
-                            });
-                            if btn_resp.clicked() {
-                                to_open = Some(s.session_id.clone());
-                            }
-                        }
-                        // 删除按钮：会话项 = 名字(左对齐截 + 后面跟一个淡淡的 "x"（右对齐
-                        // 位置固定在按钮右端。注意：不能put/scope_builder（其 scope
-                        // 推进父光标，导致每项 horizontal 可用宽度递增——名字越往下越长
-                        // x 被挤出列表）。用 allocate_rect + interact + painter 手动绘制
-                        // 第一次点击进入确认态（红色 "OK"），再点执行
-                        let is_confirm =
-                            self.pending_delete.as_deref() == Some(s.session_id.as_str());
-                        let del_label = if is_confirm { "OK" } else { "x" };
-                        let del_color = if is_confirm {
-                            Theme::ERR
-                        } else {
-                            Theme::TEXT_FAINT
-                        };
-                        let del_rect = egui::Rect::from_min_size(
-                            egui::pos2(btn_rect.right() + 8.0, btn_rect.top()),
-                            vec2(del_w, 32.0),
-                        );
-                        let del_resp = ui.interact(
-                            del_rect,
-                            ui.id().with(("del", &s.session_id)),
-                            egui::Sense::click(),
-                        );
-                        if del_resp.hovered() || is_confirm {
-                            ui.painter().rect_filled(del_rect, 8.0, Theme::BG_HOVER);
-                        }
-                        ui.painter().text(
-                            egui::pos2(del_rect.center().x, del_rect.center().y),
-                            egui::Align2::CENTER_CENTER,
-                            del_label,
-                            egui::FontId::proportional(13.0),
-                            del_color,
-                        );
-                        del_resp.widget_info(|| {
-                            egui::WidgetInfo::labeled(
-                                egui::WidgetType::Button,
-                                true,
-                                del_label.to_string(),
-                            )
-                        });
-                        let del_hover = del_resp.clone();
-                        if del_resp.clicked() {
-                            if is_confirm {
-                                to_delete = Some(s.session_id.clone());
-                            } else {
-                                self.pending_delete = Some(s.session_id.clone());
-                            }
-                        }
-                        // 悬停提示（删除/确认）
-                        let _ = del_hover.on_hover_text(if is_confirm {
-                            "再次点击确认删除此会话"
-                        } else {
-                            "删除会话"
-                        });
-                    });
-                }
-                // 删除：引擎删+ 状态清理（含当前会话的切换
-                if let Some(id) = to_delete {
-                    self.pending_delete = None;
-                    let mut engine = self.engine.lock().unwrap();
-                    match engine.delete_session(&id) {
-                        Ok(()) => {
-                            drop(engine);
-                            self.stream_buf.remove(&id);
-                            if self.current.as_deref() == Some(id.as_str()) {
-                                self.current = None;
-                                self.current_session = None;
-                                self.pending_question = None;
-                            }
-                            self.refresh_sessions();
-                            if self.current.is_none() {
-                                // 删除的是当前会话 打开剩余第一个会
-                                let first_id = self.sessions.first().map(|s| s.session_id.clone());
-                                if let Some(fid) = first_id {
-                                    self.open(&fid);
-                                }
-                            }
-                        }
-                        Err(e) => self.error = Some(format!("删除会话失败：{e:#}")),
-                    }
-                }
-                // 打开其他会话时取消删除确认
-                if let Some(id) = to_open {
-                    self.pending_delete = None;
-                    self.open(&id);
-                }
-            });
-        }
-
-        // separator
-        let sep_x = left_rect.right() + 1.0;
-        ui.painter().vline(
-            sep_x,
-            left_rect.y_range(),
-            egui::Stroke::new(1.0, Theme::BORDER),
-        );
-
-        // ===== 右侧：弹幕区 + 对话 =====
-        let right_rect = egui::Rect::from_min_size(
-            egui::pos2(left_rect.right() + sep, left_rect.top()),
-            vec2(right_w, full.y),
-        );
+        let right_rect = egui::Rect::from_min_size(ui.max_rect().min, full);
         let mut right_ui = ui.new_child(egui::UiBuilder::new().max_rect(right_rect));
         right_ui.set_clip_rect(right_rect);
         {
-            if let Some(error) = &self.error {
-                right_ui.colored_label(Theme::ERR, format!("⚠ {error}"));
-                right_ui.add_space(4.0);
+            // 渲染快照仅在会话状态变化时重建（messages 深拷贝是性能热点：
+            // 弹幕动画 30fps 整窗重绘时每帧 clone 整个会话历史不可接受）
+            if self.render_dirty {
+                self.render_session = self.current_session.as_ref().map(|s| RenderSession {
+                    id: s.id.clone(),
+                    title: s.title.clone(),
+                    running: s.running,
+                    preset: s.preset,
+                    messages: Arc::new(s.messages.clone()),
+                });
+                self.render_dirty = false;
             }
-            match &self.current_session {
+            // 拆借用：take 快照渲染后放回（render_main 需 &mut self，
+            // 不能同时持有 self.render_session 的不可变借用）
+            let render_session = self.render_session.take();
+            match &render_session {
                 Some(session) => {
-                    let session = session.clone();
-                    self.render_main(&mut right_ui, &session);
+                    self.render_main(&mut right_ui, session);
                 }
                 None => {
                     right_ui.centered_and_justified(|ui| {
                         ui.label(
                             RichText::new(tr(
                                 self.lang,
-                                "select a session please",
+                                "选择左侧会话，或点 ＋ 新建",
                                 "Pick a session on the left, or click ＋ to create one",
                             ))
-                            .size(15.0)
-                            .color(Theme::TEXT_DIM),
+                            .size(12.0)
+                            .color(Theme::text_dim()),
                         );
                     });
                 }
             }
+            self.render_session = render_session;
         }
         self.ui_viewer(ui.ctx());
     }
@@ -740,7 +784,7 @@ impl ChatTab {
                         "Scroll to zoom · drag to pan",
                     ))
                     .size(11.0)
-                    .color(Theme::TEXT_DIM),
+                    .color(Theme::text_dim()),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button(tr(self.lang, "100%", "100%")).clicked() {
@@ -750,7 +794,7 @@ impl ChatTab {
                     let _ = ui.label(
                         RichText::new(format!("{:.0}%", v.zoom * 100.0))
                             .size(11.0)
-                            .color(Theme::TEXT_DIM),
+                            .color(Theme::text_dim()),
                     );
                 });
             });
@@ -780,7 +824,7 @@ impl ChatTab {
     }
 
     /// 主区域：弹幕区（上）+ 对话（下）
-    fn render_main(&mut self, ui: &mut egui::Ui, session: &Session) {
+    fn render_main(&mut self, ui: &mut egui::Ui, session: &RenderSession) {
         // 顶部标题行：右侧"目标 / 子代理 / 任务 / 计划"按钮（点击切换卡片，单选）。
         // 注意：不能直接 ui.with_layout(right_to_left)——它会推进父布局的 x cursor，
         // 导致**后续所有消息**整体右移 ~220px（历史回归：实机 AI 消息左缘 433 而非 214）。
@@ -809,6 +853,9 @@ impl ChatTab {
             );
             let mut right_ui = ui.new_child(egui::UiBuilder::new().max_rect(right_rect));
             right_ui.set_clip_rect(right_rect);
+            // 标题行按钮：统一紧凑内边距（全局 14px 会让按钮高低胖瘦不均）
+            right_ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+            right_ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
             right_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // 计划按钮（中文保留"📋 计划 ▸"，历史测试依赖）
                 let lang = self.lang;
@@ -827,12 +874,12 @@ impl ChatTab {
                 let btn = ui
                     .add(
                         egui::Button::new(RichText::new(label).size(12.0).color(if plan_active {
-                            Theme::ACCENT_LIGHT
+                            Theme::accent_light()
                         } else {
-                            Theme::TEXT_DIM
+                            Theme::text_dim()
                         }))
                         .fill(if plan_active || self.card == CardKind::Plan {
-                            Theme::BG_HOVER
+                            Theme::bg_hover()
                         } else {
                             egui::Color32::TRANSPARENT
                         })
@@ -862,13 +909,40 @@ impl ChatTab {
         }
         ui.add_space(2.0);
 
-        // ===== 标题行卡片（单选，点击按钮切换====
-        match self.card {
-            CardKind::Plan => self.render_plan_card(ui),
-            CardKind::Goals => self.render_goals_card(ui, session),
-            CardKind::Subagents => self.render_subagents_card(ui),
-            CardKind::Jobs => self.render_jobs_card(ui),
-            CardKind::None => {}
+        // ===== 标题行卡片：浮动层（egui::Window）=====
+        // 不挤占消息区布局（旧实现内联渲染，展开后把消息/输入往下推），
+        // 吸附在按钮行下方右侧；再次点击按钮或点窗口 ✕ 关闭。
+        if self.card != CardKind::None {
+            let lang = self.lang;
+            let (title, w) = match self.card {
+                CardKind::Plan => (tr(lang, "📋 计划", "📋 Plan"), 460.0),
+                CardKind::Goals => (tr(lang, "🎯 目标", "🎯 Goals"), 420.0),
+                CardKind::Subagents => (tr(lang, "🤖 子代理", "🤖 Subagents"), 440.0),
+                CardKind::Jobs => (tr(lang, "⏳ 任务", "⏳ Tasks"), 440.0),
+                CardKind::None => unreachable!(),
+            };
+            let anchor = egui::pos2(
+                (row_rect.right() - w).max(row_rect.left()),
+                row_rect.bottom() + 6.0,
+            );
+            let mut open = true;
+            egui::Window::new(title)
+                .id(egui::Id::new("floating_card"))
+                .fixed_pos(anchor)
+                .default_size([w, 320.0])
+                .resizable(true)
+                .collapsible(false)
+                .open(&mut open)
+                .show(ui.ctx(), |ui| match self.card {
+                    CardKind::Plan => self.render_plan_card(ui),
+                    CardKind::Goals => self.render_goals_card(ui, session),
+                    CardKind::Subagents => self.render_subagents_card(ui),
+                    CardKind::Jobs => self.render_jobs_card(ui),
+                    CardKind::None => {}
+                });
+            if !open {
+                self.card = CardKind::None;
+            }
         }
 
         // 模式选择 / 工作区栏 / 弹幕/ 消息+ 输入
@@ -886,12 +960,12 @@ impl ChatTab {
         let btn = ui
             .add(
                 egui::Button::new(RichText::new(text).size(12.0).color(if open {
-                    Theme::ACCENT_LIGHT
+                    Theme::accent_light()
                 } else {
-                    Theme::TEXT_DIM
+                    Theme::text_dim()
                 }))
                 .fill(if open {
-                    Theme::BG_HOVER
+                    Theme::bg_hover()
                 } else {
                     egui::Color32::TRANSPARENT
                 })
@@ -956,11 +1030,11 @@ impl ChatTab {
         let (card_rect, _) =
             ui.allocate_exact_size(vec2(ui.available_width(), card_h), egui::Sense::hover());
         let card_painter = ui.painter_at(card_rect);
-        card_painter.rect_filled(card_rect, 10.0, Theme::BG_ELEVATED);
+        card_painter.rect_filled(card_rect, 10.0, Theme::bg_elevated());
         card_painter.rect_stroke(
             card_rect,
             10.0,
-            egui::Stroke::new(1.0, Theme::BORDER),
+            egui::Stroke::new(1.0, Theme::border()),
             egui::StrokeKind::Inside,
         );
         let mut card_ui =
@@ -971,7 +1045,7 @@ impl ChatTab {
             card_ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(tr(lang, "🗺 计划", "🗺 Plan"))
-                        .color(Theme::ACCENT_LIGHT)
+                        .color(Theme::accent_light())
                         .strong(),
                 );
                 let (state_zh, state_en) =
@@ -981,9 +1055,9 @@ impl ChatTab {
                         ("未启用", "inactive")
                     };
                 let color = if self.plan_mode == crate::engine::plan::PlanMode::Active {
-                    Theme::OK
+                    Theme::ok()
                 } else {
-                    Theme::TEXT_DIM
+                    Theme::text_dim()
                 };
                 ui.label(
                     RichText::new(format!("（{}）", tr(lang, state_zh, state_en)))
@@ -1005,11 +1079,11 @@ impl ChatTab {
                                 "No plan yet. Ask the AI to enter plan mode (it plans before \
                                  acting), or wait for plan_write output to appear here.",
                             ))
-                            .color(Theme::TEXT_FAINT),
+                            .color(Theme::text_faint()),
                         );
                     } else {
                         let content = self.plan_content.clone();
-                        self.render_rich(ui, &content, 7001u64, Theme::TEXT);
+                        self.render_rich(ui, &content, 7001u64, Theme::text());
                     }
                 });
         }
@@ -1017,16 +1091,16 @@ impl ChatTab {
     }
 
     /// 目标卡片：fold goal/change 事件；操作经 engine.goal_op 持久化
-    fn render_goals_card(&mut self, ui: &mut egui::Ui, session: &Session) {
+    fn render_goals_card(&mut self, ui: &mut egui::Ui, session: &RenderSession) {
         let card_h = 170.0;
         let (card_rect, _) =
             ui.allocate_exact_size(vec2(ui.available_width(), card_h), egui::Sense::hover());
         let painter = ui.painter_at(card_rect);
-        painter.rect_filled(card_rect, 10.0, Theme::BG_ELEVATED);
+        painter.rect_filled(card_rect, 10.0, Theme::bg_elevated());
         painter.rect_stroke(
             card_rect,
             10.0,
-            egui::Stroke::new(1.0, Theme::BORDER),
+            egui::Stroke::new(1.0, Theme::border()),
             egui::StrokeKind::Inside,
         );
         let mut card_ui =
@@ -1035,7 +1109,7 @@ impl ChatTab {
         card_ui.horizontal(|ui| {
             ui.label(
                 RichText::new(tr(self.lang, "🎯 目标", "🎯 Goals"))
-                    .color(Theme::ACCENT_LIGHT)
+                    .color(Theme::accent_light())
                     .strong(),
             );
             let active = self.goals.active_count();
@@ -1047,9 +1121,9 @@ impl ChatTab {
                 })
                 .size(11.0)
                 .color(if active > 0 {
-                    Theme::OK
+                    Theme::ok()
                 } else {
-                    Theme::TEXT_DIM
+                    Theme::text_dim()
                 }),
             );
         });
@@ -1062,14 +1136,14 @@ impl ChatTab {
                 TextEdit::singleline(&mut self.goal_input)
                     .hint_text(
                         RichText::new(tr(lang, "新目标描述：", "New goal: "))
-                            .color(Theme::TEXT_FAINT),
+                            .color(Theme::text_faint()),
                     )
                     .desired_width(w)
-                    .text_color(Theme::TEXT),
+                    .text_color(Theme::text()),
             );
             let clicked = ui
                 .add(egui::Button::new(
-                    RichText::new(tr(lang, "创建", "Create")).color(Theme::ACCENT_LIGHT),
+                    RichText::new(tr(lang, "创建", "Create")).color(Theme::accent_light()),
                 ))
                 .clicked()
                 || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
@@ -1088,10 +1162,10 @@ impl ChatTab {
             .show(&mut card_ui, |ui| {
                 for g in &goals {
                     let color = match g.phase {
-                        crate::engine::goal::GoalPhase::Active => Theme::OK,
-                        crate::engine::goal::GoalPhase::Paused => Theme::WARN,
-                        crate::engine::goal::GoalPhase::Blocked => Theme::ERR,
-                        crate::engine::goal::GoalPhase::Complete => Theme::TEXT_FAINT,
+                        crate::engine::goal::GoalPhase::Active => Theme::ok(),
+                        crate::engine::goal::GoalPhase::Paused => Theme::warn(),
+                        crate::engine::goal::GoalPhase::Blocked => Theme::err(),
+                        crate::engine::goal::GoalPhase::Complete => Theme::text_faint(),
                     };
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("● {}", g.objective)).color(color));
@@ -1154,11 +1228,11 @@ impl ChatTab {
         let (card_rect, _) =
             ui.allocate_exact_size(vec2(ui.available_width(), card_h), egui::Sense::hover());
         let painter = ui.painter_at(card_rect);
-        painter.rect_filled(card_rect, 10.0, Theme::BG_ELEVATED);
+        painter.rect_filled(card_rect, 10.0, Theme::bg_elevated());
         painter.rect_stroke(
             card_rect,
             10.0,
-            egui::Stroke::new(1.0, Theme::BORDER),
+            egui::Stroke::new(1.0, Theme::border()),
             egui::StrokeKind::Inside,
         );
         let mut card_ui =
@@ -1167,7 +1241,7 @@ impl ChatTab {
         card_ui.horizontal(|ui| {
             ui.label(
                 RichText::new(tr(self.lang, "🤖 子代理", "🤖 Subagents"))
-                    .color(Theme::ACCENT_LIGHT)
+                    .color(Theme::accent_light())
                     .strong(),
             );
             ui.label(Theme::dim(&format!(
@@ -1185,10 +1259,10 @@ impl ChatTab {
             .show(&mut card_ui, |ui| {
                 for d in &subs {
                     let color = match d.status.as_str() {
-                        "done" => Theme::OK,
-                        "failed" => Theme::ERR,
-                        "running" => Theme::CYAN,
-                        _ => Theme::TEXT_DIM,
+                        "done" => Theme::ok(),
+                        "failed" => Theme::err(),
+                        "running" => Theme::cyan(),
+                        _ => Theme::text_dim(),
                     };
                     let icon = match d.status.as_str() {
                         "running" => "⏳",
@@ -1210,7 +1284,7 @@ impl ChatTab {
                         ui.label(
                             RichText::new(truncate(sum, 200))
                                 .size(11.0)
-                                .color(Theme::TEXT_DIM),
+                                .color(Theme::text_dim()),
                         );
                     }
                     ui.add_space(3.0);
@@ -1232,11 +1306,11 @@ impl ChatTab {
         let (card_rect, _) =
             ui.allocate_exact_size(vec2(ui.available_width(), card_h), egui::Sense::hover());
         let painter = ui.painter_at(card_rect);
-        painter.rect_filled(card_rect, 10.0, Theme::BG_ELEVATED);
+        painter.rect_filled(card_rect, 10.0, Theme::bg_elevated());
         painter.rect_stroke(
             card_rect,
             10.0,
-            egui::Stroke::new(1.0, Theme::BORDER),
+            egui::Stroke::new(1.0, Theme::border()),
             egui::StrokeKind::Inside,
         );
         let mut card_ui =
@@ -1247,7 +1321,7 @@ impl ChatTab {
         card_ui.horizontal(|ui| {
             ui.label(
                 RichText::new(tr(lang, "⏳ 任务", "⏳ Jobs"))
-                    .color(Theme::ACCENT_LIGHT)
+                    .color(Theme::accent_light())
                     .strong(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1267,10 +1341,10 @@ impl ChatTab {
             .show(&mut card_ui, |ui| {
                 for job in &jobs {
                     let color = match job.status {
-                        crate::engine::jobs::JobStatus::Running => Theme::CYAN,
-                        crate::engine::jobs::JobStatus::Done => Theme::OK,
-                        crate::engine::jobs::JobStatus::Failed => Theme::ERR,
-                        crate::engine::jobs::JobStatus::Pending => Theme::TEXT_DIM,
+                        crate::engine::jobs::JobStatus::Running => Theme::cyan(),
+                        crate::engine::jobs::JobStatus::Done => Theme::ok(),
+                        crate::engine::jobs::JobStatus::Failed => Theme::err(),
+                        crate::engine::jobs::JobStatus::Pending => Theme::text_dim(),
                     };
                     let icon = match job.status {
                         crate::engine::jobs::JobStatus::Running => "⏳",
@@ -1294,7 +1368,7 @@ impl ChatTab {
                         ui.label(
                             RichText::new(truncate(r, 140))
                                 .size(11.0)
-                                .color(Theme::TEXT_DIM),
+                                .color(Theme::text_dim()),
                         );
                     }
                     ui.add_space(3.0);
@@ -1314,61 +1388,7 @@ impl ChatTab {
     }
 
     /// 标题行下方其余区域：模式选择 / 工作区栏 / 弹幕/ 消息+ 输入区
-    fn render_body_bottom(&mut self, ui: &mut egui::Ui, session: &Session) {
-        // ===== 模式选择（标/ PTC / 极简 / 创造，对齐 DSH agent-presets====
-        // horizontal_wrapped 会污染父布局 x（子布局宽=内容宽 → 父 cursor.x
-        // 推进 ~420px，后续工作区栏/弹幕/消息区整体右移 = 实机"AI 消息偏移"）。
-        // 正确做法：allocate 整行 + 独立子 ui（子 ui 内随便 wrap，不污染父）。
-        // 小窗口（<450px 可用高）隐藏模式行，把高度让给消息区。
-        if ui.available_height() > 450.0 {
-            let mode_h = 28.0;
-            let (mode_rect, _) =
-                ui.allocate_exact_size(vec2(ui.available_width(), mode_h), egui::Sense::hover());
-            let mut mode_ui = ui.new_child(egui::UiBuilder::new().max_rect(mode_rect));
-            mode_ui.set_clip_rect(mode_rect);
-            mode_ui.horizontal_wrapped(|ui| {
-                ui.label(Theme::dim(&tr(self.lang, "模式:", "Mode:")));
-                for p in AgentPreset::all() {
-                    let selected = session.preset == p;
-                    let label = if selected {
-                        RichText::new(format!("● {}", p.name())).color(Theme::ACCENT_LIGHT)
-                    } else {
-                        RichText::new(p.name()).color(Theme::TEXT_DIM)
-                    };
-                    if ui.selectable_label(selected, label).clicked() && !selected {
-                        let id = session.id.clone();
-                        let mut engine = self.engine.lock().unwrap();
-                        match engine.set_session_preset(&id, p) {
-                            Ok(()) => {
-                                log::info!("session {} switched to {}", id, p.id());
-                                drop(engine);
-                                // 本地同步 preset（引擎已持久化）。不重开会话—
-                                // 重开会话会把视口跳回消息区底部，模式行在顶部
-                                // 滚出视野，看起来点击没反
-                                if let Some(s) = &mut self.current_session {
-                                    s.preset = p;
-                                }
-                                self.status = format!(
-                                    "{} {}",
-                                    tr(self.lang, "已切换模式", "Mode switched"),
-                                    p.name()
-                                );
-                            }
-                            Err(e) => self.error = Some(format!("切换模式失败：{e:#}")),
-                        }
-                    }
-                }
-                // 长描述只在右栏足够宽（按描述能排同一行，1010px）时显示
-                // 否则换行独占 1-2 行挤占消息区，历史消息可见性优
-                if ui.available_width() > 1050.0 {
-                    ui.label(Theme::dim(session.preset.description()));
-                }
-            });
-            ui.add_space(4.0);
-            ui.separator();
-            ui.add_space(2.0);
-        }
-
+    fn render_body_bottom(&mut self, ui: &mut egui::Ui, session: &RenderSession) {
         // ===== 工作区栏（窄栏时自动换行；窗口矮时隐藏腾空间====
         // horizontal_wrapped 污染父布局 x（同上），用 allocate 子 ui 隔离。
         // 小窗口（<420px）隐藏，把高度让给消息区。
@@ -1387,14 +1407,14 @@ impl ChatTab {
                     TextEdit::singleline(&mut self.ws_input)
                         .hint_text(
                             RichText::new(tr(lang, "打开工作区目录：", "Open workspace dir: "))
-                                .color(Theme::TEXT_FAINT),
+                                .color(Theme::text_faint()),
                         )
                         .desired_width(w)
-                        .text_color(Theme::TEXT),
+                        .text_color(Theme::text()),
                 );
                 let browse = ui
                     .add(egui::Button::new(
-                        RichText::new(tr(lang, "📂 浏览…", "📂 Browse…")).color(Theme::TEXT_DIM),
+                        RichText::new(tr(lang, "📂 浏览…", "📂 Browse…")).color(Theme::text_dim()),
                     ))
                     .on_hover_text(tr(lang, "打开系统目录选择器", "Open system folder picker"));
                 if browse.clicked() {
@@ -1419,7 +1439,7 @@ impl ChatTab {
                 }
                 let opened = ui
                     .add(egui::Button::new(
-                        RichText::new(tr(lang, "打开", "Open")).color(Theme::ACCENT_LIGHT),
+                        RichText::new(tr(lang, "打开", "Open")).color(Theme::accent_light()),
                     ))
                     .on_hover_text(tr(
                         lang,
@@ -1478,7 +1498,7 @@ impl ChatTab {
         painter.hline(
             dm_rect.x_range(),
             dm_rect.bottom(),
-            egui::Stroke::new(1.0, Theme::BORDER),
+            egui::Stroke::new(1.0, Theme::border()),
         );
 
         // 弹幕标题
@@ -1488,8 +1508,23 @@ impl ChatTab {
             egui::Align2::LEFT_TOP,
             tr(self.lang, "🎯 AI 思考", "🎯 AI thinking"),
             FontId::proportional(11.0),
-            Theme::TEXT_FAINT,
+            Theme::text_faint(),
         );
+        // 空态提示：无弹幕时补一行弱提示，避免"黑洞块"观感
+        if dm_height > 0.0 && self.danmaku.is_empty() {
+            let hint = tr(
+                self.lang,
+                "思考过程将在这里飘过…",
+                "Thinking will float by here…",
+            );
+            painter2.text(
+                egui::pos2(dm_rect.left() + 90.0, dm_rect.top() + 4.0),
+                egui::Align2::LEFT_TOP,
+                hint,
+                FontId::proportional(11.0),
+                Theme::text_dim(),
+            );
+        }
 
         // 推进 + 测量 + 绘制弹幕
         let dt = ui.input(|i| i.stable_dt.min(0.05));
@@ -1519,9 +1554,10 @@ impl ChatTab {
 
         // ===== 消息+ 输入区：手动矩形分配 =====
         // 输入框矩形锚定面板底部（任何窗口高度都完整可见），消息区在其上方占剩
-        let full = ui.available_rect_before_wrap();
+        // intersect max_rect：极矮窗下前面区域可能把 cursor 推出界，防止底部越窗
+        let full = ui.available_rect_before_wrap().intersect(ui.max_rect());
         // 输入区高度三档：96（正常）/ 80（矮窗）/ 64（超矮窗，单行紧凑模式）
-        let input_h = if full.height() < 70.0 {
+        let input_h = if full.height() < 140.0 {
             64.0
         } else if full.height() < 200.0 {
             80.0
@@ -1594,14 +1630,12 @@ impl ChatTab {
                     // 迭代，流式缓冲单独作为一条追加渲染。
                     let has_stream = !stream.is_empty() && session.running;
                     let mut last_resp: Option<egui::Response> = None;
-                    let mut last_user_resp: Option<egui::Response> = None;
                     self.last_user_msg_rect = None;
                     for (idx, msg) in session.messages.iter().enumerate() {
                         let resp = self.render_message(ui, msg, idx as u64, false);
                         last_resp = Some(resp.clone());
                         if matches!(msg, Message::User { .. }) {
                             self.last_user_msg_rect = Some(resp.rect);
-                            last_user_resp = Some(resp);
                         }
                     }
                     // 流式缓冲：只在回合运行中显示（中断/失败 ASSISTANT_MESSAGE
@@ -1615,12 +1649,22 @@ impl ChatTab {
                         let resp = self.render_message(ui, &msg, idx as u64, true);
                         last_resp = Some(resp);
                     }
-                    // 权限审批卡片（与 ask_user 选择卡片一致：消息区可点击）
-                    if let Some(a) = &self.pending_approval {
+                    // 权限审批卡片（与 ask_user 选择卡片一致：消息区可点击）。
+                    // 队列来自引擎审批注册表快照——跨会话的审批也可见
+                    // （旧实现只在"恰好当前会话收到事件"时渲染，切走后卡片
+                    // 丢失、引擎侧死等 300s 超时）
+                    let pending_approvals: Vec<
+                        crate::engine::approval::ApprovalRequest,
+                    > = self
+                        .engine
+                        .lock()
+                        .map(|e| e.pending_approvals())
+                        .unwrap_or_default();
+                    if let Some(a) = pending_approvals.first() {
                         ui.add_space(6.0);
                         let card = egui::Frame::default()
-                            .fill(Theme::BG_ELEVATED)
-                            .stroke(egui::Stroke::new(1.0, Theme::WARN))
+                            .fill(Theme::bg_elevated())
+                            .stroke(egui::Stroke::new(1.0, Theme::warn()))
                             .corner_radius(egui::CornerRadius::same(10))
                             .inner_margin(egui::Margin::same(12));
                         let cr = card.show(ui, |ui| {
@@ -1630,19 +1674,42 @@ impl ChatTab {
                                     "🔐 需要授权：写工作区外",
                                     "🔐 Authorization needed: outside workspace",
                                 ))
-                                .color(Theme::WARN)
+                                .color(Theme::warn())
                                 .strong(),
                             );
+                            if a.session_id != session.id {
+                                ui.label(
+                                    RichText::new(tr(
+                                        self.lang,
+                                        &format!("（来自会话 {}）", a.session_id),
+                                        &format!("(from session {})", a.session_id),
+                                    ))
+                                    .size(11.0)
+                                    .color(Theme::text_dim()),
+                                );
+                            }
                             ui.add_space(4.0);
                             ui.label(Theme::dim(&a.reason));
                             ui.add_space(2.0);
                             ui.label(Theme::dim(a.target.as_str()));
+                            if pending_approvals.len() > 1 {
+                                ui.add_space(2.0);
+                                ui.label(
+                                    RichText::new(tr(
+                                        self.lang,
+                                        &format!("另有 {} 个待审批请求排队中", pending_approvals.len() - 1),
+                                        &format!("{} more approvals queued", pending_approvals.len() - 1),
+                                    ))
+                                    .size(11.0)
+                                    .color(Theme::text_dim()),
+                                );
+                            }
                             ui.add_space(6.0);
                             ui.horizontal_wrapped(|ui| {
                                 let opts = [
-                                    ("A  允许本次", crate::engine::approval::ApprovalDecision::Allow, Theme::OK),
-                                    ("B  拒绝", crate::engine::approval::ApprovalDecision::Deny, Theme::ERR),
-                                    ("C  总是允许", crate::engine::approval::ApprovalDecision::AlwaysAllow, Theme::ACCENT),
+                                    ("A  允许本次", crate::engine::approval::ApprovalDecision::Allow, Theme::ok()),
+                                    ("B  拒绝", crate::engine::approval::ApprovalDecision::Deny, Theme::err()),
+                                    ("C  总是允许", crate::engine::approval::ApprovalDecision::AlwaysAllow, Theme::accent()),
                                 ];
                                 for (label, dec, fill) in opts {
                                     let btn = ui.add(
@@ -1670,8 +1737,8 @@ impl ChatTab {
                         if !q.question.is_empty() && q.session_id == session.id {
                             ui.add_space(6.0);
                             let card = egui::Frame::default()
-                                .fill(Theme::BG_ELEVATED)
-                                .stroke(egui::Stroke::new(1.0, Theme::ACCENT))
+                                .fill(Theme::bg_elevated())
+                                .stroke(egui::Stroke::new(1.0, Theme::accent()))
                                 .corner_radius(egui::CornerRadius::same(10))
                                 .inner_margin(egui::Margin::same(12));
                             let cr = card.show(ui, |ui| {
@@ -1681,7 +1748,7 @@ impl ChatTab {
                                     "❓ 需要你的选择",
                                     "❓ Your input needed",
                                     ))
-                                    .color(Theme::ACCENT_LIGHT)
+                                    .color(Theme::accent_light())
                                     .strong(),
                                 );
                                 if let Some(h) = &q.header {
@@ -1689,7 +1756,7 @@ impl ChatTab {
                                     ui.label(Theme::dim(h));
                                 }
                                 ui.add_space(4.0);
-                                ui.label(RichText::new(&q.question).color(Theme::TEXT));
+                                ui.label(RichText::new(&q.question).color(Theme::text()));
                                 if !q.options.is_empty() {
                                     ui.add_space(6.0);
                                     ui.horizontal_wrapped(|ui| {
@@ -1699,7 +1766,7 @@ impl ChatTab {
                                                     RichText::new(opt.clone())
                                                         .color(Color32::WHITE),
                                                 )
-                                                .fill(Theme::ACCENT)
+                                                .fill(Theme::accent())
                                                 .corner_radius(8.0),
                                             );
                                             if btn
@@ -1753,7 +1820,7 @@ impl ChatTab {
                                     "开始对话 —— 输入你的问题，AI 的思考会飘过",
                                     "Start chatting — type your question; the AI's thinking floats by",
                                 ))
-                                .color(Theme::TEXT_FAINT),
+                                .color(Theme::text_faint()),
                             );
                         });
                     }
@@ -1807,9 +1874,8 @@ impl ChatTab {
                     }
                 }
             }
-            // 处理权限审批动作（用户点了 A/B/C → 回传引擎）
+            // 处理权限审批动作（用户点了 A/B/C → 回传引擎注册表）
             if let Some((aid, decision)) = approval_action {
-                self.pending_approval = None;
                 let engine = self.engine.clone();
                 let resolved = engine.lock().unwrap().resolve_approval(&aid, decision);
                 info!("approval {aid} resolved={resolved} {:?}", decision);
@@ -1818,92 +1884,370 @@ impl ChatTab {
     }
 
     /// 输入区：Enter 发送（16px 亮色字体 + 圆角容器 + 焦点高亮；矩形由调用方钉底）
-    fn render_input(&mut self, ui: &mut egui::Ui, session: &Session, input_rect: egui::Rect) {
-        // 容器背景（与面板区分的深色凹槽）
-        ui.painter().rect_filled(input_rect, 10.0, Theme::BG);
-        // 压缩模式（输入区 <70px 高）：减小边+ 单行输入，防止内容溢出被窗口裁掉
-        let compact = input_rect.height() < 70.0;
-        let pad_y = if compact { 6.0 } else { 12.0 };
-        let mut input_ui =
-            ui.new_child(egui::UiBuilder::new().max_rect(input_rect.shrink2(vec2(14.0, pad_y))));
-        input_ui.set_clip_rect(input_rect);
-        let mut focused = false;
-        // 用引事件流的最running（避免陈clone 导致按钮永久禁用
-        let running_now = self
-            .current_session
-            .as_ref()
-            .map(|s| s.running)
-            .unwrap_or(false);
-        // 沙箱切换：Arc clone 避免对 self 的额外捕获（与 TextEdit 借用互不冲突）
-        let engine = self.engine.clone();
-        let mut sb_mode = engine
-            .lock()
-            .map(|e| e.sandbox_mode())
-            .unwrap_or(SandboxMode::DangerFullAccess);
-        input_ui.horizontal(|ui| {
-            // 沙箱模式快速切换（仅窗口足够宽时显示，避免窄窗口挤压输入/发送控件挤压出界）
-            if ui.available_width() > 260.0 {
-                let sb_short = match sb_mode {
-                    SandboxMode::DangerFullAccess => "全",
-                    SandboxMode::WorkspaceWrite => "写",
-                    SandboxMode::ReadOnly => "只读",
-                };
-                let sb_label = RichText::new(sb_short).size(14.0).color(match sb_mode {
-                    SandboxMode::DangerFullAccess => Theme::WARN,
-                    SandboxMode::WorkspaceWrite => Theme::OK,
-                    SandboxMode::ReadOnly => Theme::CYAN,
-                });
-                if ui
-                    .small_button(sb_label)
-                    .on_hover_text(format!("沙箱模式：{}（点击切换）", sb_mode.as_str()))
-                    .clicked()
-                {
-                    sb_mode = match sb_mode {
-                        SandboxMode::DangerFullAccess => SandboxMode::WorkspaceWrite,
-                        SandboxMode::WorkspaceWrite => SandboxMode::ReadOnly,
-                        SandboxMode::ReadOnly => SandboxMode::DangerFullAccess,
-                    };
-                    if let Ok(mut e) = engine.lock() {
-                        e.set_sandbox_mode(sb_mode);
+    /// 输入区（ZCode 风格）：一个 elevated 圆角容器 = 透明多行输入（上）+
+    /// 底部工具行（左：模型/思考深度/权限 chips，右：发送按钮）。
+    /// 快捷切换就地完成，不挤占消息区。
+    fn render_input(&mut self, ui: &mut egui::Ui, session: &RenderSession, input_rect: egui::Rect) {
+        let lang = self.lang;
+        let compact = input_rect.height() < 78.0;
+        let running_now = session.running;
+
+        // 容器底色先铺（后画会盖住工具行 chips——历史 bug）
+        ui.painter()
+            .rect_filled(input_rect, 12.0, Theme::bg_elevated());
+        let inner = input_rect.shrink2(vec2(12.0, if compact { 6.0 } else { 10.0 }));
+        let bar_h = if compact { 24.0 } else { 30.0 };
+        let chip_h = if compact { 22.0 } else { 26.0 };
+        // 附件条（有附件时占据编辑区顶部一行）
+        let attach_h = if self.attachments.is_empty() {
+            0.0
+        } else {
+            26.0
+        };
+        let edit_rect = egui::Rect::from_min_max(
+            egui::pos2(inner.left(), inner.top() + attach_h),
+            egui::pos2(inner.right(), inner.bottom() - bar_h - 6.0),
+        );
+        if attach_h > 0.0 {
+            let att_rect = egui::Rect::from_min_max(
+                inner.min,
+                egui::pos2(inner.right(), inner.top() + attach_h),
+            );
+            let mut att_ui = ui.new_child(egui::UiBuilder::new().max_rect(att_rect));
+            att_ui.set_clip_rect(att_rect);
+            att_ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
+            att_ui.horizontal(|ui| {
+                let mut remove: Option<usize> = None;
+                for (i, path) in self.attachments.iter().enumerate() {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let short: String = name.chars().take(18).collect();
+                    let text = egui::RichText::new(format!("\u{1F4CE} {short} \u{2715}"))
+                        .size(10.5)
+                        .color(Theme::text_dim());
+                    if ui
+                        .add(
+                            egui::Button::new(text)
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(8.0)
+                                .min_size(egui::vec2(0.0, 20.0)),
+                        )
+                        .on_hover_text(path.display().to_string())
+                        .clicked()
+                    {
+                        remove = Some(i);
                     }
                 }
-                ui.add_space(2.0);
+                if let Some(i) = remove {
+                    self.attachments.remove(i);
+                }
+            });
+        }
+        let bar_rect = egui::Rect::from_min_max(
+            egui::pos2(inner.left(), inner.bottom() - bar_h),
+            inner.right_bottom(),
+        );
+
+        // ===== 上：多行输入（透明背景，容器即视觉框） =====
+        let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+        let mut edit_ui = ui.new_child(egui::UiBuilder::new().max_rect(edit_rect));
+        edit_ui.set_clip_rect(edit_rect);
+        let input_rows = if compact {
+            1
+        } else {
+            self.input.lines().count().clamp(2, 6)
+        };
+        let edit = TextEdit::multiline(&mut self.input)
+            .font(egui::FontId::proportional(12.0))
+            .hint_text(
+                RichText::new(tr(lang, "描述任务…", "Describe the task…"))
+                    .color(Theme::text_faint())
+                    .size(13.0),
+            )
+            .desired_width(f32::INFINITY)
+            .desired_rows(input_rows)
+            .text_color(Theme::text())
+            .background_color(egui::Color32::TRANSPARENT)
+            .frame(egui::Frame::NONE)
+            .vertical_align(egui::Align::Center);
+        let edit_resp = edit_ui.add(edit);
+        let focused = edit_resp.has_focus();
+        // 仅聊天框自身持有（或刚失去）焦点时的 Enter 才发送（防止其它
+        // 输入框里按 Enter 误发草稿）
+        let entered = enter_pressed && (edit_resp.has_focus() || edit_resp.lost_focus());
+
+        // ===== 下：工具行（chips + 发送） =====
+        let mut bar_ui = ui.new_child(egui::UiBuilder::new().max_rect(bar_rect));
+        bar_ui.set_clip_rect(bar_rect);
+        // 紧凑均匀的 chip 间隙（默认 8px 配上 chip 自身内边距显得松散不齐）
+        bar_ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+        let mut send_clicked = false;
+        bar_ui.horizontal(|ui| {
+            // —— 左：📎 附件 + 等高图标 chips（⊞ 模型 / ✦ 思考 / 🛡 权限 / ◇ 模式）——
+            {
+                let n_att = self.attachments.len();
+                let label = if n_att > 0 {
+                    format!("\u{1F4CE} {n_att}")
+                } else {
+                    "\u{1F4CE}".to_string()
+                };
+                if chip_button(
+                    ui,
+                    &label,
+                    Theme::text_dim(),
+                    chip_h,
+                    &tr(
+                        lang,
+                        "附加文件（发送时内容注入消息；文本全文，超大截断）",
+                        "Attach files (contents injected into the message)",
+                    ),
+                ) {
+                    if let Some(paths) = rfd::FileDialog::new()
+                        .set_title(tr(lang, "选择文件", "Pick files"))
+                        .pick_files()
+                    {
+                        self.attachments.extend(paths);
+                    }
+                }
             }
-            // Enter 发送（Shift+Enter 换行）；回合运行Enter = 插话（引擎侧打断当前 step 续跑
-            let entered = ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-            // 宽度自适应：窄时按钮变窄，极窄时隐藏按钮（Enter 发送）
-            // 保证发送控件永远不会被挤出面板
-            // 按钮统一显示"发送"（无 ➤ 图标），文字在按钮内居中
-            let avail_w = ui.available_width();
-            let lang = self.lang;
-            let (send_w, send_label) = if avail_w < 84.0 {
-                (0.0, String::new()) // 极窄：隐藏按钮，仅 Enter 发送
-            } else if avail_w < 160.0 {
-                (52.0, tr(lang, "发送", "Send")) // 窄：紧凑按钮
-            } else {
-                (64.0, tr(lang, "发送", "Send")) // 正常
-            };
-            let edit_w = (avail_w - send_w - 8.0).max(20.0);
-            let edit = TextEdit::multiline(&mut self.input)
-                .font(egui::FontId::proportional(16.0))
-                .hint_text(
-                    // 短 hint：窄输入框下 hint 换行会撑高 TextEdit 导致溢出窗口
-                    RichText::new(tr(lang, "输入消息…", "Type a message…"))
-                        .color(Theme::TEXT_DIM)
-                        .size(15.0),
-                )
-                .desired_width(edit_w)
-                .desired_rows(if compact { 1 } else { 2 })
-                .text_color(Color32::from_rgb(243, 246, 252))
-                .background_color(Theme::BG)
-                .vertical_align(egui::Align::Center);
-            let edit_resp = ui.add(edit);
-            focused = edit_resp.has_focus();
-            let mut send_clicked = false;
-            if send_w > 0.0 {
+            // 发送模式 chip（⚡插话 / ⏳排队）：点击切换
+            {
+                let (icon, tip) = match self.send_mode {
+                    SendMode::Interject => (
+                        "\u{26A1}",
+                        tr(
+                            lang,
+                            "插话模式：回合运行中发送会打断当前步骤并立即处理",
+                            "Interject: interrupts the running turn",
+                        ),
+                    ),
+                    SendMode::Queue => (
+                        "\u{23F3}",
+                        tr(
+                            lang,
+                            "排队模式：回合运行中发送会排队，当前回合结束后依次执行",
+                            "Queue: runs after the current turn finishes (FIFO)",
+                        ),
+                    ),
+                };
+                let qn = self
+                    .engine
+                    .lock()
+                    .map(|e| e.queued_count(&session.id))
+                    .unwrap_or(0);
+                let label = if qn > 0 {
+                    format!("{icon} {qn}")
+                } else {
+                    icon.to_string()
+                };
+                if chip_button(
+                    ui,
+                    &label,
+                    if self.send_mode == SendMode::Queue {
+                        Theme::accent_light()
+                    } else {
+                        Theme::text_dim()
+                    },
+                    chip_h,
+                    &tip,
+                ) {
+                    self.send_mode = match self.send_mode {
+                        SendMode::Interject => SendMode::Queue,
+                        SendMode::Queue => SendMode::Interject,
+                    };
+                }
+            }
+            let mut model_cur = None;
+            if ui.available_width() > 150.0 {
+                let current = self.engine.lock().unwrap().effective_model(&session.id);
+                let short = current
+                    .strip_prefix("deepseek-")
+                    .unwrap_or(&current)
+                    .to_string();
+                let opts: Vec<(String, String)> = crate::core::llm::DEEPSEEK_MODELS
+                    .iter()
+                    .map(|m| (m.to_string(), m.to_string()))
+                    .collect();
+                let opt_refs: Vec<(&str, &str)> =
+                    opts.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+                if let Some(v) = ui_icon_chip(
+                    ui,
+                    "model",
+                    "\u{229E}",
+                    &short,
+                    &opt_refs,
+                    &format!("{current}\n（点击切换模型，下一回合生效）"),
+                    chip_h,
+                ) {
+                    model_cur = Some(v);
+                }
+            }
+            if let Some(v) = model_cur {
+                self.engine
+                    .lock()
+                    .unwrap()
+                    .set_session_model(&session.id, &v);
+                self.status = tr(lang, "模型已切换", "Model switched").into();
+            }
+            // 思考深度
+            let mut effort_cur = None;
+            if ui.available_width() > 110.0 {
+                let current = self.engine.lock().unwrap().effective_effort(&session.id);
+                let label_of = |e: &str| -> String {
+                    match e {
+                        "none" => "\u{2726} 关".into(),
+                        "low" => "\u{2726} 低".into(),
+                        "high" => "\u{2726} 高".into(),
+                        _ => "\u{2726} 最高".into(),
+                    }
+                };
+                let short_cur = match current.as_str() {
+                    "none" => "关".to_string(),
+                    "low" => "低".to_string(),
+                    "high" => "高".to_string(),
+                    _ => "最高".to_string(),
+                };
+                let opts: Vec<(String, String)> = crate::core::llm::REASONING_EFFORTS
+                    .iter()
+                    .map(|e| (label_of(e), e.to_string()))
+                    .collect();
+                let opt_refs: Vec<(&str, &str)> =
+                    opts.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+                if let Some(v) = ui_icon_chip(
+                    ui,
+                    "effort",
+                    "\u{2726}",
+                    &short_cur,
+                    &opt_refs,
+                    "思考深度（reasoning_effort，下一回合生效）",
+                    chip_h,
+                ) {
+                    effort_cur = Some(v);
+                }
+            }
+            if let Some(v) = effort_cur {
+                self.engine
+                    .lock()
+                    .unwrap()
+                    .set_session_effort(&session.id, &v);
+                self.status = tr(lang, "思考深度已切换", "Thinking effort switched").into();
+            }
+            // 权限（沙箱）
+            let mut sb_cur: Option<SandboxMode> = None;
+            {
+                let current = self
+                    .engine
+                    .lock()
+                    .map(|e| e.effective_sandbox(&session.id))
+                    .unwrap_or(SandboxMode::DangerFullAccess);
+                let name_of = |m: SandboxMode| -> String {
+                    match m {
+                        SandboxMode::DangerFullAccess => "全访问".into(),
+                        SandboxMode::WorkspaceWrite => "工作区可写".into(),
+                        SandboxMode::ReadOnly => "只读".into(),
+                    }
+                };
+                let short_of = |m: SandboxMode| -> String {
+                    match m {
+                        SandboxMode::DangerFullAccess => "全".into(),
+                        SandboxMode::WorkspaceWrite => "写".into(),
+                        SandboxMode::ReadOnly => "只读".into(),
+                    }
+                };
+                let all = [
+                    SandboxMode::DangerFullAccess,
+                    SandboxMode::WorkspaceWrite,
+                    SandboxMode::ReadOnly,
+                ];
+                let opts: Vec<(String, SandboxMode)> =
+                    all.iter().map(|m| (name_of(*m), *m)).collect();
+                let opt_refs: Vec<(&str, &str)> =
+                    opts.iter().map(|(n, m)| (n.as_str(), m.as_str())).collect();
+                if let Some(v) = ui_icon_chip(
+                    ui,
+                    "sandbox",
+                    "\u{1F6E1}",
+                    &short_of(current),
+                    &opt_refs,
+                    "权限/沙箱：bash/pwsh 与写操作的执行边界",
+                    chip_h,
+                ) {
+                    if let Some(m) = SandboxMode::parse(&v) {
+                        sb_cur = Some(m);
+                    }
+                }
+            }
+            if let Some(m) = sb_cur {
+                self.engine
+                    .lock()
+                    .unwrap()
+                    .set_session_sandbox(&session.id, m);
+                self.status = tr(lang, "权限已切换", "Permissions switched").into();
+            }
+            // 模式（Agent 预设，会话级）
+            let mut preset_cur: Option<AgentPreset> = None;
+            if ui.available_width() > 130.0 {
+                let current = session.preset;
+                let opts: Vec<(String, AgentPreset)> = AgentPreset::all()
+                    .iter()
+                    .map(|p| (p.name().to_string(), *p))
+                    .collect();
+                let opt_refs: Vec<(&str, &str)> =
+                    opts.iter().map(|(n, p)| (n.as_str(), p.id())).collect();
+                if let Some(v) = ui_icon_chip(
+                    ui,
+                    "preset",
+                    "\u{25C7}",
+                    current.name(),
+                    &opt_refs,
+                    "Agent 模式（会话级，下一回合生效）",
+                    chip_h,
+                ) {
+                    if let Some(p) = AgentPreset::parse(&v) {
+                        preset_cur = Some(p);
+                    }
+                }
+            }
+            if let Some(p) = preset_cur {
+                let id = session.id.clone();
+                let mut engine = self.engine.lock().unwrap();
+                match engine.set_session_preset(&id, p) {
+                    Ok(()) => {
+                        drop(engine);
+                        if let Some(s) = &mut self.current_session {
+                            s.preset = p;
+                        }
+                        self.render_dirty = true;
+                        self.status =
+                            format!("{} {}", tr(lang, "已切换模式", "Mode switched"), p.name());
+                    }
+                    Err(e) => self.error = Some(format!("切换模式失败：{e:#}")),
+                }
+            }
+            // 右侧：状态反馈 + 发送/停止（胶囊）。
+            // 显式分配剩余宽度做右对齐子 ui——`ui.with_layout(right_to_left)`
+            // 的子 ui 继承父 max_rect，胶囊会被推到容器右缘之外被裁
+            // （实机：发送按钮半截悬在输入框外）。
+            let rem = ui.available_size();
+            let right_rect = egui::Rect::from_min_size(
+                ui.cursor().min,
+                egui::vec2(rem.x.max(70.0), bar_rect.height()),
+            )
+            .intersect(bar_rect);
+            let (alloc_rect, _) = ui.allocate_exact_size(right_rect.size(), egui::Sense::hover());
+            let mut right_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(alloc_rect)
+                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            );
+            right_ui.set_clip_rect(alloc_rect);
+            {
+                let ui = &mut right_ui;
                 if running_now {
-                    // 运行中：发送按钮替换为"停止"按钮（中断当前回合）
-                    let stop_label = if send_w < 160.0 {
+                    let stop_label = if ui.available_width() < 120.0 {
                         "⏹".to_string()
                     } else {
                         tr(lang, "⏹ 停止", "⏹ Stop")
@@ -1911,11 +2255,14 @@ impl ChatTab {
                     let stop = ui
                         .add(
                             egui::Button::new(
-                                RichText::new(stop_label).size(15.0).color(Color32::WHITE),
+                                RichText::new(stop_label).size(13.0).color(Color32::WHITE),
                             )
-                            .fill(Theme::ERR)
-                            .corner_radius(8.0)
-                            .min_size(vec2(send_w, if compact { 30.0 } else { 38.0 })),
+                            .fill(Theme::err())
+                            .corner_radius(if compact { 11.0 } else { 14.0 })
+                            .min_size(vec2(
+                                if compact { 52.0 } else { 64.0 },
+                                if compact { 22.0 } else { 28.0 },
+                            )),
                         )
                         .on_hover_text(tr(
                             lang,
@@ -1929,53 +2276,85 @@ impl ChatTab {
                         self.status = tr(lang, "已请求停止", "Stop requested").into();
                     }
                 } else {
+                    let send_label = if ui.available_width() < 120.0 {
+                        "➤".to_string()
+                    } else {
+                        tr(lang, "发送", "Send")
+                    };
                     send_clicked = ui
                         .add_enabled(
                             !self.input.trim().is_empty(),
                             egui::Button::new(
-                                RichText::new(send_label).size(15.0).color(Color32::WHITE),
+                                RichText::new(send_label).size(13.0).color(Color32::WHITE),
                             )
-                            .fill(Theme::ACCENT)
-                            .corner_radius(8.0)
-                            .min_size(vec2(send_w, if compact { 30.0 } else { 38.0 })),
+                            .fill(Theme::accent())
+                            .corner_radius(if compact { 11.0 } else { 14.0 })
+                            .min_size(vec2(
+                                if compact { 52.0 } else { 64.0 },
+                                if compact { 22.0 } else { 28.0 },
+                            )),
                         )
                         .clicked();
                 }
-            }
-            if (send_clicked || entered) && !self.input.trim().is_empty() {
-                let content = self.input.trim().to_string();
-                let id = session.id.clone();
-                let mut engine = self.engine.lock().unwrap();
-                match engine.send_message(&id, &content) {
-                    Ok(()) => {
-                        // 发送成功才清空（失败保留草稿）
-                        self.input.clear();
-                        self.status = tr(self.lang, "已发送", "Sent").into();
-                        // 注意：不要在此乐观追加用户消息/事件！
-                        // send_message 内部已同步把 user/message 事件推入通道，
-                        // 下一帧 pump() 会 push_event + project 投影显示。
-                        // 乐观双写是"消息显示两遍"的根因（历史回归）：
-                        // 事件通道 + project 无条件追加 → 同一内容渲染两次。
-                    }
-                    Err(e) => self.error = Some(format!("{e:#}")),
+                if !self.status.is_empty() {
+                    ui.label(Theme::dim(&self.status));
                 }
             }
         });
-        // 边框：聚焦时强调色高
+
+        // ===== 发送 =====
+        if (send_clicked || entered)
+            && (!self.input.trim().is_empty() || !self.attachments.is_empty())
+        {
+            // 附件内容注入消息文本（持久化/重放天然包含，零引擎改动）
+            let base = self.input.trim().to_string();
+            let content = compose_message_with_attachments(&base, &self.attachments);
+            if content.is_empty() {
+                self.status = tr(lang, "消息为空", "Empty message").into();
+            } else {
+                let id = session.id.clone();
+                let mut engine = self.engine.lock().unwrap();
+                // 排队模式 + 回合运行中 → 入队不打断（回合结束由 pump 逐条发出）
+                let running = {
+                    let shared = engine.shared_sessions();
+                    shared.get(id.as_str()).map(|x| x.running).unwrap_or(false)
+                };
+                if running && self.send_mode == SendMode::Queue {
+                    let pos = engine.enqueue_message(&id, &content);
+                    self.input.clear();
+                    self.attachments.clear();
+                    self.status = tr(
+                        lang,
+                        &format!("已排队（第 {pos} 位，当前回合结束后执行）"),
+                        &format!("Queued (#{pos}, runs after current turn)"),
+                    );
+                } else {
+                    match engine.send_message(&id, &content) {
+                        Ok(()) => {
+                            // 发送成功才清空（失败保留草稿与附件）。不要乐观追加
+                            // 用户消息——send_message 已推事件，双写 = 显示两遍。
+                            self.input.clear();
+                            self.attachments.clear();
+                            self.status = tr(lang, "已发送", "Sent").into();
+                        }
+                        Err(e) => self.error = Some(format!("{e:#}")),
+                    }
+                }
+            }
+        }
+
+        // 边框最后画（细线不遮内容）；底色已在开头铺（末尾填充会盖住 chips）
         let border = if focused {
-            Theme::ACCENT
+            Theme::accent()
         } else {
-            Theme::BORDER
+            Theme::border()
         };
         ui.painter().rect_stroke(
             input_rect,
-            10.0,
+            12.0,
             egui::Stroke::new(1.0, border),
             egui::StrokeKind::Inside,
         );
-        if !self.status.is_empty() {
-            input_ui.label(Theme::dim(&self.status));
-        }
     }
 
     fn render_message(
@@ -2007,7 +2386,7 @@ impl ChatTab {
                         let w = ui.fonts_mut(|f| {
                             f.layout_no_wrap(
                                 content.to_string(),
-                                FontId::proportional(14.0),
+                                FontId::proportional(12.0),
                                 Color32::WHITE,
                             )
                             .size()
@@ -2026,21 +2405,28 @@ impl ChatTab {
                     let left_space = (avail_w - bubble_w - 24.0 - 8.0).max(4.0);
                     ui.add_space(left_space);
                     let frame = egui::Frame::default()
-                        .fill(Theme::USER_BUBBLE)
+                        .fill(Theme::user_bubble())
                         .corner_radius(egui::CornerRadius::same(10))
                         .inner_margin(egui::Margin::symmetric(12, 8));
                     frame.show(ui, |ui| {
                         ui.set_max_width(bubble_w);
-                        ui.label(RichText::new(content).size(14.0).color(bubble_text_color()));
+                        ui.label(RichText::new(content).size(12.0).color(bubble_text_color()));
                     });
                 })
                 .response
             }
             Message::Assistant { content, .. } => {
+                // 纯工具调用消息（content 为空）：不渲染空气泡（历史视觉缺陷：
+                // 空白框 + 头像孤零零占一行）
+                if content.trim().is_empty() {
+                    return ui.allocate_response(egui::vec2(0.0, 0.0), egui::Sense::hover());
+                }
                 let avail_w = ui.available_width();
                 let max_bubble = (avail_w * 0.95).max(80.0).min(avail_w - 8.0);
+                // AI 消息无气泡（ZCode/ChatGPT 风格）：深色主题下浅灰气泡底
+                // 是大面积高对比色块（"丑"的主要来源）；纯文本直接落在背景上
                 let frame = egui::Frame::default()
-                    .fill(Theme::ASSISTANT_BUBBLE)
+                    .fill(egui::Color32::TRANSPARENT)
                     .corner_radius(egui::CornerRadius::same(10))
                     .inner_margin(egui::Margin::symmetric(12, 8));
                 // 图片渲染状态（&mut self 字段在闭包外取出，避免借用冲突
@@ -2058,7 +2444,7 @@ impl ChatTab {
                         // （严重卡顿 + 消息"闪现一大段"）；等 ASSISTANT_MESSAGE
                         // 完成后才走完整 markdown 渲染。
                         if streaming || !looks_like_markdown(content) {
-                            ui.label(RichText::new(content).color(Theme::TEXT));
+                            ui.label(RichText::new(content).size(12.0).color(Theme::text()));
                         } else {
                             // 解析结果缓存：同一内容只 parse 一次（弹幕动画期间
                             // 整窗高频重绘，重复 parse 是主要 CPU 热点）。
@@ -2083,7 +2469,7 @@ impl ChatTab {
                                 ui,
                                 &blocks,
                                 salt,
-                                Theme::TEXT,
+                                Theme::text(),
                                 base_dir.as_deref(),
                                 img_cache,
                                 viewer,
@@ -2097,25 +2483,179 @@ impl ChatTab {
             Message::Tool { content, .. } => {
                 // 直接 frame.show（左对齐）：不用 with_layout(left_to_right)——
                 // 它会推进父布局 x cursor，污染后续消息的对齐。
+                // 摘要提取 stdout/content 等主字段（复用弹幕摘要逻辑），
+                // 不展示原始 JSON 转义串；全量内容悬浮可看。
+                let (brief, full) = summarize_tool_result(true, content);
                 let frame = egui::Frame::default()
-                    .fill(Theme::BG_HOVER)
-                    .stroke(egui::Stroke::new(1.0, Theme::BORDER))
+                    .fill(Theme::bg_hover())
+                    .stroke(egui::Stroke::new(1.0, Theme::border()))
                     .corner_radius(egui::CornerRadius::same(8))
                     .inner_margin(egui::Margin::symmetric(10, 6));
-                frame
+                let resp = frame
                     .show(ui, |ui| {
                         ui.set_max_width((ui.available_width() * 0.92).max(80.0));
                         ui.label(
-                            RichText::new(format!("🔧 {}", truncate(content, 160)))
-                                .color(Theme::TEXT_DIM)
+                            RichText::new(truncate(&brief, 160))
+                                .color(Theme::text_dim())
                                 .monospace(),
-                        );
+                        )
                     })
-                    .response
+                    .response;
+                resp.on_hover_text(full)
             }
         };
         resp
     }
+}
+
+/// 附件内容注入上限（单文件）：超出部分截断并说明。
+const ATTACH_MAX_BYTES: u64 = 512 * 1024;
+
+/// 文本类扩展名白名单（内容直接注入）。
+const ATTACH_TEXT_EXTS: &[&str] = &[
+    "txt",
+    "md",
+    "markdown",
+    "rst",
+    "log",
+    "csv",
+    "tsv",
+    "json",
+    "jsonl",
+    "yaml",
+    "yml",
+    "toml",
+    "ini",
+    "cfg",
+    "conf",
+    "xml",
+    "html",
+    "htm",
+    "css",
+    "js",
+    "mjs",
+    "cjs",
+    "jsx",
+    "ts",
+    "tsx",
+    "py",
+    "pyi",
+    "rb",
+    "go",
+    "rs",
+    "java",
+    "kt",
+    "kts",
+    "c",
+    "h",
+    "cpp",
+    "hpp",
+    "cc",
+    "cs",
+    "swift",
+    "m",
+    "mm",
+    "php",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "ps1",
+    "bat",
+    "cmd",
+    "sql",
+    " graphql",
+    "proto",
+    "gradle",
+    "properties",
+    "env",
+    "gitignore",
+    "dockerignore",
+    "dockerfile",
+    "makefile",
+    "cmake",
+    "lock",
+];
+
+/// 判定文件是否按文本注入（扩展名白名单 + 无扩展名时 UTF-8 探测）。
+fn attach_is_text(path: &std::path::Path) -> bool {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if ext.is_empty() {
+        // 无扩展名：读前 4KB 探测 UTF-8 有效性
+        return match std::fs::read(path) {
+            Ok(bytes) => {
+                let probe = &bytes[..bytes.len().min(4096)];
+                String::from_utf8_lossy(probe)
+                    .chars()
+                    .any(|c| !c.is_control() || c == '\n' || c == '\r' || c == '\t')
+                    && std::str::from_utf8(probe).is_ok()
+            }
+            Err(_) => false,
+        };
+    }
+    // 无扩展名文件名本身（Makefile/Dockerfile 等）
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if matches!(
+        name.as_str(),
+        "makefile" | "dockerfile" | "license" | "readme"
+    ) {
+        return true;
+    }
+    ATTACH_TEXT_EXTS.contains(&ext.as_str())
+}
+
+/// 组装用户消息：正文 + 附件内容注入。
+/// 文本类：全文注入（超 ATTACH_MAX_BYTES 截断）；二进制/读取失败：占位说明
+/// （路径可见，AI 可用工具自行处理）。空正文 + 有附件 = 纯附件消息。
+pub fn compose_message_with_attachments(base: &str, attachments: &[std::path::PathBuf]) -> String {
+    if attachments.is_empty() {
+        return base.to_string();
+    }
+    let mut out = base.to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    for (i, path) in attachments.iter().enumerate() {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        out.push_str(&format!(
+            "---\n【附件 {}/{}：{name}】（{}）\n",
+            i + 1,
+            attachments.len(),
+            path.display()
+        ));
+        if !attach_is_text(path) {
+            out.push_str(&format!(
+                "（二进制/非文本文件未注入内容；如需处理请用工具按路径读取）\n"
+            ));
+            continue;
+        }
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let truncated = bytes.len() as u64 > ATTACH_MAX_BYTES;
+                let slice = &bytes[..bytes.len().min(ATTACH_MAX_BYTES as usize)];
+                let text = String::from_utf8_lossy(slice);
+                let fence = if text.contains("```") { "~~~" } else { "```" };
+                out.push_str(&format!("{fence}\n{text}\n{fence}\n"));
+                if truncated {
+                    out.push_str(&format!(
+                        "（文件过大，仅注入前 {} KB，完整内容请用工具按路径读取）\n",
+                        ATTACH_MAX_BYTES / 1024
+                    ));
+                }
+            }
+            Err(e) => out.push_str(&format!("（读取失败：{e}）\n")),
+        }
+    }
+    out
 }
 
 /// 粗略检测文本是否含 Markdown 语法。
@@ -2160,17 +2700,132 @@ pub struct PendingQuestion {
     pub header: Option<String>,
 }
 
-/// 待用户确认的越权写操作（权限审批卡片）。
-#[derive(Debug, Clone)]
-pub struct PendingApproval {
+/// 等高图标 chip（输入框工具行用）：ComboBox + 统一 11.5px 字号 + 图标前缀
+/// （同字号 = 等高；Popup::menu 会把锚定按钮从 accessibility 树隐藏，故不用）。
+/// 返回用户新选择的值（未选择返回 None）。
+/// 等高图标按钮芯片：手动绘制（悬停底色 + 垂直水平居中文字）。
+/// 不走全局 Button（button_padding=14px 会让纯图标按钮宽成胶囊，
+/// 与选择器 chip 的紧凑节奏不一致）。
+fn chip_button(ui: &mut egui::Ui, label: &str, color: egui::Color32, h: f32, tip: &str) -> bool {
+    let font = egui::FontId::proportional(11.5);
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, color);
+    let w = (galley.size().x + 16.0).max(30.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+    let resp = resp.on_hover_text(tip);
+    if resp.hovered() || resp.highlighted() {
+        ui.painter().rect_filled(rect, 8.0, Theme::bg_hover());
+    }
+    let pos = egui::pos2(
+        rect.center().x - galley.size().x / 2.0,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    ui.painter().galley(pos, galley, color);
+    resp.clicked()
+}
+
+fn ui_icon_chip(
+    ui: &mut egui::Ui,
+    id: &str,
+    icon: &str,
+    value: &str,
+    options: &[(&str, &str)], // (显示文本, 值)
+    hover: &str,
+    h: f32,
+) -> Option<String> {
+    let mut picked: Option<String> = None;
+    // 视觉层完全手绘（rect 自己分配、边框自己画）：不依赖 ComboBox 内部按钮
+    // 的自然宽度——它含内边距+箭头+外边距且随版本变化，预估稍小就会被
+    // 外层 clip 矩形吃掉右缘圆角（实机缺陷：边框"不闭合"）。
+    // 下拉改用 egui::Popup（行为同 ComboBox：点击选择 / 点击外部关闭）。
+    // 无障碍/点击：在 rect 内放一个透明真实 Button（文字透明、无填充），
+    // 注册 a11y 节点（kittest/UI 测试按 value 查询）并承载交互。
+    let text = format!("{icon} {value} \u{25BE}");
+    let font = egui::FontId::proportional(11.5);
+    let galley = ui.painter().layout_no_wrap(text, font, Theme::text_dim());
+    let w = (galley.size().x + 20.0).max(42.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+    let mut btn_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    {
+        let sp = btn_ui.spacing_mut();
+        sp.button_padding = egui::vec2(0.0, 0.0);
+        sp.interact_size.y = h;
+    }
+    let resp = btn_ui.add(
+        egui::Button::new(
+            egui::RichText::new(format!("{icon} {value}"))
+                .size(11.5)
+                .color(egui::Color32::TRANSPARENT),
+        )
+        .fill(egui::Color32::TRANSPARENT)
+        .stroke(egui::Stroke::NONE)
+        .min_size(rect.size()),
+    );
+    let resp = resp.on_hover_text(hover);
+    let bg = if resp.hovered() || resp.highlighted() {
+        Theme::bg_hover()
+    } else {
+        Theme::bg_elevated()
+    };
+    ui.painter().rect(
+        rect,
+        8.0,
+        bg,
+        egui::Stroke::new(1.0, Theme::border()),
+        egui::StrokeKind::Inside,
+    );
+    let pos = egui::pos2(
+        rect.center().x - galley.size().x / 2.0,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    ui.painter().galley(pos, galley, Theme::text_dim());
+
+    let popup_id = ui.id().with(format!("chip_{id}"));
+    if let Some(menu) = egui::Popup::menu(&resp).id(popup_id).show(|ui| {
+        for (disp, val) in options {
+            let lit = *val == value;
+            if ui
+                .selectable_label(
+                    lit,
+                    egui::RichText::new(*disp).size(12.0).color(if lit {
+                        Theme::accent_light()
+                    } else {
+                        Theme::text()
+                    }),
+                )
+                .clicked()
+            {
+                picked = Some(val.to_string());
+            }
+        }
+    }) {
+        // 菜单打开期间持续重绘（hover 高亮等即时反馈）
+        menu.response.ctx.request_repaint();
+    }
+    picked
+}
+
+/// 渲染用会话快照：messages 以 Arc 共享，仅在会话状态变化时重建——
+/// 弹幕动画期间整窗 30fps 重绘，每帧深拷贝整个消息历史是主要卡顿源。
+pub struct RenderSession {
     pub id: String,
-    pub target: String,
-    pub reason: String,
+    pub title: String,
+    pub running: bool,
+    pub preset: AgentPreset,
+    pub messages: Arc<Vec<Message>>,
+}
+
+/// 发送模式：回合运行中发送时的行为。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendMode {
+    /// 插话：打断当前 step，消息并入本回合续跑（默认，最快得到回应）
+    Interject,
+    /// 排队：不打断；当前回合结束后作为新回合逐条执行（FIFO）
+    Queue,
 }
 
 /// 标题行卡片种类（单选：同一时间只开一张）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CardKind {
+pub enum CardKind {
     None,
     Plan,
     Goals,
@@ -2443,5 +3098,79 @@ mod tests {
         // 非 JSON 字符串
         let (b3, _) = summarize_tool_result(true, "plain text");
         assert!(b3.contains("plain text"));
+    }
+}
+
+#[cfg(test)]
+mod attach_tests {
+    use super::*;
+
+    /// 文本附件全文注入 + 代码围栏。
+    #[test]
+    fn compose_text_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("note.md");
+        std::fs::write(&f, "# hello\nworld").unwrap();
+        let out = compose_message_with_attachments("看一下", &[f]);
+        assert!(out.starts_with("看一下\n\n"));
+        assert!(out.contains("【附件 1/1：note.md】"));
+        assert!(out.contains("```\n# hello\nworld\n```"));
+    }
+
+    /// 二进制占位（不注入内容，路径可见）。
+    #[test]
+    fn compose_binary_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("blob.bin");
+        std::fs::write(&f, [0u8, 159, 146, 150]).unwrap();
+        let out = compose_message_with_attachments("", &[f]);
+        assert!(out.contains("二进制/非文本文件未注入内容"));
+        assert!(!out.contains("```"));
+    }
+
+    /// 超大文本截断提示。
+    #[test]
+    fn compose_large_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("big.log");
+        std::fs::write(&f, "x".repeat(600_000)).unwrap();
+        let out = compose_message_with_attachments("", &[f]);
+        assert!(out.contains("文件过大，仅注入前 512 KB"));
+    }
+
+    /// 空正文 + 纯附件 = 合法消息；含 ``` 的内容换围栏 ~~~。
+    #[test]
+    fn compose_fence_escape_and_attachment_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("code.rs");
+        std::fs::write(&f, "fn main() { println!(\"```\"); }").unwrap();
+        let out = compose_message_with_attachments("", &[f]);
+        assert!(out.starts_with("---\n【附件 1/1：code.rs】"));
+        assert!(out.contains("~~~\nfn main()"));
+        assert!(out.contains("~~~\n")); // 围栏换用 ~~~ 防嵌套破坏
+    }
+
+    /// 无附件 = 原文返回。
+    #[test]
+    fn compose_no_attachments() {
+        assert_eq!(compose_message_with_attachments("hi", &[]), "hi");
+    }
+
+    /// 文本判定：扩展名白名单 / 无扩展 UTF-8 探测 / Makefile。
+    #[test]
+    fn attach_text_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let py = dir.path().join("a.py");
+        std::fs::write(&py, "x=1").unwrap();
+        assert!(attach_is_text(&py));
+        let mk = dir.path().join("Makefile");
+        std::fs::write(&mk, "all:").unwrap();
+        assert!(attach_is_text(&mk));
+        let noext = dir.path().join("plain");
+        std::fs::write(&noext, "你好 plain text").unwrap();
+        assert!(attach_is_text(&noext));
+        let bin = dir.path().join("x.exe");
+        std::fs::write(&bin, [0u8; 16]).unwrap();
+        assert!(!attach_is_text(&bin));
     }
 }

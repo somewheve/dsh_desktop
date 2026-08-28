@@ -55,6 +55,119 @@ fn default_invocation() -> SkillInvocation {
     }
 }
 
+/// 内置领域增强技能（提示词级增强：模型按需 load_skill 加载领域规范；
+/// 用户可在技能目录创建同名技能覆盖，目录 rank 250 < 内置 600）。
+/// 领域插件也可以经 cordis 子进程插件提供工具级增强（tools 字段），
+/// 两者互补：技能管"怎么思考"，插件管"额外能力"。
+pub fn builtin_skills() -> Vec<Skill> {
+    vec![
+        Skill {
+            name: "chemistry-research".into(),
+            description: Some(
+                "化学研究领域增强：命名/结构表示规范、计算与量纲检查、\
+                 实验设计、谱图归属谨慎性、安全与数据严谨性要求"
+                    .into(),
+            ),
+            instructions: Some(CHEMISTRY_INSTRUCTIONS.into()),
+            invocation: SkillInvocation {
+                model_invocable: true,
+            },
+            rank: 600,
+        },
+        Skill {
+            name: "academic-writing".into(),
+            description: Some(
+                "学术论文撰写增强：IMRaD 结构、学术语言规范、引用格式\
+                 （APA/GB-T 7714）、图表自明性、摘要与审稿回复写作"
+                    .into(),
+            ),
+            instructions: Some(WRITING_INSTRUCTIONS.into()),
+            invocation: SkillInvocation {
+                model_invocable: true,
+            },
+            rank: 600,
+        },
+    ]
+}
+
+const CHEMISTRY_INSTRUCTIONS: &str = r#"# 化学研究领域规范
+
+处理化学相关问题（研究、计算、实验设计、谱图解析、文献综述）时，严格遵循：
+
+## 1 命名与结构表示
+- 优先使用 IUPAC 命名；常用名可并列标注（如 乙酸（ethanoic acid））。
+- 结构表示给出至少一种规范机器可读格式：SMILES（或 InChI）；涉及立体化学时必须标注（R/S、E/Z、楔形键/@@）。
+- 分子式、摩尔质量给出并保留合理有效数字；摩尔质量计算列出原子量来源（IUPAC 2021 标准）。
+
+## 2 计算规范
+- 所有计算逐步展示：已知量 → 公式 → 代入（带单位）→ 结果（单位 + 有效数字）。
+- 量纲分析贯穿始终；结果的SigFig 与最少有效数字的输入一致（pH/log 类按小数位规则）。
+- 化学方程式必须配平（原子守恒 + 电荷守恒）；氧化还原反应标注半反应与电子转移数。
+- 平衡/热力学/动力学计算注明假设（理想气体、恒温、忽略副反应等）。
+
+## 3 数据严谨性（最重要）
+- **绝不编造数据**：熔点、沸点、pKa、溶解度、键长、光谱数据、收率等——已知可靠值可给出并注明来源类别（如"常见手册值"）；不确定或可能有出入时明确说"需要查证"并建议用 web_search 或权威数据库（CRC、NIST、PubChem、Reaxys、SciFinder）。
+- 谱图归属（NMR/IR/MS/UV-Vis）给出归属逻辑与备选解释；避免过度确定——注明"符合/支持"而非"证明"。
+- 区分实验值、文献值、理论计算值（DFT/半经验）并标注方法与基组（如适用）。
+
+## 4 实验设计
+- 给出：目的 → 反应/方案原理 → 试剂与用量（摩尔比）→ 条件（温度/时间/气氛）→ 后处理 → 表征手段 → 预期结果与判据。
+- 安全：涉及危险试剂/操作（强酸碱、氰化物、叠氮、硝化、高压、放热失控风险）必须给出安全提示与 GHS 类别；不提供违禁品/爆炸物/毒品的合成路线。
+- 建议控制变量、重复次数（n≥3 统计才稳健）、空白/对照。
+
+## 5 表达
+- 单位用规范符号（mol/L 或 M 统一；kPa/bar/ atm 注明）；温度 ℃/K 明确。
+- 综述类回答按分支组织（无机/有机/物化/分析/高分子），标注综述截止认知的局限。
+"#;
+
+const WRITING_INSTRUCTIONS: &str = r#"# 学术论文撰写规范
+
+处理论文写作（论文各部分、摘要、投稿信、审稿回复、润色）时，严格遵循：
+
+## 1 结构（IMRaD）
+- Introduction：背景漏斗（领域 → 缺口 → 本文贡献）；贡献用 1-3 条明确列出。
+- Methods：可复现标准——他人按此能重复；试剂/仪器/参数/统计方法完整。
+- Results：只报告事实，与讨论分开；图表在正文被引用且按编号引用（图1、表2）。
+- Discussion/Conclusion：解释结果、与文献对比、局限、展望；不重复罗列结果。
+
+## 2 学术语言
+- 客观、精确、克制：避免"非常/极其/首次（除非确证）"等绝对化表述。
+- 主动/被动语态按目标期刊惯例（默认可用"我们/本文"式主动语态）。
+- 术语首现给全称+缩写（如 反应表面方法论（RSM））；全文缩写一致。
+- 中英文写作均保持句长可控（一句一个信息点），逻辑连接词准确（然而/因此/进而）。
+
+## 3 引用与链接真实性（硬性红线）
+- **绝对禁止编造文献、DOI、URL**。任何链接/DOI/页码，只要没有把握真实存在，就不写。
+- **文献查找强制核验流程**（用户要求文献检索/推荐参考文献/文献综述时）：
+  1. 逐条用 web_search 检索（查询式：`"<论文标题>" <第一作者姓氏> <年份>`）；
+  2. 搜索结果中**实际看到**该标题（期刊页/PubMed/Google Scholar/DOI 记录）才算核验通过；
+  3. 输出分两组，不得混淆——
+     - ✅ 已核验：可带链接（链接只用搜索结果里**实际返回的 URL**，禁止自己拼 doi.org/期刊页地址）；
+     - ⚠️ 未能在线核验：仅给"作者 + 标题 + 年份 + 期刊"题录，明确标注"未核验，引用前请自行确认"，**不带任何链接**；
+  4. **禁止凭记忆直接生成"参考文献列表"**——未经第 1-2 步核验的文献清单一律视为未核验组。
+- 写作中引用已有文献同样规则：**先检索核验再引用**；核验不到的只给题录并注明，不给链接。
+- DOI 只在核验结果中实际见到时才写（统一 https://doi.org/10.xxxx/xxxx 形式）。
+- 警惕幻觉高发区：卷期页码、年份、作者顺序、期刊名缩写——逐项给出时自查来源。
+- 用户提供的引用若疑似有误（拼错作者/期刊不存在），主动指出并建议核实。
+- 引用格式按需切换：GB/T 7714（中文期刊）、APA 7、Vancouver/AMA、Elsevier numbered；文内与文末格式一致。
+- 改写而非复制；涉及他人图表注明"引自/修改自"。
+- 语言/查重润色保持原意，不做代写假扮（如用户声明原创性的内容）。
+
+## 4 图表规范
+- 图表自明：标题含"什么+条件+结果"要素；坐标轴带单位；缩写与正文一致。
+- 表格三线表（学术惯例）；统计量标注（n、p、误差棒含义）。
+- 提供改进建议时指出具体问题（可读性/单位/配色无障碍）。
+
+## 5 摘要与投稿文书
+- 结构式摘要：背景（1句）→ 方法（1-2句）→ 关键结果（2-3句，含量化）→ 意义（1句）。
+- Cover Letter：创新点 + 为何适合该刊 + 无一稿多投声明；简洁（<350词）。
+- 审稿回复：逐条编号回应；采纳的写修改位置，不采纳的给礼貌且有依据的理由。
+
+## 6 交付习惯
+- 按用户提供的期刊/学校模板调整；未提供时先问清格式要求（引用风格、字数、语言）。
+- 长文档给大纲先行确认再展开；修改稿保留修订说明（改了什么、为什么）。
+"#;
+
 /// 技能注册表。
 #[derive(Debug, Default)]
 pub struct SkillRegistry {
@@ -96,6 +209,10 @@ impl SkillRegistry {
     /// 从用户技能目录加载全部技能（每技能一个子目录，含 skill.md 或 SKILL.md）。
     /// 用户目录 rank = 250（对齐 RUNTIME_RANK，优先于 bundle 技能）。
     pub fn load_from_dir(&mut self, dir: &Path) {
+        // 先注册内置领域技能（rank 600）；目录技能（rank 250）后到覆盖
+        for sk in builtin_skills() {
+            self.register(sk);
+        }
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -169,8 +286,11 @@ impl SkillRegistry {
             return Err(format!("技能已存在: {name}（如需更新请先移除）"));
         }
         let url = github_skill_raw_url(owner, repo, branch, name);
+        // 超时保护：挂起的请求不能让面板永久卡"操作中"（busy 不复位）
         let client = reqwest::blocking::Client::builder()
             .user_agent("dsh-desktop-skill-installer")
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|e| format!("HTTP 客户端初始化失败: {e}"))?;
         let resp = client
@@ -425,7 +545,7 @@ mod tests {
         // 从目录加载
         let mut reg2 = SkillRegistry::default();
         reg2.load_from_dir(td.path());
-        assert_eq!(reg2.len(), 1);
+        // len = 目录技能 + 2 个内置领域技能；断言目标技能内容正确
         let s = reg2.get("my-skill").unwrap();
         assert_eq!(s.description.as_deref(), Some("我的技能"));
         assert_eq!(s.instructions.as_deref(), Some("按以下步骤执行…"));
@@ -537,8 +657,81 @@ mod tests {
         // 导入后可加载
         let mut reg2 = SkillRegistry::default();
         reg2.load_from_dir(&skills_dir);
-        assert_eq!(reg2.len(), 2);
+        // len = 导入的 2 个 + 2 个内置领域技能
         assert!(reg2.get("from-file").is_some());
         assert!(reg2.get("my-local-skill").is_some());
+    }
+}
+
+#[cfg(test)]
+mod builtin_skill_tests {
+    use super::*;
+
+    /// 内置领域技能：注册后可列出、可读取指令、模型可调用。
+    #[test]
+    fn builtin_domain_skills_available() {
+        let mut reg = SkillRegistry::default();
+        reg.load_from_dir(std::path::Path::new("Z:/不存在的目录")); // 目录为空 → 仅内置
+        assert!(reg.len() >= 2, "至少两个内置领域技能: {}", reg.len());
+        let chem = reg.get("chemistry-research").expect("化学技能");
+        assert!(chem.invocation.model_invocable);
+        assert!(chem.instructions.as_deref().unwrap().contains("IUPAC"));
+        assert!(chem
+            .instructions
+            .as_deref()
+            .unwrap()
+            .contains("绝不编造数据"));
+        let writ = reg.get("academic-writing").expect("论文技能");
+        assert!(writ.instructions.as_deref().unwrap().contains("IMRaD"));
+        assert!(writ.instructions.as_deref().unwrap().contains("GB/T 7714"));
+        // 引用真实性红线（用户明确要求：链接必须真实有效，不得编造）
+        assert!(writ
+            .instructions
+            .as_deref()
+            .unwrap()
+            .contains("绝对禁止编造文献、DOI、URL"));
+        assert!(writ
+            .instructions
+            .as_deref()
+            .unwrap()
+            .contains("先检索核验再引用"));
+        // 文献查找强制核验流程（逐条 web_search 确认存在；禁止凭记忆生成文献列表）
+        assert!(writ
+            .instructions
+            .as_deref()
+            .unwrap()
+            .contains("文献查找强制核验流程"));
+        assert!(writ
+            .instructions
+            .as_deref()
+            .unwrap()
+            .contains("禁止凭记忆直接生成"));
+        assert!(writ
+            .instructions
+            .as_deref()
+            .unwrap()
+            .contains("实际返回的 URL"));
+    }
+
+    /// 用户目录同名技能覆盖内置（rank 250 < 600）。
+    #[test]
+    fn user_dir_overrides_builtin() {
+        let dir = tempfile::tempdir().unwrap();
+        let sk = dir.path().join("chemistry-research");
+        std::fs::create_dir_all(&sk).unwrap();
+        std::fs::write(
+            sk.join("skill.md"),
+            "---\nname: chemistry-research\ndescription: 自定义版\n---\n我的自定义指令",
+        )
+        .unwrap();
+        let mut reg = SkillRegistry::default();
+        reg.load_from_dir(dir.path());
+        let got = reg.get("chemistry-research").unwrap();
+        assert_eq!(got.description.as_deref(), Some("自定义版"));
+        assert!(got
+            .instructions
+            .as_deref()
+            .unwrap()
+            .contains("我的自定义指令"));
     }
 }

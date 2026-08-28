@@ -45,6 +45,12 @@ pub mod types {
     pub const SESSION_PRESET: &str = "session/preset";
     /// 会话独立工作区（cwd，set_session_workspace 持久化）
     pub const SESSION_CWD: &str = "session/cwd";
+    /// 会话级沙箱模式（per-session 覆盖）
+    pub const SESSION_SANDBOX: &str = "session/sandbox";
+    /// 会话级模型覆盖
+    pub const SESSION_MODEL: &str = "session/model";
+    /// 会话级思考深度覆盖
+    pub const SESSION_EFFORT: &str = "session/effort";
 }
 
 impl SessionEvent {
@@ -119,6 +125,14 @@ pub struct Session {
     pub cwd: Option<PathBuf>,
     /// Agent 预设（对齐 session.create 的 agentPresets）
     pub preset: crate::core::preset::AgentPreset,
+    /// 回合代数：send_message 每启动一个新回合自增。
+    pub turn_epoch: u64,
+    /// 会话级沙箱模式覆盖（None = 跟随引擎全局设置）
+    pub sandbox_mode: Option<String>,
+    /// 会话级模型覆盖（None = 跟随引擎全局设置）
+    pub model: Option<String>,
+    /// 会话级思考深度覆盖（None = 跟随引擎全局设置）
+    pub effort: Option<String>,
     /// 完整事件序列（持久化依据）
     pub events: Vec<SessionEvent>,
     /// 给 LLM 的消息序列（从 events 投影）
@@ -139,6 +153,10 @@ impl Session {
             running: false,
             cwd: None,
             preset: crate::core::preset::AgentPreset::Standard,
+            turn_epoch: 0,
+            sandbox_mode: None,
+            model: None,
+            effort: None,
             events: Vec::new(),
             messages: Vec::new(),
         }

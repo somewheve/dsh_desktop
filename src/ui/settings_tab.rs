@@ -26,6 +26,8 @@ pub struct SettingsTab {
     /// 界面语言（zh / en）
     lang: String,
     status: String,
+    /// 桥信息 (port, token)——app 启动后写入，设置页展示
+    bridge_info: Option<(u16, String)>,
 }
 
 impl SettingsTab {
@@ -50,6 +52,7 @@ impl SettingsTab {
             shell: cfg.resolved_shell(),
             lang: cfg.lang.clone(),
             status: String::new(),
+            bridge_info: None,
         }
     }
 
@@ -62,7 +65,7 @@ impl SettingsTab {
         ui.label(
             RichText::new("DeepSeek 引擎")
                 .strong()
-                .color(crate::ui::theme::Theme::ACCENT_LIGHT),
+                .color(crate::ui::theme::Theme::accent_light()),
         );
         egui::Grid::new("engine_settings_grid")
             .num_columns(2)
@@ -77,9 +80,31 @@ impl SettingsTab {
                 ui.end_row();
                 ui.label("模型:");
                 ui.horizontal(|ui| {
-                    ui.add(TextEdit::singleline(&mut self.model).desired_width(200.0));
+                    // 下拉：DeepSeek 官方模型表（V4 系列 + legacy），
+                    // 当前值不在表内（自定义网关模型）保留为选项
+                    let mut sel = self.model.clone();
+                    egui::ComboBox::from_id_salt("model_select")
+                        .selected_text(&self.model)
+                        .width(240.0)
+                        .show_ui(ui, |ui| {
+                            for m in crate::core::llm::DEEPSEEK_MODELS {
+                                ui.selectable_value(&mut sel, m.to_string(), *m);
+                            }
+                            if !crate::core::llm::DEEPSEEK_MODELS.contains(&self.model.as_str()) {
+                                let keep = self.model.clone();
+                                ui.selectable_value(
+                                    &mut sel,
+                                    keep.clone(),
+                                    format!("{keep}（自定义）"),
+                                );
+                            }
+                        });
+                    if sel != self.model {
+                        self.model = sel;
+                        self.status = "模型已更改（保存后生效）".into();
+                    }
                     ui.label(
-                        RichText::new("deepseek-chat / deepseek-reasoner")
+                        RichText::new("V4 系列（flash / pro / vision-exp）+ legacy")
                             .weak()
                             .size(11.0),
                     );
@@ -96,9 +121,9 @@ impl SettingsTab {
                         let selected = p == current;
                         let label = if selected {
                             RichText::new(format!("● {}", p.name()))
-                                .color(crate::ui::theme::Theme::ACCENT_LIGHT)
+                                .color(crate::ui::theme::Theme::accent_light())
                         } else {
-                            RichText::new(p.name()).color(crate::ui::theme::Theme::TEXT_DIM)
+                            RichText::new(p.name()).color(crate::ui::theme::Theme::text_dim())
                         };
                         if ui.selectable_label(selected, label).clicked() && !selected {
                             self.default_preset = p.id().to_string();
@@ -117,7 +142,7 @@ impl SettingsTab {
         ui.label(
             RichText::new("沙箱模式")
                 .strong()
-                .color(crate::ui::theme::Theme::ACCENT_LIGHT),
+                .color(crate::ui::theme::Theme::accent_light()),
         );
         ui.horizontal(|ui| {
             for m in [
@@ -128,9 +153,9 @@ impl SettingsTab {
                 let selected = self.sandbox_mode == m;
                 let label = if selected {
                     RichText::new(format!("● {}", m.as_str()))
-                        .color(crate::ui::theme::Theme::ACCENT_LIGHT)
+                        .color(crate::ui::theme::Theme::accent_light())
                 } else {
-                    RichText::new(m.as_str()).color(crate::ui::theme::Theme::TEXT_DIM)
+                    RichText::new(m.as_str()).color(crate::ui::theme::Theme::text_dim())
                 };
                 if ui.selectable_label(selected, label).clicked() && !selected {
                     self.sandbox_mode = m;
@@ -217,6 +242,51 @@ impl SettingsTab {
                     }
                 });
                 ui.end_row();
+
+                // 主题（调色盘切换，立即生效）：内置 + $DSH_HOME/themes + 插件主题
+                ui.label("主题 / Theme:");
+                ui.horizontal(|ui| {
+                    let mut files: Vec<std::path::PathBuf> = Vec::new();
+                    let themes_dir = cfg.dsh_home.join("themes");
+                    if let Ok(entries) = std::fs::read_dir(&themes_dir) {
+                        for e in entries.flatten() {
+                            let p = e.path();
+                            if p.extension().map(|x| x == "json").unwrap_or(false) {
+                                files.push(p);
+                            }
+                        }
+                    }
+                    if let Ok(engine) = self.engine.lock() {
+                        files.extend(engine.plugin_theme_files());
+                    }
+                    let mgr = crate::ui::theme::ThemeManager::discover(&files);
+                    let names = mgr.names();
+                    let current = cfg.theme.clone();
+                    let mut selected = current.clone();
+                    egui::ComboBox::from_id_salt("theme_select")
+                        .selected_text(&current)
+                        .width(200.0)
+                        .show_ui(ui, |ui| {
+                            for n in &names {
+                                ui.selectable_value(&mut selected, n.clone(), n);
+                            }
+                        });
+                    if selected != current {
+                        if let Some(p) = mgr.get(&selected).cloned() {
+                            crate::ui::theme::Theme::set_palette(&p);
+                            crate::ui::theme::Theme::apply(ui.ctx());
+                            cfg.theme = selected.clone();
+                            let _ = cfg.save();
+                            self.status = format!("主题已切换：{selected} ✓");
+                        }
+                    }
+                    ui.label(
+                        RichText::new("内置 + $DSH_HOME/themes/*.json + 插件主题，立即生效")
+                            .weak()
+                            .size(11.0),
+                    );
+                });
+                ui.end_row();
             });
 
         ui.separator();
@@ -234,31 +304,74 @@ impl SettingsTab {
                 } else {
                     Some(self.shell.trim().to_string())
                 };
-                // 引擎设置
-                let mut engine = crate::core::settings::EngineSettings::load();
-                engine.default_preset = if self.default_preset.trim().is_empty() {
-                    "standard".into()
+                // 引擎设置：经引擎更新（内存 + 磁盘 + LLM 客户端三同步，
+                // 立即生效）。不能直接 EngineSettings::save() 绕过引擎——
+                // 引擎内存留着旧值时，之后任何 chip 切换触发 rebuild_llm
+                // 落盘就会覆盖刚保存的 key（历史 bug："保存不了 key"）。
+                // 空 key 输入 = 保留现有（防误清——改模型/代理后保存不应
+                // 把已有 key 抹掉；清除走"清除 Key"按钮）
+                let key = if self.api_key.trim().is_empty() {
+                    self.engine
+                        .lock()
+                        .ok()
+                        .and_then(|e| e.settings().api_key.clone())
                 } else {
-                    self.default_preset.trim().into()
+                    opt(&self.api_key)
                 };
-                engine.api_key = opt(&self.api_key);
-                engine.model = if self.model.trim().is_empty() {
-                    "deepseek-chat".into()
+                let model = if self.model.trim().is_empty() {
+                    "deepseek-v4-flash".into()
                 } else {
                     self.model.trim().into()
                 };
-                engine.base_url = if self.base_url.trim().is_empty() {
+                let base_url = if self.base_url.trim().is_empty() {
                     "https://api.deepseek.com".into()
                 } else {
                     self.base_url.trim().into()
                 };
-                engine.http_proxy = opt(&self.http_proxy);
-                let engine_save = engine.save();
-                match (cfg.save(), engine_save) {
-                    (Ok(()), Ok(())) => self.status = "设置已保存 ✓（引擎设置重启后生效）".into(),
+                let preset = if self.default_preset.trim().is_empty() {
+                    "standard".into()
+                } else {
+                    self.default_preset.trim().into()
+                };
+                let engine_result = self
+                    .engine
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .and_then(|mut e| {
+                        e.update_settings_from_ui(
+                            key,
+                            base_url,
+                            model,
+                            opt(&self.http_proxy),
+                            preset,
+                        );
+                        Ok(())
+                    });
+                match (cfg.save(), engine_result) {
+                    (Ok(()), Ok(())) => self.status = "设置已保存 ✓（引擎设置立即生效）".into(),
                     (Err(e), _) => self.status = format!("保存失败: {e:#}"),
                     (_, Err(e)) => self.status = format!("引擎设置保存失败: {e:#}"),
                 }
+            }
+            if ui.button("清除 Key").clicked() {
+                // 显式清除（绕过空输入保留逻辑）
+                let keep = self.engine.lock().ok().map(|e| {
+                    let s = e.settings();
+                    (
+                        s.base_url.clone(),
+                        s.model.clone(),
+                        s.http_proxy.clone(),
+                        s.default_preset.clone(),
+                    )
+                });
+                if let Some((url, model, proxy, preset)) = keep {
+                    let _ = self
+                        .engine
+                        .lock()
+                        .map(|mut e| e.update_settings_from_ui(None, url, model, proxy, preset));
+                }
+                self.api_key.clear();
+                self.status = "API Key 已清除 ✓".into();
             }
             if ui.button("恢复默认代理").clicked() {
                 self.http_proxy.clear();
@@ -276,6 +389,39 @@ impl SettingsTab {
                 .size(11.0)
                 .weak(),
         );
+        self.ui_bridge_info(ui);
+    }
+
+    /// 桥访问信息（端口 + 鉴权 token，供程序化调用者）。
+    /// 由 app 每帧写入（桥启动时生成），设置页只读展示。
+    pub fn set_bridge_info(&mut self, port: Option<u16>, token: Option<String>) {
+        self.bridge_info = match (port, token) {
+            (Some(p), Some(t)) => Some((p, t)),
+            _ => None,
+        };
+    }
+
+    fn ui_bridge_info(&self, ui: &mut egui::Ui) {
+        if let Some((port, token)) = &self.bridge_info {
+            ui.separator();
+            ui.label(
+                RichText::new("本地桥 API")
+                    .strong()
+                    .color(crate::ui::theme::Theme::accent_light()),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "http://127.0.0.1:{port}/api/sessions · 鉴权 X-DSH-Token: {token}"
+                ))
+                .size(11.0)
+                .weak(),
+            );
+            ui.label(
+                RichText::new("token 每次启动随机生成（本机任意进程可读端口，故必须携带）")
+                    .size(10.5)
+                    .weak(),
+            );
+        }
     }
 }
 

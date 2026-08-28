@@ -36,6 +36,20 @@ pub fn init_logging() {
     log::info!("dsh-desktop logging initialized (file: {})", file.display());
 }
 
+/// 界面主字体 Consolas（Windows 系统自带：Regular + Bold + Italic + Bold
+/// Italic 四风格；从系统字体目录读取，不内嵌分发）。缺失时返回 None →
+/// 沿用默认/等宽回退链。
+pub fn load_ui_font_consolas() -> Option<(String, Vec<u8>)> {
+    let path = r"C:\Windows\Fonts\consola.ttf";
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            log::info!("ui font loaded: Consolas ({path})");
+            Some(("Consolas".to_string(), bytes))
+        }
+        Err(_) => None,
+    }
+}
+
 /// 找到系统里可用的等宽字体字节（用于终端渲染）。返回 (字体名, 字节)。
 pub fn load_mono_font() -> Option<(String, Vec<u8>)> {
     let candidates = [
@@ -73,6 +87,7 @@ pub fn load_cjk_font() -> Option<(String, Vec<u8>)> {
 /// 真正的粗体字形族（微软雅黑 Bold / 黑体），注册为独立字体族。
 pub fn load_bold_font() -> Option<(String, Vec<u8>)> {
     let candidates = [
+        ("ConsolasBold", "C:\\Windows\\Fonts\\consolab.ttf"),
         ("MicrosoftYaHeiBold", "C:\\Windows\\Fonts\\msyhbd.ttc"),
         ("SimHei", "C:\\Windows\\Fonts\\simhei.ttf"),
     ];
@@ -210,5 +225,30 @@ mod tests {
             base.0,
             fixed.0
         );
+    }
+}
+
+#[cfg(test)]
+mod consolas_tests {
+    use super::*;
+
+    /// Windows 本机：Consolas Regular 可加载且为合法 TrueType。
+    #[test]
+    fn ui_font_consolas_loads() {
+        if let Some((name, bytes)) = load_ui_font_consolas() {
+            assert_eq!(name, "Consolas");
+            assert!(bytes.len() > 100_000, "字体应完整: {} bytes", bytes.len());
+            assert_eq!(&bytes[..4], &[0x00, 0x01, 0x00, 0x00], "sfnt TrueType");
+        } else {
+            eprintln!("无 Consolas（非 Windows）：跳过（回退链兜底）");
+        }
+    }
+
+    /// 粗体链首选 Consolas Bold（存在时），中文粗体回退雅黑。
+    #[test]
+    fn bold_font_prefers_consolas() {
+        if let Some((name, _)) = load_bold_font() {
+            assert_eq!(name, "ConsolasBold");
+        }
     }
 }

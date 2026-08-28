@@ -144,13 +144,15 @@ impl JobManager {
 }
 
 fn simple_id() -> String {
+    // 时间戳 + 单调计数器：同一时钟 tick 内连续创建也不会碰撞
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let ptr = &simple_id as *const _ as usize as u64;
-    format!("{nanos:x}{ptr:x}")
+    let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{nanos:x}{c:x}")
 }
 
 #[cfg(test)]

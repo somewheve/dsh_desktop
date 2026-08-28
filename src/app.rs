@@ -37,15 +37,40 @@ pub struct DshDesktopApp {
     /// DSH web 子进程托管（启动/停止/重启；侧边栏手动控制）
     web: crate::dsh::WebHandle,
     bridge_port: Option<u16>,
+    /// 桥鉴权 token（调用方需带 Authorization: Bearer <token>）
+    bridge_token: Option<String>,
     engine: Arc<Mutex<DshEngine>>,
     /// 已持久化的工作区（变更时写 cfg.last_workspace）
     ws_saved: Option<String>,
+    /// 侧栏"会话"导航下方的会话列表展开状态（收纳自 Chat 中央区）
+    sessions_expanded: bool,
 }
 
 impl DshDesktopApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let cfg = AppConfig::load();
-        Theme::apply(&cc.egui_ctx);
+        // 主题：内置 + $DSH_HOME/themes/*.json + 插件主题（合并去重），
+        // 激活配置保存的主题名（找不到回退 dark）。插件主题在引擎构造后
+        // 二次发现（autostart 插件此时已可见），首帧先用已知名激活。
+        {
+            let mut theme_files: Vec<std::path::PathBuf> = Vec::new();
+            let themes_dir = cfg.dsh_home.join("themes");
+            if let Ok(entries) = std::fs::read_dir(&themes_dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.extension().map(|x| x == "json").unwrap_or(false) {
+                        theme_files.push(p);
+                    }
+                }
+            }
+            let mgr = crate::ui::theme::ThemeManager::discover(&theme_files);
+            let palette = mgr
+                .get(&cfg.theme)
+                .cloned()
+                .unwrap_or_else(crate::ui::theme::Palette::dark);
+            crate::ui::theme::Theme::set_palette(&palette);
+            Theme::apply(&cc.egui_ctx);
+        }
         setup_fonts(&cc.egui_ctx);
 
         // 引擎（Rust 原生 DSH 核心）
@@ -73,11 +98,14 @@ impl DshDesktopApp {
             }
         };
 
-        // 桥（xitca-web 访问交互层）
+        // 桥（xitca-web 访问交互层；带随机 token 鉴权）
         info!("app: before bridge");
-        let bridge_port = start_bridge(engine.clone())
-            .ok()
-            .inspect(|p| info!("bridge on port {p}"));
+        let (bridge_port, bridge_token) = start_bridge(engine.clone())
+            .map(|(p, t)| {
+                info!("bridge on port {p} (token auth enabled)");
+                (Some(p), Some(t))
+            })
+            .unwrap_or((None, None));
         info!("app: after bridge");
 
         // 恢复上次打开的工作区（工具根目录 / 新会话 / 终端直接可用）
@@ -117,8 +145,10 @@ impl DshDesktopApp {
             settings,
             web: crate::dsh::WebHandle::new(),
             bridge_port,
+            bridge_token,
             engine,
             ws_saved,
+            sessions_expanded: true,
         };
         // 默认不自动拉起 DSH web（用户手动在侧边栏启动）。
         if app.web_probe.is_up() {
@@ -145,20 +175,80 @@ impl DshDesktopApp {
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
+        // 简约侧栏：小型标识 + 无框导航 + 弱化状态（视觉重量让位内容区）
+        ui.add_space(14.0);
+        ui.label(
+            RichText::new("dsh · desktop")
+                .size(13.0)
+                .strong()
+                .color(Theme::text_faint()),
+        );
         ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("dsh-desktop")
-                    .size(18.0)
-                    .strong()
-                    .color(Theme::ACCENT_LIGHT),
-            );
-        });
-        ui.add_space(16.0);
         let lang = crate::ui::i18n::Lang::parse(&self.cfg.lang);
         use crate::ui::i18n::tr;
-        if Theme::nav_button(ui, &tr(lang, "会话", "Chat"), "💬", self.tab == Tab::Chat) {
-            self.tab = Tab::Chat;
+        let chat_active = self.tab == Tab::Chat;
+        let chat_label = format!(
+            "{} {}",
+            tr(lang, "会话", "Chat"),
+            if self.sessions_expanded { "▾" } else { "▸" }
+        );
+        // "会话"导航行：nav_button 占左侧 + ＋ 按钮右端对齐
+        {
+            let plus_w = 30.0;
+            let avail = ui.available_width();
+            let (nav_rect, _) =
+                ui.allocate_exact_size(egui::vec2(avail - plus_w, 34.0), egui::Sense::hover());
+            let mut nav_ui = ui.new_child(egui::UiBuilder::new().max_rect(nav_rect));
+            nav_ui.set_clip_rect(nav_rect);
+            if Theme::nav_button(&mut nav_ui, &chat_label, "💬", chat_active) {
+                self.tab = Tab::Chat;
+                self.sessions_expanded = !self.sessions_expanded;
+            }
+            // ＋ 按钮（右端、与导航行同高）
+            let plus_rect = egui::Rect::from_min_size(
+                egui::pos2(nav_rect.right() + 4.0, nav_rect.top()),
+                egui::vec2(plus_w - 6.0, 34.0),
+            );
+            let plus_resp = ui.interact(
+                plus_rect,
+                ui.id().with("plus_new_session"),
+                egui::Sense::click(),
+            );
+            if plus_resp.hovered() {
+                ui.painter().rect_filled(plus_rect, 6.0, Theme::bg_hover());
+            }
+            ui.painter().text(
+                plus_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "＋",
+                egui::FontId::proportional(14.0),
+                if plus_resp.hovered() {
+                    Theme::accent_light()
+                } else {
+                    Theme::text_dim()
+                },
+            );
+            plus_resp.clone().widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "＋ 新建会话")
+            });
+            let _ = plus_resp
+                .clone()
+                .on_hover_text(tr(lang, "新建会话", "New session"));
+            if plus_resp.clicked() {
+                let mut engine = self.engine.lock().unwrap();
+                if let Ok(id) = engine.create_session(None) {
+                    drop(engine);
+                    self.chat.refresh_sessions();
+                    self.chat.open(&id);
+                    self.tab = Tab::Chat;
+                }
+            }
+        }
+        if self.sessions_expanded {
+            // 点击/新建会话时自动切回会话页（否则在设置/技能页点会话无反馈）
+            if self.chat.ui_session_list(ui, None).is_some() {
+                self.tab = Tab::Chat;
+            }
         }
         if Theme::nav_button(
             ui,
@@ -184,89 +274,71 @@ impl DshDesktopApp {
         ) {
             self.tab = Tab::Settings;
         }
-        ui.add_space(20.0);
-        ui.separator();
-        ui.add_space(8.0);
-        if let Some(port) = self.bridge_port {
-            ui.label(Theme::dim(&format!("桥: 127.0.0.1:{port}")));
-        }
-        {
-            let engine = self.engine.lock().unwrap();
-            let has_key = engine.settings().api_key.is_some();
-            let status = if has_key {
-                "引擎就绪 ✓".to_string()
-            } else {
-                tr(lang, "未配置 API key", "API key not set")
-            };
-            let color = if has_key { Theme::OK } else { Theme::WARN };
-            ui.label(RichText::new(status).size(11.0).color(color));
-        }
+        // 桥/引擎状态：两行弱化小字（信息保留，视觉降噪）
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            let web_running = self.web_probe.is_up();
-            let managed = self.web.managed();
-            let status = if web_running {
-                if managed {
-                    "DSH Web 运行中（本应用托管）"
-                } else {
-                    "DSH Web 运行中（外部）"
-                }
-            } else {
-                "DSH Web 未运行"
-            };
-            ui.label(RichText::new(status).size(11.0).color(if web_running {
-                Theme::OK
-            } else {
-                Theme::WARN
-            }));
+            ui.add_space(6.0);
+            if let Some(port) = self.bridge_port {
+                ui.label(Theme::dim(&format!("bridge 127.0.0.1:{port}")));
+            }
+            // DSH Web：状态一行 + 极简文字按钮（不再是按钮堆）
             ui.horizontal(|ui| {
+                let web_running = self.web_probe.is_up();
+                let managed = self.web.managed();
+                let dot = if web_running { "●" } else { "○" };
+                let status = if web_running {
+                    if managed {
+                        tr(lang, "DSH Web", "DSH Web")
+                    } else {
+                        tr(lang, "DSH Web（外部）", "DSH Web (external)")
+                    }
+                } else {
+                    tr(lang, "DSH Web", "DSH Web")
+                };
+                ui.label(RichText::new(format!("{dot} {status}")).size(11.0).color(
+                    if web_running {
+                        Theme::ok()
+                    } else {
+                        Theme::text_faint()
+                    },
+                ));
                 if web_running {
                     ui.hyperlink_to(
-                        RichText::new("打开 Web").color(Theme::CYAN),
+                        RichText::new(tr(lang, "打开", "open")).size(11.0),
                         self.cfg.web_url(),
                     );
-                } else {
-                    // 未运行 → 一键启动（插件功能的入口：web 进程承载插件）
-                    if ui.small_button("启动 Web").clicked() {
-                        let profile = self
-                            .cfg
-                            .profile
-                            .clone()
-                            .unwrap_or_else(|| "web".to_string());
-                        match self.web.start(&profile) {
-                            Ok(()) => info!("web started from sidebar (profile {profile})"),
-                            Err(e) => {
-                                log::warn!("web start failed: {e:#}");
-                                self.chat.error = Some(format!("启动 DSH Web 失败：{e:#}"));
-                            }
+                } else if ui
+                    .small_button(tr(lang, "启动", "start"))
+                    .on_hover_text(tr(
+                        lang,
+                        "启动 DSH Web（插件功能的入口：web 进程承载插件）",
+                        "Start DSH Web (plugins live in the web process)",
+                    ))
+                    .clicked()
+                {
+                    let profile = self
+                        .cfg
+                        .profile
+                        .clone()
+                        .unwrap_or_else(|| "web".to_string());
+                    match self.web.start(&profile) {
+                        Ok(()) => info!("web started from sidebar (profile {profile})"),
+                        Err(e) => {
+                            log::warn!("web start failed: {e:#}");
+                            self.chat.error = Some(format!("启动 DSH Web 失败：{e:#}"));
                         }
                     }
                 }
                 if managed {
-                    if ui.small_button("停止").clicked() {
+                    if ui.small_button(tr(lang, "停止", "stop")).clicked() {
                         self.web.stop();
                     }
-                    if ui.small_button("重启").clicked() {
+                    if ui.small_button(tr(lang, "重启", "restart")).clicked() {
                         let profile = self.web.profile().to_string();
                         self.web.restart(&profile);
                     }
                 }
             });
         });
-    }
-
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        let lang = crate::ui::i18n::Lang::parse(&self.cfg.lang);
-        use crate::ui::i18n::tr;
-        ui.horizontal(|ui| {
-            let tab_name = match self.tab {
-                Tab::Chat => tr(lang, "会话", "Chat"),
-                Tab::Skills => tr(lang, "技能", "Skills"),
-                Tab::Extensions => tr(lang, "扩展", "Extensions"),
-                Tab::Settings => tr(lang, "设置", "Settings"),
-            };
-            ui.label(Theme::section_title(&tab_name));
-        });
-        ui.separator();
     }
 }
 
@@ -277,6 +349,26 @@ impl eframe::App for DshDesktopApp {
         self.chat.lang = lang;
         self.skills.lang = lang;
         self.ext.lang = lang;
+        // 全局快捷键：Ctrl+N 新建会话 / Escape 关浮动卡片
+        {
+            let ctx = ui.ctx();
+            if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::N)) {
+                let mut engine = self.engine.lock().unwrap();
+                if let Ok(id) = engine.create_session(None) {
+                    drop(engine);
+                    self.chat.refresh_sessions();
+                    self.chat.open(&id);
+                    self.tab = Tab::Chat;
+                }
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.chat.card = crate::ui::chat_tab::CardKind::None;
+            }
+        }
+        // 引擎事件泵置顶（任何标签页都处理）：事件只驱动 ChatTab 状态，
+        // 但泵本身必须无条件执行——否则切到技能/扩展/设置页时后台回合的
+        // 事件积压在无界通道里，状态不更新、UI 冻结到下次鼠标移动
+        self.chat.pump(&ui.ctx().clone());
         // 工作区变更 → 立即持久化 last_workspace（避免崩溃/异常退出丢失）
         {
             let ws = self.engine.lock().unwrap().workspace_root().cloned();
@@ -290,12 +382,21 @@ impl eframe::App for DshDesktopApp {
             }
         }
         Panel::left("sidebar").show(ui, |ui| {
-            ui.set_width(180.0);
+            ui.set_width(172.0);
             self.sidebar(ui);
         });
-        Panel::top("topbar").show(ui, |ui| self.top_bar(ui));
+        // 简约布局：无顶栏（页面标题由各内容区自带），底部一行弱化状态
+        // 错误信息显示在底部状态栏（RUST_LOG 前）：不打断内容区布局，
+        // 用户视线自然落底即可看到
+        let chat_error = self.chat.error.clone();
         Panel::bottom("status").show(ui, |ui| {
-            status_bar(ui, &self.cfg, self.web_probe.is_up(), lang)
+            status_bar(
+                ui,
+                &self.cfg,
+                self.web_probe.is_up(),
+                lang,
+                chat_error.as_deref(),
+            )
         });
 
         CentralPanel::default().show(ui, |ui| match self.tab {
@@ -307,8 +408,23 @@ impl eframe::App for DshDesktopApp {
             }
             Tab::Settings => self.settings.ui(ui, &mut self.cfg),
         });
+        // 桥访问信息（端口/token）注入设置页展示
+        if let (Some(p), Some(t)) = (self.bridge_port, self.bridge_token.as_deref()) {
+            self.settings.set_bridge_info(Some(p), Some(t.to_string()));
+        }
+        // 排队消息泵：回合结束（idle）的会话自动取队首发起（FIFO）
+        self.engine.lock().unwrap().pump_message_queue();
         // 插件（子进程扩展）输出泵：每帧处理响应/握手/退出（引擎短锁）
-        self.engine.lock().unwrap().plugin_pump();
+        let plugin_busy = {
+            let engine = self.engine.lock().unwrap();
+            engine.plugin_pump();
+            engine.plugin_has_live_work()
+        };
+        if plugin_busy {
+            // 有握手/工具响应等待中：定时重绘，响应到达不被"无鼠标输入不重绘"卡住
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
     }
 
     fn on_exit(&mut self) {
@@ -321,15 +437,29 @@ impl eframe::App for DshDesktopApp {
     }
 }
 
-/// 加载系统字体（等宽 + CJK 回退）到 egui。
+/// 加载字体（Consolas 界面主字体 + 等宽回退 + CJK 回退）到 egui。
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+    // Consolas：界面文字主字体（Windows 系统自带，含 Bold 四风格）。
+    // 插到 Proportional 与 Monospace 家族首位；无中文字形 → 自动落到
+    // 下方 CJK 回退链（雅黑），emoji 落 Segoe。
+    if let Some((name, bytes)) = util::load_ui_font_consolas() {
+        fonts
+            .font_data
+            .insert(name.clone(), egui::FontData::from_owned(bytes).into());
+        if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+            mono.insert(0, name.clone());
+        }
+        if let Some(prop) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            prop.insert(0, name);
+        }
+    }
     if let Some((name, bytes)) = util::load_mono_font() {
         fonts
             .font_data
             .insert(name.clone(), egui::FontData::from_owned(bytes).into());
         if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-            mono.insert(0, name);
+            mono.insert(1, name);
         }
     }
     if let Some((name, bytes)) = util::load_cjk_font() {

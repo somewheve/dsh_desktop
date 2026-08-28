@@ -131,5 +131,28 @@
 ## 6 当前进度快照
 
 - M0 全部完成（37 测试全绿、release 构建、E2E 真实 LLM 回复验证）
-- 已实现：core/{agent,session,llm,tools,storage,settings}、bridge(xitca-web)、ui/{chat,terminal,plugins,settings,theme,status_bar}
-- 待补：agent inbox/dispatch 全语义、projection/query、retry、17 工具、exec/、engine/、plugin/
+- **M11 全量审查与修复完成**（111 lib + 28 integration + 33 ui_layout 测试全绿、零警告、release 构建）：
+  - 回合生命周期：turn epoch/TurnGuard（cancel-重发竞态、错误路径复位、panic 安全）、
+    每会话回合串行锁、stop/interject 信号分离、删除会话墓碑
+  - UI：事件泵置顶（跨标签页）、扩展页锁重构（死锁修复）、审批队列（注册表驱动跨会话）、
+    Enter 焦点门、流式幽灵清理、渲染快照（30fps 不再每帧深拷贝）
+  - 安全：node_called 沙箱拒绝+审批、run_code 子步审批、写工具 can_write fail-closed、
+    桥 token 鉴权、重定向启发式增强、受限令牌特权全删+最小环境+Job Object 树杀、
+    工作区根防过宽、uuid 随机化
+  - LLM/持久化：连接+读空闲超时、瞬态重试、[DONE] 截断检测、部分输出降级落盘、
+    tool/result call_id 配对、重载截断、compaction 修复并接线
+  - 执行/插件：subprocess 排水、cli 超时+proxy 注入、插件 stderr 排水/pending 清理/
+    stop 唤醒、schedule 后台驱动、read_file 上限
+- **M12 UI/主题/插件增强完成**（同上全绿）：
+  - 简约重设计：无框导航+左侧强调条、去顶栏、极简状态栏、ZCode 风格输入框
+    （透明多行输入 + 工具行：模型/思考深度/权限/模式 chips）
+  - 主题系统：16 槽 Palette、内置 3 主题、$DSH_HOME/themes/*.json + 插件主题、设置页切换
+  - 模型系统：DeepSeek V4 表（flash/pro/vision-exp+legacy）、thinking.type + reasoning_effort
+    （none/low/high/max）、运行时切换（下一回合生效）
+  - 会话列表收纳进侧栏"会话"下（可折叠）；计划/任务/子代理/目标改浮动卡片（不挤占布局）
+  - 插件核心层增强：同名工具覆盖内置（如 web_search）、domain 领域声明归组展示
+  - 错误信息移至底部状态栏（RUST_LOG 前）
+- 已实现：core/{agent,session,llm,tools,storage,settings}、bridge(xitca-web)、
+  ui/{chat,extensions,settings,theme,status_bar,danmaku,markdown,skills}、
+  engine/{approval,compaction,goal,plan,schedule,skill,subagent,jobs,plugin}、exec/{acl,sandbox,winacl,subprocess}
+- 待补：projection/query、多 provider、workflow 完整编排、dsh-web 前端功能对齐

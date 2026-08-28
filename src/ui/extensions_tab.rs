@@ -21,6 +21,15 @@ enum ExtTab {
     Local,
 }
 
+/// 渲染期收集的插件操作（渲染结束后短锁统一执行，渲染期间不持引擎锁）。
+enum ExtAction {
+    StartAll,
+    Start(String),
+    Stop(String),
+    Reload(String),
+    Refresh,
+}
+
 pub struct ExtensionsTab {
     engine: Arc<Mutex<DshEngine>>,
     pub lang: Lang,
@@ -33,6 +42,8 @@ pub struct ExtensionsTab {
     busy: bool,
     status: String,
     error: Option<String>,
+    /// 本帧收集的插件操作（ui 结束后统一短锁执行）
+    actions: Vec<ExtAction>,
 }
 
 impl ExtensionsTab {
@@ -47,18 +58,30 @@ impl ExtensionsTab {
             busy: false,
             status: String::new(),
             error: None,
+            actions: Vec::new(),
         };
         tab.refresh_local();
         tab
     }
 
-    /// 刷新本地已装 DSH 插件。
+    /// 刷新本地已装 DSH 插件 + 重读缓存的远程清单（不再每帧读盘）。
     fn refresh_local(&mut self) {
         let cfg = crate::config::AppConfig::load();
         self.local_plugins = crate::dsh::plugins::scan_dsh_plugins(&cfg)
             .into_iter()
             .map(|(n, _, _)| n)
             .collect();
+        let cache_file = {
+            let engine = self.engine.lock().unwrap();
+            engine.skills_dir().join(".dsh-plugin-list.json")
+        };
+        let cached: Vec<(String, String)> = std::fs::read_to_string(&cache_file)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        if !cached.is_empty() {
+            self.dsh_plugins = cached;
+        }
     }
 
     fn pump_bg(&mut self) {
@@ -116,7 +139,14 @@ impl ExtensionsTab {
                     }
                 }
             })
-            .expect("spawn ext-op thread");
+            .map_err(|e| e.to_string())
+            .err()
+            .map(|e| {
+                // 线程启动失败：立即解除 busy 并提示（否则面板永久卡"操作中"）
+                self.busy = false;
+                self.error = Some(format!("后台线程启动失败: {e}"));
+                self.bg_rx = None;
+            });
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -131,14 +161,24 @@ impl ExtensionsTab {
                 "Cordis-style subprocess plugins: write in any language; the agent can call their tools directly. DSH official cordis plugins can be fetched online and called by the agent via node_called (no transcription needed).",
             ))
             .size(11.0)
-            .color(Theme::TEXT_DIM),
+            .color(Theme::text_dim()),
         );
         ui.add_space(4.0);
 
-        // 不借用 self（下方有 &mut self 的后台操作）：Arc clone 后锁
-        let engine_arc = self.engine.clone();
-        let engine = engine_arc.lock().unwrap();
-        let dir = engine.plugin_dir();
+        // 短锁取快照（目录/插件状态/领域声明），渲染期间不持锁：
+        // ui_local 的 rfd 文件对话框会阻塞 UI（持锁 = 冻结全部引擎工作），
+        // 且 ui_local 内部还会再 lock 同一非重入锁（历史死锁点）
+        let (dir, snapshot, skills_dir, domains) = {
+            let engine = self.engine.lock().unwrap();
+            (
+                engine.plugin_dir(),
+                engine.plugin_snapshot(),
+                engine.skills_dir(),
+                engine.plugin_domains(),
+            )
+        };
+        // 插件名 → 领域（核心层增强插件按 domain 声明归组展示）
+        let domain_of: std::collections::HashMap<String, String> = domains.into_iter().collect();
         // 目录行
         ui.horizontal(|ui| {
             ui.label(
@@ -148,7 +188,7 @@ impl ExtensionsTab {
                     dir.display()
                 ))
                 .size(11.0)
-                .color(Theme::TEXT_DIM),
+                .color(Theme::text_dim()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -169,7 +209,7 @@ impl ExtensionsTab {
                     }
                 }
                 if ui.small_button(tr(lang, "刷新", "Refresh")).clicked() {
-                    engine.plugin_refresh();
+                    self.actions.push(ExtAction::Refresh);
                     self.refresh_local();
                 }
             });
@@ -213,16 +253,28 @@ impl ExtensionsTab {
         ui.separator();
 
         match self.tab {
-            ExtTab::Installed => self.ui_installed(ui, lang, &engine),
-            ExtTab::Remote => self.ui_remote(ui, lang, &engine),
+            ExtTab::Installed => self.ui_installed(ui, lang, &snapshot, &skills_dir, &domain_of),
+            ExtTab::Remote => self.ui_remote(ui, lang, &skills_dir),
             ExtTab::Local => self.ui_local(ui, lang),
         }
-        // 每帧泵（处理插件输出/响应/退出）
-        engine.plugin_pump();
+        // 渲染期收集的操作：短锁统一执行
+        let actions = std::mem::take(&mut self.actions);
+        if !actions.is_empty() {
+            let engine = self.engine.lock().unwrap();
+            for a in actions {
+                match a {
+                    ExtAction::StartAll => engine.plugin_start_all(),
+                    ExtAction::Start(n) => engine.plugin_start(&n),
+                    ExtAction::Stop(n) => engine.plugin_stop(&n),
+                    ExtAction::Reload(n) => engine.plugin_reload(&n),
+                    ExtAction::Refresh => engine.plugin_refresh(),
+                }
+            }
+        }
         // 状态/错误
         if let Some(e) = &self.error {
             ui.add_space(2.0);
-            ui.colored_label(Theme::ERR, format!("⚠ {e}"));
+            ui.colored_label(Theme::err(), format!("⚠ {e}"));
         }
         if !self.status.is_empty() {
             ui.add_space(2.0);
@@ -235,12 +287,14 @@ impl ExtensionsTab {
         &mut self,
         ui: &mut egui::Ui,
         lang: Lang,
-        engine: &std::sync::MutexGuard<'_, DshEngine>,
+        snapshot: &[(String, PluginStatus, Vec<String>, String)],
+        skills_dir: &std::path::Path,
+        domain_of: &std::collections::HashMap<String, String>,
     ) {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(tr(lang, "子进程插件", "Subprocess plugins"))
-                    .color(Theme::ACCENT_LIGHT)
+                    .color(Theme::accent_light())
                     .strong(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -253,12 +307,12 @@ impl ExtensionsTab {
                     ))
                     .clicked()
                 {
-                    engine.plugin_start_all();
+                    self.actions.push(ExtAction::StartAll);
                 }
             });
         });
         ui.add_space(4.0);
-        let snapshot = engine.plugin_snapshot();
+        let snapshot = snapshot.to_vec();
         let empty = snapshot.is_empty();
         ScrollArea::vertical()
             .max_height(ui.available_height() * 0.5)
@@ -266,8 +320,8 @@ impl ExtensionsTab {
             .show(ui, |ui| {
                 for (name, status, tool_names, desc) in snapshot {
                     let frame = egui::Frame::default()
-                        .fill(Theme::BG_ELEVATED)
-                        .stroke(egui::Stroke::new(1.0, Theme::BORDER))
+                        .fill(Theme::bg_elevated())
+                        .stroke(egui::Stroke::new(1.0, Theme::border()))
                         .corner_radius(egui::CornerRadius::same(10))
                         .inner_margin(egui::Margin::symmetric(12, 10));
                     frame.show(ui, |ui| {
@@ -276,14 +330,26 @@ impl ExtensionsTab {
                                 RichText::new(&name)
                                     .size(15.0)
                                     .strong()
-                                    .color(Theme::ACCENT_LIGHT),
+                                    .color(Theme::accent_light()),
                             );
                             let (status_zh, status_en, color) = match &status {
-                                PluginStatus::Running => ("运行中", "running", Theme::OK),
-                                PluginStatus::Starting => ("启动中", "starting", Theme::CYAN),
-                                PluginStatus::Stopped => ("已停止", "stopped", Theme::TEXT_DIM),
-                                PluginStatus::Failed(_) => ("异常", "failed", Theme::ERR),
+                                PluginStatus::Running => ("运行中", "running", Theme::ok()),
+                                PluginStatus::Starting => ("启动中", "starting", Theme::cyan()),
+                                PluginStatus::Stopped => ("已停止", "stopped", Theme::text_dim()),
+                                PluginStatus::Failed(_) => ("异常", "failed", Theme::err()),
                             };
+                            if let Some(dom) = domain_of.get(&name) {
+                                ui.label(
+                                    RichText::new(format!("◇ {dom}"))
+                                        .size(10.0)
+                                        .color(Theme::cyan()),
+                                )
+                                .on_hover_text(tr(
+                                    lang,
+                                    "领域增强插件（核心层工具提供者，非提示词注入）",
+                                    "Domain enhancement plugin (core-level tool provider)",
+                                ));
+                            }
                             ui.label(
                                 RichText::new(tr(lang, status_zh, status_en))
                                     .size(11.0)
@@ -293,7 +359,7 @@ impl ExtensionsTab {
                                 ui.label(
                                     RichText::new(e.clone())
                                         .size(11.0)
-                                        .color(Theme::ERR),
+                                        .color(Theme::err()),
                                 );
                             }
                             ui.label(
@@ -303,7 +369,7 @@ impl ExtensionsTab {
                                     tool_names.len()
                                 ))
                                 .size(11.0)
-                                .color(Theme::TEXT_DIM),
+                                .color(Theme::text_dim()),
                             );
                             // 工具名列表（hover 显示全名；数量多时截断显示前 6 个）
                             if !tool_names.is_empty() {
@@ -319,7 +385,7 @@ impl ExtensionsTab {
                                 ui.label(
                                     RichText::new(names.clone())
                                         .size(11.0)
-                                        .color(Theme::TEXT_FAINT),
+                                        .color(Theme::text_faint()),
                                 )
                                 .on_hover_text(if tool_names.len() > 6 {
                                     tool_names.join(", ")
@@ -329,19 +395,19 @@ impl ExtensionsTab {
                             }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.small_button(tr(lang, "重载", "Reload")).clicked() {
-                                    engine.plugin_reload(&name);
+                                    self.actions.push(ExtAction::Reload(name.clone()));
                                 }
                                 if ui.small_button(tr(lang, "停止", "Stop")).clicked() {
-                                    engine.plugin_stop(&name);
+                                    self.actions.push(ExtAction::Stop(name.clone()));
                                 }
                                 if ui.small_button(tr(lang, "启动", "Start")).clicked() {
-                                    engine.plugin_start(&name);
+                                    self.actions.push(ExtAction::Start(name.clone()));
                                 }
                             });
                         });
                         if !desc.is_empty() {
                             ui.add_space(2.0);
-                            ui.label(RichText::new(desc).color(Theme::TEXT_DIM));
+                            ui.label(RichText::new(desc).color(Theme::text_dim()));
                         }
                     });
                     ui.add_space(4.0);
@@ -369,7 +435,7 @@ impl ExtensionsTab {
                 ),
                 self.local_plugins.len()
             ))
-            .color(Theme::ACCENT_LIGHT)
+            .color(Theme::accent_light())
             .strong(),
         );
         ui.add_space(2.0);
@@ -386,15 +452,15 @@ impl ExtensionsTab {
                 .show(ui, |ui| {
                     for name in self.local_plugins.clone() {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("•").color(Theme::ACCENT_LIGHT));
-                            ui.label(RichText::new(&name).size(12.0).color(Theme::TEXT));
+                            ui.label(RichText::new("•").color(Theme::accent_light()));
+                            ui.label(RichText::new(&name).size(12.0).color(Theme::text()));
                             // 已转写为技能标记
                             let skill_name = crate::dsh::plugins::plugin_to_skill_name(&name);
-                            if engine.skills_dir().join(&skill_name).is_dir() {
+                            if skills_dir.join(&skill_name).is_dir() {
                                 ui.label(
                                     RichText::new(tr(lang, "✓ 已转写", "✓ transcribed"))
                                         .size(11.0)
-                                        .color(Theme::OK),
+                                        .color(Theme::ok()),
                                 );
                             }
                         });
@@ -404,12 +470,7 @@ impl ExtensionsTab {
     }
 
     // ================= 远程安装（联网） =================
-    fn ui_remote(
-        &mut self,
-        ui: &mut egui::Ui,
-        lang: Lang,
-        engine: &std::sync::MutexGuard<'_, DshEngine>,
-    ) {
+    fn ui_remote(&mut self, ui: &mut egui::Ui, lang: Lang, skills_dir: &std::path::Path) {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!(
@@ -417,7 +478,7 @@ impl ExtensionsTab {
                     tr(lang, "来源", "Source")
                 ))
                 .size(12.0)
-                .color(Theme::ACCENT_LIGHT)
+                .color(Theme::accent_light())
                 .strong(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -433,7 +494,7 @@ impl ExtensionsTab {
                     ))
                     .clicked()
                 {
-                    let cache_file = engine.skills_dir().join(".dsh-plugin-list.json");
+                    let cache_file = skills_dir.join(".dsh-plugin-list.json");
                     let engine2 = self.engine.clone();
                     self.run_in_background(move || {
                         let list = crate::dsh::plugins::fetch_dsh_plugin_list()?;
@@ -457,15 +518,7 @@ impl ExtensionsTab {
             });
         });
         ui.add_space(4.0);
-        // 读取缓存清单
-        let cache_file = engine.skills_dir().join(".dsh-plugin-list.json");
-        let cached: Vec<(String, String)> = std::fs::read_to_string(&cache_file)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
-        if !cached.is_empty() {
-            self.dsh_plugins = cached;
-        }
+        // 清单已在 refresh_local() 加载（后台获取完成后刷新；不每帧读盘）
         if self.dsh_plugins.is_empty() {
             ui.add_space(16.0);
             ui.centered_and_justified(|ui| {
@@ -484,7 +537,7 @@ impl ExtensionsTab {
                 "Click Download: fetch the package into the local plugin repository. After downloading, the agent can require it directly via node_called — no transcription needed.",
             ))
             .size(11.0)
-            .color(Theme::TEXT_DIM),
+            .color(Theme::text_dim()),
         );
         ui.add_space(2.0);
         let dl_nm = crate::config::AppConfig::load()
@@ -501,8 +554,8 @@ impl ExtensionsTab {
                     let downloaded = dl_nm.join("@deepseek-ai").join(base).is_dir();
                     let locally_installed = self.local_plugins.contains(&name);
                     let frame = egui::Frame::default()
-                        .fill(Theme::BG_ELEVATED)
-                        .stroke(egui::Stroke::new(1.0, Theme::BORDER))
+                        .fill(Theme::bg_elevated())
+                        .stroke(egui::Stroke::new(1.0, Theme::border()))
                         .corner_radius(egui::CornerRadius::same(8))
                         .inner_margin(egui::Margin::symmetric(10, 6));
                     frame.show(ui, |ui| {
@@ -510,24 +563,24 @@ impl ExtensionsTab {
                             ui.label(
                                 RichText::new(&name)
                                     .strong()
-                                    .color(Theme::ACCENT_LIGHT),
+                                    .color(Theme::accent_light()),
                             );
                             ui.label(
                                 RichText::new(version.clone())
                                     .size(11.0)
-                                    .color(Theme::TEXT_DIM),
+                                    .color(Theme::text_dim()),
                             );
                             if locally_installed {
                                 ui.label(
                                     RichText::new(tr(lang, "已安装", "installed"))
                                         .size(11.0)
-                                        .color(Theme::OK),
+                                        .color(Theme::ok()),
                                 );
                             } else if downloaded {
                                 ui.label(
                                     RichText::new(tr(lang, "✓ 已下载", "✓ downloaded"))
                                         .size(11.0)
-                                        .color(Theme::OK),
+                                        .color(Theme::ok()),
                                 );
                             }
                             ui.with_layout(
@@ -584,14 +637,14 @@ impl ExtensionsTab {
                 "Import a plugin from a local folder. The folder must contain plugin.json
                  (manifest); the plugin program can be in any language (Python / Node / Rust / batch…).",
             ))
-            .color(Theme::TEXT),
+            .color(Theme::text()),
         );
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if ui
                 .add(egui::Button::new(
                     RichText::new(tr(lang, "📁 选择插件目录导入", "📁 Import plugin folder"))
-                        .color(Theme::ACCENT_LIGHT),
+                        .color(Theme::accent_light()),
                 ))
                 .clicked()
             {
@@ -624,8 +677,8 @@ impl ExtensionsTab {
         ui.add_space(8.0);
         // 格式说明
         let frame = egui::Frame::default()
-            .fill(Theme::BG_ELEVATED)
-            .stroke(egui::Stroke::new(1.0, Theme::BORDER))
+            .fill(Theme::bg_elevated())
+            .stroke(egui::Stroke::new(1.0, Theme::border()))
             .corner_radius(egui::CornerRadius::same(8))
             .inner_margin(egui::Margin::symmetric(10, 8));
         frame.show(ui, |ui| {
@@ -636,7 +689,7 @@ impl ExtensionsTab {
                     "plugin.json format:",
                 ))
                 .size(11.0)
-                .color(Theme::ACCENT_LIGHT)
+                .color(Theme::accent_light())
                 .strong(),
             );
             ui.add_space(2.0);
@@ -646,7 +699,7 @@ impl ExtensionsTab {
                 )
                 .monospace()
                 .size(11.0)
-                .color(Theme::TEXT_DIM),
+                .color(Theme::text_dim()),
             );
             ui.add_space(4.0);
             ui.label(
@@ -658,7 +711,7 @@ impl ExtensionsTab {
                      handle tool.invoke by params.name and reply with result (JSON-RPC 2.0, newline-delimited on stdin/stdout).",
                 ))
                 .size(11.0)
-                .color(Theme::TEXT_DIM),
+                .color(Theme::text_dim()),
             );
         });
     }
