@@ -52,6 +52,12 @@ impl Default for AppConfig {
     }
 }
 
+/// 字体大小（font_size）→ 全局界面缩放（16 = 1.0x 默认；
+/// 钳制 0.75–1.5 防止极端值把 UI 缩没/撑爆）。
+pub fn ui_zoom(font_size: f32) -> f32 {
+    (font_size / 16.0).clamp(0.75, 1.5)
+}
+
 /// 解析 DSH_HOME：环境变量优先，否则 ~/.dsh。
 pub fn default_dsh_home() -> PathBuf {
     if let Some(h) = std::env::var_os("DSH_HOME") {
@@ -214,6 +220,22 @@ impl AppConfig {
             cmd.env("NO_PROXY", p);
             cmd.env("no_proxy", p);
         }
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::ui_zoom;
+
+    /// 字体大小 → 缩放映射：16=1.0；钳制范围；用户存的 19.5 → 1.22。
+    #[test]
+    fn ui_zoom_mapping() {
+        assert_eq!(ui_zoom(16.0), 1.0, "默认字号 = 1.0x");
+        assert_eq!(ui_zoom(19.5), 1.21875, "用户保存的 19.5 应映射 ~1.22x");
+        assert_eq!(ui_zoom(8.0), 0.75, "过小钳到 0.75");
+        assert_eq!(ui_zoom(48.0), 1.5, "过大钳到 1.5");
+        assert_eq!(ui_zoom(12.0), 0.75);
+        assert_eq!(ui_zoom(24.0), 1.5);
     }
 }
 

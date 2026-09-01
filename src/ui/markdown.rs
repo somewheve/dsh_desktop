@@ -516,7 +516,7 @@ fn span_text(spans: &[MdSpan]) -> String {
 
 /// 解析任务列表项的勾选框前缀：`[x]`/`[X]` → (true, 剩余)，`[ ]` → (false, 剩余)。
 /// 非勾选框项返回 None。用于 `- [ ]`/`- [x]` 计划步骤的渲染。
-fn checkbox_state(text: &str) -> Option<(bool, String)> {
+pub fn checkbox_state(text: &str) -> Option<(bool, String)> {
     let mut t = text.trim_start();
     // fnv list bullet tolerant
     for sym in ["- ", "* ", "+ ", "• "] {
@@ -611,6 +611,41 @@ fn render_code_block(ui: &mut egui::Ui, code: &str, max_w: f32) {
         // 必须用调用方传入的 max_w 强制 wrap——否则超长代码行会把整个
         // 消息气泡撑到视口外（历史回归：AI 消息气泡宽 1394px、后续消息偏移）。
         ui.set_max_width(max_w.max(40.0));
+        // 顶行右侧：⧉ 复制（整块代码入剪贴板）——代码块是 AI 消息里最常
+        // 被取用的内容。命中区 58x18（历史缺陷 52x14 太小难点中），复制后
+        // 1.5s 内按钮变为绿色 "✓ copied"（历史缺陷：点击后零反馈，
+        // 用户以为没生效）。点击时刻存 egui 临时数据（按代码内容寻址）。
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            let key = egui::Id::new(("code_copy_flash", code));
+            let just_copied = ui
+                .ctx()
+                .data(|d| d.get_temp::<std::time::Instant>(key))
+                .map(|t| t.elapsed().as_secs_f32() < 1.5)
+                .unwrap_or(false);
+            let (label, color) = if just_copied {
+                ("✓ copied", Theme::ok())
+            } else {
+                ("⧉ copy", Theme::text_faint())
+            };
+            let btn = ui
+                .add_sized(
+                    [58.0, 18.0],
+                    egui::Label::new(
+                        egui::RichText::new(label).size(10.5).color(color),
+                    ),
+                )
+                .interact(egui::Sense::click())
+                .on_hover_text("Copy code block");
+            if btn.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if btn.clicked() {
+                ui.ctx()
+                    .copy_text(code.trim_end_matches('\n').to_string());
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(key, std::time::Instant::now()));
+            }
+        });
         ui.label(
             egui::RichText::new(code.trim_end_matches('\n'))
                 .monospace()
@@ -680,9 +715,16 @@ fn render_table(
 pub fn load_texture_from_file(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
     let bytes = std::fs::read(path).ok()?;
     let img = image::load_from_memory(&bytes).ok()?;
+    // 降采样：显示上限 320×240，纹理超 1024 长边即缩（历史：8192² 原始
+    // 尺寸 RGBA 达 256MB/张，多图会话 GPU 内存暴涨）
+    let img = if img.width().max(img.height()) > 1024 {
+        img.resize(1024, 1024, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
-    if w == 0 || h == 0 || w > 8192 || h > 8192 {
+    if w == 0 || h == 0 {
         return None;
     }
     let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
@@ -723,7 +765,7 @@ fn show_image(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_image(
+pub fn render_image(
     ui: &mut egui::Ui,
     src: &str,
     alt: &str,

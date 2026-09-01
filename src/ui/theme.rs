@@ -255,6 +255,14 @@ impl ThemeManager {
 /// UI 主题门面：颜色读取当前激活调色盘。
 pub struct Theme;
 
+/// mini 按钮的语义色：中性（默认）/ 强调（主操作）/ 危险（删除等）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChipTint {
+    Neutral,
+    Accent,
+    Danger,
+}
+
 impl Theme {
     // ===== 颜色槽位（读全局激活调色盘） =====
     pub fn bg() -> Color32 {
@@ -437,16 +445,216 @@ impl Theme {
     pub fn font(size: f32) -> FontId {
         FontId::proportional(size)
     }
+
+    // ===== 共享设计组件：聊天输入框（ZCode 风格）chips 推广到全部页面 =====
+    //
+    // 设计基准取自会话输入框：等高小尺寸 chips（8px 圆角、11.5px 字号、
+    // 细边框 + hover 亮底）、实心胶囊主按钮、圆角 elevated 卡片容器。
+    // 插件 / 技能 / 设置页的 tab 切换、操作按钮与卡片统一走这些组件。
+
+    /// 页面标题（无全局顶栏，各内容区自带）。
+    pub fn page_title(text: impl Into<String>) -> RichText {
+        RichText::new(text).size(17.0).strong().color(Self::text())
+    }
+
+    /// 卡片容器：圆角 elevated + 细边框（与聊天输入容器同族）。
+    pub fn card() -> egui::Frame {
+        egui::Frame::default()
+            .fill(Self::bg_elevated())
+            .stroke(egui::Stroke::new(1.0, Self::border()))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(14, 10))
+    }
+
+    /// 卡片内小节标题。
+    pub fn card_section_title(text: impl Into<String>) -> RichText {
+        RichText::new(text).size(12.5).strong().color(Self::accent_light())
+    }
+
+    /// 分段 Tab（页面内 tab 切换）：等高胶囊，选中 = 亮底 + 边框 +
+    /// accent 文字，悬停 = 半透明亮底。手绘 + 手动注册 a11y
+    /// （nav_button 同模式；painter 绘制不进 accessibility 树）。
+    pub fn segment_tab(
+        ui: &mut egui::Ui,
+        label: impl Into<String>,
+        selected: bool,
+    ) -> egui::Response {
+        const H: f32 = 26.0;
+        let label = label.into();
+        let color =
+            if selected { Self::accent_light() } else { Self::text_dim() };
+        let galley = ui.painter().layout_no_wrap(
+            label.clone(),
+            FontId::proportional(12.0),
+            color,
+        );
+        let w = galley.size().x + 26.0;
+        let (rect, resp) =
+            ui.allocate_exact_size(Vec2::new(w, H), egui::Sense::click());
+        if selected {
+            ui.painter().rect(
+                rect,
+                8.0,
+                Self::bg_hover(),
+                egui::Stroke::new(1.0, Self::border()),
+                egui::StrokeKind::Inside,
+            );
+        } else if resp.hovered() {
+            ui.painter().rect_filled(
+                rect,
+                8.0,
+                Self::bg_hover().gamma_multiply(0.5),
+            );
+        }
+        let mb = galley.mesh_bounds;
+        let pos = egui::pos2(
+            rect.center().x - mb.width() / 2.0 - mb.min.x,
+            rect.center().y - mb.height() / 2.0 - mb.min.y,
+        );
+        ui.painter().galley(pos, galley, Color32::WHITE);
+        resp.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                true,
+                label.to_owned(),
+            )
+        });
+        resp
+    }
+
+    /// 次级小按钮（输入框 chips 同款：等高、细边框、hover 亮底）。
+    pub fn mini_button(
+        ui: &mut egui::Ui,
+        label: impl Into<String>,
+        tint: ChipTint,
+    ) -> egui::Response {
+        const H: f32 = 24.0;
+        let label = label.into();
+        let color = match tint {
+            ChipTint::Neutral => Self::text_dim(),
+            ChipTint::Accent => Self::accent_light(),
+            ChipTint::Danger => Self::err(),
+        };
+        let galley = ui.painter().layout_no_wrap(
+            label.clone(),
+            FontId::proportional(11.5),
+            color,
+        );
+        let w = (galley.size().x + 20.0).max(34.0);
+        let (rect, resp) =
+            ui.allocate_exact_size(Vec2::new(w, H), egui::Sense::click());
+        let hovered = resp.hovered();
+        let (bg, stroke) = match tint {
+            ChipTint::Neutral => {
+                let bg = if hovered {
+                    Self::bg_hover()
+                } else {
+                    Self::bg_elevated()
+                };
+                let stroke = if hovered {
+                    egui::Stroke::new(1.0, Self::text_faint())
+                } else {
+                    egui::Stroke::new(1.0, Self::border())
+                };
+                (bg, stroke)
+            }
+            ChipTint::Accent => {
+                let bg = if hovered {
+                    Self::accent().gamma_multiply(0.18)
+                } else {
+                    Self::accent().gamma_multiply(0.10)
+                };
+                (bg, egui::Stroke::new(1.0, Self::accent().gamma_multiply(0.45)))
+            }
+            ChipTint::Danger => {
+                let bg = if hovered {
+                    Self::err().gamma_multiply(0.20)
+                } else {
+                    Self::err().gamma_multiply(0.08)
+                };
+                (bg, egui::Stroke::new(1.0, Self::err().gamma_multiply(0.50)))
+            }
+        };
+        ui.painter().rect(rect, 8.0, bg, stroke, egui::StrokeKind::Inside);
+        // 用 mesh_bounds（实际字形墨迹边界）垂直居中而非 logical size
+        // （行高含 leading，混排 emoji/CJK 时字形在行内偏移——视觉偏上/偏下）
+        let mb = galley.mesh_bounds;
+        let pos = egui::pos2(
+            rect.center().x - mb.width() / 2.0 - mb.min.x,
+            rect.center().y - mb.height() / 2.0 - mb.min.y,
+        );
+        ui.painter().galley(pos, galley, Color32::WHITE);
+        resp.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                true,
+                label.to_owned(),
+            )
+        });
+        resp
+    }
+
+    /// 主操作胶囊按钮（发送按钮同款：实心 accent + 白字 + 大圆角）。
+    /// `enabled=false` 时置灰不可点（如后台任务进行中）。
+    pub fn primary_button(
+        ui: &mut egui::Ui,
+        label: impl Into<String>,
+        enabled: bool,
+    ) -> egui::Response {
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(
+                RichText::new(label).size(12.5).color(Color32::WHITE),
+            )
+            .fill(Self::accent())
+            .corner_radius(13.0)
+            .min_size(Vec2::new(0.0, 26.0)),
+        )
+    }
+
+    /// 状态胶囊（非交互）：低饱和语义色底 + 同色文字（运行中/已安装…）。
+    pub fn status_pill(ui: &mut egui::Ui, text: impl Into<String>, color: Color32) {
+        let text = text.into();
+        let galley = ui.painter().layout_no_wrap(
+            text.clone(),
+            FontId::proportional(10.5),
+            color,
+        );
+        let (rect, resp) = ui.allocate_exact_size(
+            Vec2::new(galley.size().x + 14.0, 18.0),
+            egui::Sense::hover(),
+        );
+        ui.painter()
+            .rect_filled(rect, 9.0, color.gamma_multiply(0.13));
+        let mb = galley.mesh_bounds;
+        let pos = egui::pos2(
+            rect.center().x - mb.width() / 2.0 - mb.min.x,
+            rect.center().y - mb.height() / 2.0 - mb.min.y,
+        );
+        ui.painter().galley(pos, galley, Color32::WHITE);
+        resp.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Label,
+                true,
+                text.to_owned(),
+            )
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 全局调色盘是共享状态：涉及 set_palette 的测试必须持此锁串行
+    /// （并行测试下 apply 断言会读到其它测试切换中的调色盘——历史 flake）。
+    static PALETTE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// 回归：egui 0.36 双主题槽机制下，自定义主题必须同时写入
     /// dark/light 两个槽（否则系统浅色模式下整个主题被忽略）。
     #[test]
     fn apply_writes_both_theme_slots() {
+        let _g = PALETTE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         Theme::set_palette(&Palette::dark());
         let ctx = egui::Context::default();
         Theme::apply(&ctx);
@@ -468,6 +676,7 @@ mod tests {
     /// 主题切换：调色盘全局生效，浅色主题切换 egui 主题模式。
     #[test]
     fn palette_switch_takes_effect() {
+        let _g = PALETTE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         Theme::set_palette(&Palette::graphite());
         assert_eq!(Theme::bg(), Palette::graphite().bg.0);
         assert!(!Theme::is_light(), "graphite 是深色主题");

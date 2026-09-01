@@ -110,7 +110,7 @@ fn engine_create_session_and_error_path() {
     let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     // 无 key 且无 DSH credentials → new 应成功（UI 可用），但发送时应报明确错误
     let mut engine = DshEngine::new(settings, tx).expect("无 key 也应能创建引擎");
     let sid = engine.create_session(None).unwrap();
@@ -127,8 +127,8 @@ fn engine_session_crud() {
     let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = Some("sk-test".into());
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
-    let test_data_dir = settings.data_dir.clone();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
+    let _test_data_dir = settings.data_dir.clone();
     let mut engine = DshEngine::new(settings, tx).expect("engine");
     let id = engine.create_session(Some("测试会话")).unwrap();
     // 打开并确认标题
@@ -150,8 +150,8 @@ fn workspace_open_and_bind_session() {
     let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
-    let test_data_dir = settings.data_dir.clone();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
+    let _test_data_dir = settings.data_dir.clone();
     let mut engine = DshEngine::new(settings, tx).expect("engine");
 
     // 未设置时无工作区
@@ -207,7 +207,7 @@ fn preset_sessions_created_restored_switched() {
     let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let data_dir = settings.data_dir.clone();
     let mut engine = DshEngine::new(settings, tx).expect("engine");
 
@@ -218,19 +218,19 @@ fn preset_sessions_created_restored_switched() {
         AgentPreset::Standard
     );
 
-    // 显式 PTC
+    // 显式自主规划
     let sid2 = engine
-        .create_session_full(Some("PTC"), None, AgentPreset::Ptc)
+        .create_session_full(Some("自主"), None, AgentPreset::AutoPlan)
         .unwrap();
-    assert_eq!(engine.open_session(&sid2).unwrap().preset, AgentPreset::Ptc);
+    assert_eq!(engine.open_session(&sid2).unwrap().preset, AgentPreset::AutoPlan);
 
-    // 切换 → 极简
+    // 切换 → 自主规划
     engine
-        .set_session_preset(&sid, AgentPreset::Minimal)
+        .set_session_preset(&sid, AgentPreset::AutoPlan)
         .expect("switch preset");
     assert_eq!(
         engine.open_session(&sid).unwrap().preset,
-        AgentPreset::Minimal
+        AgentPreset::AutoPlan
     );
 
     // 重放恢复：新引擎实例读同一 data_dir
@@ -241,44 +241,98 @@ fn preset_sessions_created_restored_switched() {
     let mut engine2 = DshEngine::new(settings2, tx2).expect("engine2");
     assert_eq!(
         engine2.open_session(&sid2).unwrap().preset,
-        AgentPreset::Ptc,
+        AgentPreset::AutoPlan,
         "重放后 preset 应恢复"
     );
 }
 
-/// Agent 预设：工具目录随预设过滤（minimal 仅 3 个，PTC 含 run_code）。
+/// Agent 预设：两种模式均为完整工具目录；run_code 已随 PTC 移除。
 #[test]
-fn preset_tool_catalog_filtering() {
+fn preset_tool_catalog_full() {
     use dsh_desktop::core::preset::AgentPreset;
     use dsh_desktop::core::tools::ToolRegistry;
     use std::path::PathBuf;
 
-    let full = ToolRegistry::new(PathBuf::from(".")).tool_specs();
-    assert!(
-        full.len() >= 10,
-        "标准模式工具集应完整，实际 {}",
-        full.len()
-    );
-    assert!(!full.iter().any(|s| s.function.name == "run_code"));
+    for preset in AgentPreset::all() {
+        let specs = ToolRegistry::new(PathBuf::from("."))
+            .with_preset(preset)
+            .tool_specs();
+        assert!(
+            specs.len() >= 10,
+            "{} 工具集应完整，实际 {}",
+            preset.name(),
+            specs.len()
+        );
+        assert!(
+            !specs.iter().any(|s| s.function.name == "run_code"),
+            "run_code 已随 PTC 模式移除"
+        );
+    }
+}
 
-    let minimal = ToolRegistry::new(PathBuf::from("."))
-        .with_preset(AgentPreset::Minimal)
-        .tool_specs();
-    let names: Vec<_> = minimal.iter().map(|s| s.function.name.as_str()).collect();
-    assert_eq!(
-        names,
-        vec!["bash", "pwsh", "str_replace_editor"],
-        "极简模式只应有双工具 + 平台 shell"
-    );
+/// 回归：附件图片链路——排队消息携带图片（泵出发送时保留）、
+/// 回合运行中插话也带图（此前两条路径都静默丢图）。
+#[test]
+fn attachment_images_survive_queue_and_interject() {
+    use dsh_desktop::core::settings::EngineSettings;
+    use dsh_desktop::core::{DshEngine, EngineEvent, Message};
+    let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = Some("fake-key".into());
+    settings.base_url = "http://127.0.0.1:1".into();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
+    let engine = std::sync::Arc::new(std::sync::Mutex::new(
+        DshEngine::new(settings, tx).expect("engine"),
+    ));
+    let sid = engine.lock().unwrap().create_session(Some("img链路")).unwrap();
 
-    let ptc = ToolRegistry::new(PathBuf::from("."))
-        .with_preset(AgentPreset::Ptc)
-        .tool_specs();
-    assert!(
-        ptc.iter().any(|s| s.function.name == "run_code"),
-        "PTC 模式应提供 run_code"
-    );
-    assert!(ptc.len() >= full.len(), "PTC 应包含标准全部工具 + run_code");
+    let user_images = |s: &dsh_desktop::core::Session| {
+        s.messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { images, .. } => images.clone(),
+                _ => None,
+            })
+            .collect::<Vec<Vec<String>>>()
+    };
+
+    // 1) 排队带图：running 中入队 → idle 泵出（同步 push 带 images）
+    {
+        let mut e = engine.lock().unwrap();
+        {
+            let mut shared = e.shared_sessions();
+            shared.get_mut(&sid).unwrap().running = true;
+        }
+        e.enqueue_message(&sid, "看这张图", vec!["C:/tmp/a.png".into()]);
+        {
+            let mut shared = e.shared_sessions();
+            shared.get_mut(&sid).unwrap().running = false;
+        }
+        e.pump_message_queue();
+        let shared = e.shared_sessions();
+        let s = shared.get(&sid).unwrap();
+        assert!(
+            user_images(s).iter().any(|v| v == &vec!["C:/tmp/a.png".to_string()]),
+            "排队泵出的消息应携带图片: {:?}",
+            user_images(s)
+        );
+    }
+
+    // 2) 插话带图：running 中直发（interject 路径同步 push）
+    {
+        let mut e = engine.lock().unwrap();
+        {
+            let mut shared = e.shared_sessions();
+            shared.get_mut(&sid).unwrap().running = true;
+        }
+        let _ = e.send_message_with_images(&sid, "插话带图", vec!["C:/tmp/b.png".into()]);
+        let s = e.open_session(&sid).unwrap();
+        assert!(
+            user_images(&s).iter().any(|v| v == &vec!["C:/tmp/b.png".to_string()]),
+            "插话消息应携带图片（此前被静默丢弃）: {:?}",
+            user_images(&s)
+        );
+    }
 }
 
 /// 回归：tool 消息必须紧跟带 tool_calls 的 assistant 消息（OpenAI 兼容 400 修复）。
@@ -290,9 +344,11 @@ fn tool_messages_pair_with_assistant_tool_calls() {
     let messages = vec![
         Message::User {
             content: "读文件".into(),
+            images: None,
         },
         Message::Assistant {
             content: String::new(),
+            reasoning: None,
             tool_calls: vec![ToolCall {
                 id: "call_1".into(),
                 call_type: "function".into(),
@@ -470,11 +526,13 @@ fn llm_messages_trim_unpaired_tool_calls() {
     let msgs = vec![
         Message::User {
             content: "u".into(),
+            images: None,
         },
         Message::Assistant {
             content: String::new(),
             tool_calls: vec![tc("call_a")],
-        },
+            reasoning: None,
+            },
     ];
     let out = LlmClient::to_llm_messages(&msgs);
     assert_eq!(
@@ -490,13 +548,16 @@ fn llm_messages_trim_unpaired_tool_calls() {
     let msgs = vec![
         Message::User {
             content: "u".into(),
+            images: None,
         },
         Message::Assistant {
             content: String::new(),
             tool_calls: vec![tc("call_a")],
-        },
+            reasoning: None,
+            },
         Message::User {
             content: "打断".into(),
+            images: None,
         },
     ];
     let out = LlmClient::to_llm_messages(&msgs);
@@ -513,6 +574,7 @@ fn llm_messages_trim_unpaired_tool_calls() {
     let msgs = vec![
         Message::User {
             content: "u".into(),
+            images: None,
         },
         Message::Tool {
             tool_call_id: "call_orphan".into(),
@@ -525,11 +587,13 @@ fn llm_messages_trim_unpaired_tool_calls() {
     let msgs = vec![
         Message::User {
             content: "u".into(),
+            images: None,
         },
         Message::Assistant {
             content: String::new(),
             tool_calls: vec![tc("call_a"), tc("call_b")],
-        },
+            reasoning: None,
+            },
         Message::Tool {
             tool_call_id: "call_a".into(),
             content: "ra".into(),
@@ -555,8 +619,8 @@ fn send_after_preset_switch_works() {
     let mut settings = EngineSettings::default();
     settings.api_key = Some("sk-test".into());
     settings.base_url = "http://127.0.0.1:1".into(); // 回合快速失败（连接拒绝）
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
-    let test_data_dir = settings.data_dir.clone();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
+    let _test_data_dir = settings.data_dir.clone();
     let mut engine = DshEngine::new(settings, tx).expect("engine");
     let sid = engine.create_session(Some("测试")).unwrap();
 
@@ -567,11 +631,11 @@ fn send_after_preset_switch_works() {
 
     // 切预设（用户操作：切到创造模式）
     engine
-        .set_session_preset(&sid, AgentPreset::Cordis)
+        .set_session_preset(&sid, AgentPreset::AutoPlan)
         .unwrap();
     assert_eq!(
         engine.open_session(&sid).unwrap().preset,
-        AgentPreset::Cordis
+        AgentPreset::AutoPlan
     );
 
     // 第二次发送：不得报 already running / session not open
@@ -581,7 +645,7 @@ fn send_after_preset_switch_works() {
     std::thread::sleep(std::time::Duration::from_millis(2500));
     let s = engine.open_session(&sid).unwrap();
     assert!(!s.running, "第二回合结束应复位");
-    assert_eq!(s.preset, AgentPreset::Cordis, "预设应保持");
+    assert_eq!(s.preset, AgentPreset::AutoPlan, "预设应保持");
     let _ = rx;
 }
 
@@ -594,8 +658,8 @@ fn send_failure_does_not_stick_running() {
     let mut settings = EngineSettings::default();
     settings.api_key = Some("sk-test".into());
     settings.base_url = "http://127.0.0.1:1".into(); // 连接立即失败
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
-    let test_data_dir = settings.data_dir.clone();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
+    let _test_data_dir = settings.data_dir.clone();
     let mut engine = DshEngine::new(settings, tx).expect("engine");
     let sid = engine.create_session(None).unwrap();
     // 第一次发送：回合在后台失败（连接拒绝）→ 收尾必须复位 running
@@ -621,8 +685,8 @@ fn no_key_does_not_pollute_state() {
     let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
-    let test_data_dir = settings.data_dir.clone();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
+    let _test_data_dir = settings.data_dir.clone();
     let mut engine = DshEngine::new(settings, tx).expect("engine");
     let sid = engine.create_session(None).unwrap();
     let err = engine.send_message(&sid, "x").unwrap_err();
@@ -652,17 +716,20 @@ fn llm_messages_partial_response_no_orphans() {
     let msgs = vec![
         Message::User {
             content: "u".into(),
+            images: None,
         },
         Message::Assistant {
             content: String::new(),
             tool_calls: vec![tc("call_a"), tc("call_b")],
-        },
+            reasoning: None,
+            },
         Message::Tool {
             tool_call_id: "call_a".into(),
             content: "ra".into(),
         },
         Message::User {
             content: "打断".into(),
+            images: None,
         },
     ];
     let out = LlmClient::to_llm_messages(&msgs);
@@ -688,8 +755,8 @@ fn default_preset_is_standard_and_configurable() {
     let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
-    let test_data_dir = settings.data_dir.clone();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
+    let _test_data_dir = settings.data_dir.clone();
     let mut engine = DshEngine::new(settings, tx).expect("engine");
 
     // 默认 = 标准模式
@@ -702,11 +769,11 @@ fn default_preset_is_standard_and_configurable() {
     );
 
     // 修改引擎默认 → 新建继承
-    engine.set_default_preset(AgentPreset::Ptc);
+    engine.set_default_preset(AgentPreset::AutoPlan);
     let sid2 = engine.create_session(None).unwrap();
     assert_eq!(
         engine.open_session(&sid2).unwrap().preset,
-        AgentPreset::Ptc,
+        AgentPreset::AutoPlan,
         "修改默认预设后新建会话应继承"
     );
 
@@ -726,40 +793,27 @@ fn default_preset_is_standard_and_configurable() {
     assert_eq!(engine2.default_preset(), AgentPreset::Standard);
 }
 
-/// run_code：一次组合多步（写文件 + 读文件 + 替换），全部成功并汇总。
+/// run_code 已随 PTC 模式移除：任何预设下 dispatch 都应拒绝
+/// （保留 dispatch 分支仅为历史会话重放兜底）。
 #[test]
-fn run_code_combines_steps() {
+fn run_code_removed_rejected_everywhere() {
     use dsh_desktop::core::preset::AgentPreset;
     use dsh_desktop::core::tools::ToolRegistry;
     use serde_json::json;
 
     let dir = tempfile::tempdir().unwrap();
-    let reg = ToolRegistry::new(dir.path().to_path_buf()).with_preset(AgentPreset::Ptc);
-    let file = dir.path().join("hello.txt");
-    let out = reg.dispatch(
-        "run_code",
-        &json!({"steps": [
-            {"op": "write_file", "path": "hello.txt", "content": "hello world"},
-            {"op": "read_file", "path": "hello.txt"},
-            {"op": "str_replace_editor", "command": "str_replace", "path": "hello.txt", "old_str": "world", "new_str": "rust"},
-            {"op": "read_file", "path": "hello.txt"},
-        ]}),
-    );
-    assert!(out.ok, "run_code 应成功: {}", out.value);
-    let results = out.value.get("results").and_then(|v| v.as_array()).unwrap();
-    assert_eq!(results.len(), 4);
-    for (i, r) in results.iter().enumerate() {
-        assert_eq!(r["ok"], true, "step {i} 应成功: {r}");
+    for preset in AgentPreset::all() {
+        let reg = ToolRegistry::new(dir.path().to_path_buf()).with_preset(preset);
+        let out = reg.dispatch(
+            "run_code",
+            &json!({"steps": [
+                {"op": "write_file", "path": "hello.txt", "content": "hi"},
+            ]}),
+        );
+        assert!(!out.ok, "{} 不应提供 run_code", preset.name());
+        let file = dir.path().join("hello.txt");
+        assert!(!file.exists(), "拒绝时不得产生副作用");
     }
-    let content = std::fs::read_to_string(&file).unwrap();
-    assert_eq!(content, "hello rust");
-
-    // minimal 下 run_code 不可用
-    let reg2 = ToolRegistry::new(dir.path().to_path_buf()).with_preset(AgentPreset::Minimal);
-    let denied = reg2.dispatch("run_code", &json!({"steps": []}));
-    assert!(!denied.ok, "minimal 不应有 run_code");
-    let denied2 = reg2.dispatch("read_file", &json!({"path": "x"}));
-    assert!(!denied2.ok, "minimal 不应有 read_file");
 }
 
 /// 工作区：canonicalize 拒绝文件路径。
@@ -783,7 +837,7 @@ fn bridge_starts() {
     let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = Some("sk-test".into());
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx).expect("engine"),
     ));
@@ -1077,7 +1131,7 @@ fn engine_no_key_no_crash() {
     let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let mut engine = DshEngine::new(settings, tx).expect("无 key 创建引擎不应失败");
     let sid = engine.create_session(None).expect("创建会话不应失败");
     let err = engine.send_message(&sid, "hi").unwrap_err();
@@ -1099,7 +1153,7 @@ fn chip_switch_preserves_saved_api_key() {
     let (tx, _rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None; // 引擎启动时无 key
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let test_data_dir = settings.data_dir.clone();
     let mut engine = DshEngine::new(settings, tx).expect("engine");
 
@@ -1151,8 +1205,8 @@ fn queue_runs_after_turn_finishes() {
     let mut settings = EngineSettings::default();
     settings.api_key = Some("fake".into());
     settings.base_url = "http://127.0.0.1:1".into(); // 不可达：回合快速失败
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
-    let test_data_dir = settings.data_dir.clone();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
+    let _test_data_dir = settings.data_dir.clone();
     let mut engine = DshEngine::new(settings, tx).expect("engine");
     let sid = engine.create_session(Some("q")).unwrap();
 
@@ -1162,8 +1216,8 @@ fn queue_runs_after_turn_finishes() {
         shared.get_mut(&sid).unwrap().running = true;
     }
     // 排队两条（FIFO）
-    assert_eq!(engine.enqueue_message(&sid, "第一"), 1);
-    assert_eq!(engine.enqueue_message(&sid, "第二"), 2);
+    assert_eq!(engine.enqueue_message(&sid, "第一", Vec::new()), 1);
+    assert_eq!(engine.enqueue_message(&sid, "第二", vec!["C:/x.png".into()]), 2);
     assert_eq!(engine.queued_count(&sid), 2);
 
     // 运行中：泵不发起（不打断）
@@ -1180,7 +1234,7 @@ fn queue_runs_after_turn_finishes() {
     let s = engine.open_session(&sid).unwrap();
     assert!(
         s.messages.iter().any(
-            |m| matches!(m, dsh_desktop::core::Message::User { content } if content == "第一")
+            |m| matches!(m, dsh_desktop::core::Message::User { content, .. } if content == "第一")
         ),
         "队首消息应已发起"
     );
@@ -1224,7 +1278,7 @@ fn sandbox_chip_toggle_actually_works() {
     // 工作区外写：审批系统是闸门，工具不硬拒（会成功写入，
     // 但实际运行时 approval flow 会拦截并要求用户确认）
     let outside2 = dir.path().join("outside2.txt");
-    let out2 = engine.tools_for_test().dispatch(
+    let _out2 = engine.tools_for_test().dispatch(
         "write_file",
         &serde_json::json!({"path": outside2.to_string_lossy(), "content": "x"}),
     );

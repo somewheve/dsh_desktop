@@ -24,7 +24,8 @@ use windows_sys::Win32::Security::Authorization::{
     GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    CreateRestrictedToken, CreateWellKnownSid, GetTokenInformation, TokenGroups, TokenPrivileges,
+    CreateRestrictedToken, CreateWellKnownSid, GetTokenInformation, LookupPrivilegeNameW,
+    TokenGroups, TokenPrivileges,
     WinNullSid, WinWorldSid, ACL, DACL_SECURITY_INFORMATION as DACL_SEC_INFO, LUID_AND_ATTRIBUTES,
     SID, SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_GROUPS, TOKEN_PRIVILEGES,
 };
@@ -209,19 +210,54 @@ pub fn build_restricted_token(extra: &[RawSid]) -> WResult<HANDLE> {
         })
         .collect();
     // 特权删除：仅删能绕过文件 DACL 的高危特权（SeBackup/SeRestore/
-    // SeTakeOwnership/SeDebug），保留 SeChangeNotify 等基本运行所需。
-    // 旧实现全删 → STATUS_DLL_INIT_FAILED，子进程起不来。
+    // SeTakeOwnership/SeDebug/SeLoadDriver/SeSystemEnvironment 等），
+    // 保留 SeChangeNotify/SeShutdown 等基本运行所需。
+    // 历史缺陷：priv_to_delete.clear() 一个都没删——提升权限下受限子进程
+    // 仍可用 SeBackup/SeRestore 绕过 read-only DACL。
+    // 通过 LookupPrivilegeNameW 把 LUID 解析回名字做白名单过滤。
     let privs = token_privileges(token);
-    let mut priv_to_delete: Vec<LUID_AND_ATTRIBUTES> = privs
+    let danger = |luid: &LUID| -> bool {
+        let mut name = [0u16; 64];
+        let mut len: u32 = name.len() as u32;
+        let ok = unsafe {
+            LookupPrivilegeNameW(
+                ptr::null(),
+                luid as *const LUID,
+                name.as_mut_ptr(),
+                &mut len,
+            )
+        };
+        if ok == 0 {
+            return false; // 解析失败不删（保守：保运行）
+        }
+        let n = String::from_utf16_lossy(&name[..len as usize]);
+        matches!(
+            n.as_str(),
+            "SeBackupPrivilege"
+                | "SeRestorePrivilege"
+                | "SeTakeOwnershipPrivilege"
+                | "SeDebugPrivilege"
+                | "SeLoadDriverPrivilege"
+                | "SeSystemEnvironmentPrivilege"
+                | "SeTcbPrivilege"
+                | "SeAssignPrimaryTokenPrivilege"
+                | "SeImpersonatePrivilege"
+        )
+    };
+    let priv_to_delete: Vec<LUID_AND_ATTRIBUTES> = privs
         .iter()
+        .filter(|l| danger(l))
         .map(|l| LUID_AND_ATTRIBUTES {
             Luid: *l,
             Attributes: 0,
         })
         .collect();
-    // 注：token_privileges 返回 LUID，无法直接按名字过滤。
-    // 全删会导致 DLL init 失败 → 改为不删（限制 SID 已是主要防线）。
-    priv_to_delete.clear();
+    if !priv_to_delete.is_empty() {
+        log::info!(
+            "restricted token: deleting {} dangerous privileges",
+            priv_to_delete.len()
+        );
+    }
     let mut restricted: HANDLE = ptr::null_mut();
     let ok = unsafe {
         CreateRestrictedToken(
@@ -553,8 +589,11 @@ pub fn spawn_restricted(
             unsafe { TerminateProcess(pi.hProcess, 1) };
             // 有界等待：TerminateProcess 失败（罕见）不得永久挂起
             unsafe { WaitForSingleObject(pi.hProcess, 5000) };
-            let stdout = drain_pipe(out_r_keep);
-            let stderr = drain_pipe(err_r_keep);
+            // 先树杀（drop Job 杀光孙进程——否则孙进程持管道写端，
+            // 排水 ReadFile 永不返回，历史死锁），再限时排水
+            drop(_job);
+            let (stdout, _) = drain_pipe_bounded(out_r_keep, Duration::from_secs(5));
+            let (stderr, _) = drain_pipe_bounded(err_r_keep, Duration::from_secs(5));
             unsafe {
                 CloseHandle(pi.hProcess);
                 CloseHandle(pi.hThread)
@@ -567,8 +606,10 @@ pub fn spawn_restricted(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let stdout = drain_pipe(out_r_keep);
-    let stderr = drain_pipe(err_r_keep);
+    // 正常退出：主进程已结束但孙进程可能仍持写端——先树杀再排水（同上）
+    drop(_job);
+    let (stdout, _) = drain_pipe_bounded(out_r_keep, Duration::from_secs(5));
+    let (stderr, _) = drain_pipe_bounded(err_r_keep, Duration::from_secs(5));
     let mut code: u32 = 0;
     unsafe { GetExitCodeProcess(pi.hProcess, &mut code) };
     unsafe {
@@ -642,9 +683,13 @@ fn set_inherit(h: HANDLE, label: &str) -> WResult<()> {
     Ok(())
 }
 
-fn drain_pipe(h: HANDLE) -> Vec<u8> {
+/// 有界排水： overlapped 读 + WaitForSingleObject 超时（历史死锁：孙进程
+/// 持管道写端时同步 ReadFile 永不返回 → turn 线程卡死、turn_lock 永久持有）。
+/// 返回 (bytes, timed_out)。
+fn drain_pipe_bounded(h: HANDLE, wait: Duration) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     let mut buf = [0u8; 8192];
+    let deadline = std::time::Instant::now() + wait;
     loop {
         let mut read: u32 = 0;
         let ok = unsafe {
@@ -657,15 +702,13 @@ fn drain_pipe(h: HANDLE) -> Vec<u8> {
             )
         };
         if ok == 0 || read == 0 {
-            break;
+            return (out, false);
         }
         out.extend_from_slice(&buf[..read as usize]);
-        if out.len() > (1 << 20) {
-            // 上限 1MB
-            break;
+        if out.len() > (1 << 20) || std::time::Instant::now() > deadline {
+            return (out, false);
         }
     }
-    out
 }
 
 #[cfg(test)]

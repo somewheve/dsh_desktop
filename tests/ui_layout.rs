@@ -20,7 +20,7 @@ fn make_chat(msg_count: usize) -> (ChatTab, std::sync::mpsc::Sender<EngineEvent>
     let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -77,7 +77,7 @@ fn q_reply_markdown_renders_inside_viewport() {
     let (tx, rx) = mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -166,7 +166,7 @@ fn long_session_messages_stay_left_aligned() {
     let (tx, rx) = mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -526,7 +526,7 @@ fn mode_switch_updates_highlight_without_reopen() {
     let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -561,19 +561,19 @@ fn mode_switch_updates_highlight_without_reopen() {
         "初始应选中标准模式"
     );
 
-    // 打开模式下拉 → 选 PTC → 选中态立即切换（无重开）
+    // 打开模式下拉 → 选自主规划 → 选中态立即切换（无重开）
     harness
         .query_by(|n| n.label().map(|l| l == "◇ 标准模式").unwrap_or(false))
         .unwrap()
         .click();
     harness.run_steps(2);
-    harness.get_by_label("PTC 模式").click();
+    harness.get_by_label("自主规划").click();
     harness.run_steps(6);
     assert!(
         harness
-            .query_by(|n| n.label().map(|l| l == "◇ PTC 模式").unwrap_or(false))
+            .query_by(|n| n.label().map(|l| l == "◇ 自主规划").unwrap_or(false))
             .is_some(),
-        "点击后应立即选中 PTC 模式"
+        "点击后应立即选中自主规划"
     );
     assert!(
         harness
@@ -585,25 +585,25 @@ fn mode_switch_updates_highlight_without_reopen() {
     let s = engine_check.lock().unwrap().open_session(&sid).unwrap();
     assert_eq!(
         s.preset,
-        dsh_desktop::core::preset::AgentPreset::Ptc,
+        dsh_desktop::core::preset::AgentPreset::AutoPlan,
         "引擎会话 preset 应已更新"
     );
-    // 再切极简模式（下拉流程）
+    // 再切回标准模式（下拉流程）
     harness
-        .query_by(|n| n.label().map(|l| l == "◇ PTC 模式").unwrap_or(false))
+        .query_by(|n| n.label().map(|l| l == "◇ 自主规划").unwrap_or(false))
         .unwrap()
         .click();
     harness.run_steps(2);
-    harness.get_by_label("极简模式").click();
+    harness.get_by_label("标准模式").click();
     harness.run_steps(6);
     assert!(
         harness
-            .query_by(|n| n.label().map(|l| l == "◇ 极简模式").unwrap_or(false))
+            .query_by(|n| n.label().map(|l| l == "◇ 标准模式").unwrap_or(false))
             .is_some(),
-        "点击后应立即选中极简模式"
+        "点击后应立即选中标准模式"
     );
     let s = engine_check.lock().unwrap().open_session(&sid).unwrap();
-    assert_eq!(s.preset, dsh_desktop::core::preset::AgentPreset::Minimal);
+    assert_eq!(s.preset, dsh_desktop::core::preset::AgentPreset::Standard);
 }
 
 /// 回归：长用户消息气泡右边缘必须保留边距（不得贴边/被裁剪）。
@@ -619,7 +619,7 @@ fn user_bubble_right_margin_kept() {
     let (tx, rx) = mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -704,7 +704,7 @@ fn multiline_user_bubble_right_aligned() {
     let (tx, rx) = mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -780,7 +780,7 @@ fn stop_button_shown_when_running() {
     let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -829,7 +829,7 @@ fn ask_user_card_renders_and_answers() {
     let mut settings = EngineSettings::default();
     settings.api_key = Some("fake-key".into());
     settings.base_url = "http://127.0.0.1:1".into(); // 不可达：send 返回 Ok，后台回合失败不影响
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -901,7 +901,7 @@ fn user_message_shown_once_after_send() {
     let mut settings = EngineSettings::default();
     settings.api_key = Some("fake-key".into());
     settings.base_url = "http://127.0.0.1:1".into(); // 不可达：send 成功，后台回合快速失败
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -965,25 +965,25 @@ fn user_message_shown_once_after_send() {
 /// 回归：子代理 / 任务 / 目标从侧边栏迁移到会话标题行（用户需求），
 /// 四个卡片按钮（目标/子代理/任务/计划）单选切换。
 #[test]
-fn title_row_cards_toggle() {
+fn panels_data_driven_no_buttons() {
+    let _theme_guard = THEME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
     let sid = engine
         .lock()
         .unwrap()
-        .create_session(Some("cards test"))
+        .create_session(Some("panels test"))
         .unwrap();
     let mut chat = ChatTab::new(engine, rx);
     chat.open(&sid);
 
-    let mut harness = Harness::builder().wgpu().build_ui_state(
+    let mut harness = Harness::new_ui_state(
         |ui, chat: &mut ChatTab| {
-            // 侧栏形态（横向并排，与真实 app 一致）：左 172px 会话列表 + 全高中央区
             egui::Panel::left("test_session_list")
                 .exact_size(172.0)
                 .show(ui, |ui| {
@@ -995,69 +995,62 @@ fn title_row_cards_toggle() {
     );
     harness.set_size(Vec2::new(900.0, 600.0));
     harness.run_steps(8);
-    // 四个按钮都在（收起状态 ▸）
+    // ZCode 式：无数据 → 无面板；且旧的开关按钮不存在
     for label in ["🎯 目标 ▸", "🤖 子代理 ▸", "⏳ 任务 ▸", "📋 计划 ▸"] {
-        assert!(harness.query_by_label(label).is_some(), "应有按钮 {label}");
+        assert!(harness.query_by_label(label).is_none(), "旧按钮应已移除: {label}");
     }
-    // 打开任务卡片
-    harness.get_by_label("⏳ 任务 ▸").click();
+    assert!(harness.query_by_label("暂无任务").is_none(), "无数据不应有任务面板");
+
+    // 注入计划 → 计划面板出现（数据驱动），点击展开/收起
+    let pev = SessionEvent::new(
+        types::PLAN_MODE,
+        Some(serde_json::json!({"state": "active", "content": "- [ ] 分析需求
+- [x] 实现"})),
+    );
+    let _ = tx.send(EngineEvent::Event { session_id: sid.clone(), event: pev });
     harness.run_steps(6);
+    let header = harness
+        .query_by_label("📋 1/2 ▸")
+        .expect("计划方块按钮应出现");
+    header.click();
+    harness.run_steps(4);
+    // 清单只显示待办项：'分析需求' 在，已完成的 '实现' 不在
     assert!(
-        harness
-            .query_by_label("暂无任务。agent 回合 / 子代理执行会自动创建任务。")
-            .is_some(),
-        "任务卡片应显示空态提示"
-    );
-    // 单选：打开目标卡片 → 任务卡片自动关闭
-    harness.get_by_label("🎯 目标 ▸").click();
-    harness.run_steps(6);
-    assert!(
-        harness.query_by_label("🎯 目标 ▾").is_some(),
-        "目标卡片应打开"
+        harness.query_by_label("分析需求").is_some(),
+        "展开后应显示待办项"
     );
     assert!(
-        harness.query_by_label("⏳ 任务 ▸").is_some(),
-        "单选：任务卡片应被关闭（回到收起态）"
+        harness.query_by_label("实现").is_some(),
+        "已完成项保留历史（弱化显示，不隐藏）"
     );
-    // 子代理卡片
-    harness.get_by_label("🤖 子代理 ▸").click();
-    harness.run_steps(6);
-    assert!(
-        harness
-            .query_by_label("暂无子代理。AI 调用 subagent_fork 工具后显示在这里。")
-            .is_some(),
-        "子代理卡片应显示空态提示"
-    );
-    // 关闭
-    harness.get_by_label("🤖 子代理 ▾").click();
-    harness.run_steps(6);
-    assert!(
-        harness.query_by_label("🤖 子代理 ▸").is_some(),
-        "再次点击应关闭子代理卡片"
-    );
+    // 再点收起
+    harness.get_by_label("📋 1/2 ▾").click();
+    harness.run_steps(4);
+    assert!(harness.query_by_label("分析需求").is_none(), "收起后清单不可见");
 }
+
 
 /// 回归：目标卡片创建目标 → goal/change 事件持久化 → 卡片列表显示。
 #[test]
-fn goals_card_create_and_list() {
+fn goals_panel_data_driven_lifecycle() {
+    let _theme_guard = THEME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
     let sid = engine
         .lock()
         .unwrap()
-        .create_session(Some("goal card test"))
+        .create_session(Some("goal panel test"))
         .unwrap();
-    let mut chat = ChatTab::new(engine, rx);
+    let mut chat = ChatTab::new(engine.clone(), rx);
     chat.open(&sid);
 
-    let mut harness = Harness::builder().wgpu().build_ui_state(
+    let mut harness = Harness::new_ui_state(
         |ui, chat: &mut ChatTab| {
-            // 侧栏形态（横向并排，与真实 app 一致）：左 172px 会话列表 + 全高中央区
             egui::Panel::left("test_session_list")
                 .exact_size(172.0)
                 .show(ui, |ui| {
@@ -1069,44 +1062,42 @@ fn goals_card_create_and_list() {
     );
     harness.set_size(Vec2::new(900.0, 600.0));
     harness.run_steps(8);
-    harness.get_by_label("🎯 目标 ▸").click();
-    harness.run_steps(6);
+    // 无目标 → 无面板
     assert!(
-        harness
-            .query_by_label("暂无目标。告诉 AI 创建，或在上方输入后点「创建」。")
-            .is_some(),
-        "目标卡片初始为空态"
+        harness.query_by_label("🎯 1/1 ▸").is_none(),
+        "无目标时不应有目标方块按钮"
     );
 
-    // 目标输入框（卡片内第一个单行输入框）
-    // 浮动卡片窗口在 AX 树末尾：取最后一个 TextInput（工作区栏/消息输入在前）
-    let edit = harness
-        .get_all_by_role(egui::accesskit::Role::TextInput)
-        .last()
-        .expect("目标输入框必须存在");
-    edit.focus();
-    harness.run_steps(2);
-    let obj = "实现目标卡片功能";
-    let edit = harness
-        .get_all_by_role(egui::accesskit::Role::TextInput)
-        .last()
-        .expect("目标输入框必须存在");
-    edit.type_text(obj);
-    harness.run_steps(4);
-    harness.get_by_label("创建").click();
-    harness.run_steps(8);
+    // 经引擎创建目标（goal_op 持久化 + GOAL_CHANGE 事件）
+    {
+        let mut e = engine.lock().unwrap();
+        let _ = e.goal_op(&sid, dsh_desktop::engine::goal::GoalOp::Create, "", Some("实现目标面板"));
+    }
+    harness.run_steps(6);
+    // 面板出现（数据驱动）
+    let header = harness
+        .query_by_label("🎯 1/1 ▸")
+        .expect("有目标时目标方块按钮应出现");
+    header.click();
+    harness.run_steps(5);
     assert!(
-        harness.query_by_label(&format!("● {obj}")).is_some(),
-        "创建后目标应显示在卡片列表"
+        harness.query_by_label("实现目标面板").is_some(),
+        "展开后目标应可见"
     );
-    // 完成目标（操作按钮）
+    // 完成：面板仍在（1 总数），状态 complete
     harness.get_by_label("完成").click();
     harness.run_steps(8);
     assert!(
         harness.query_by_label("complete").is_some(),
-        "完成后目标状态应为 complete"
+        "完成后状态应为 complete"
+    );
+    assert!(
+        harness.query_by_label("🎯 0/1 ▸").is_some()
+            || harness.query_by_label("🎯 0/1 ▾").is_some(),
+        "完成后按钮保留（活动 0/总数 1）"
     );
 }
+
 
 /// 回归：会话列表项带删除按钮；第一次点击进入确认态（"OK"），
 /// 再次点击删除会话（列表项消失）。
@@ -1118,7 +1109,7 @@ fn session_list_delete_flow() {
     let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx).expect("engine"),
     ));
@@ -1152,34 +1143,31 @@ fn session_list_delete_flow() {
 
 /// 回归：会话界面"计划"按钮点击显示计划卡片，再次点击关闭。
 #[test]
-fn plan_button_toggles_card() {
+fn plan_panel_checklist_progress() {
+    let _theme_guard = THEME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
     let sid = engine
         .lock()
         .unwrap()
-        .create_session(Some("plan test"))
+        .create_session(Some("plan panel test"))
         .unwrap();
     let mut chat = ChatTab::new(engine, rx);
     chat.open(&sid);
-    // AI 写入计划（plan_write → plan/mode 事件）
     let pev = SessionEvent::new(
         types::PLAN_MODE,
-        Some(serde_json::json!({"state": "active", "content": "1. 分析需求\n2. 实现功能"})),
+        Some(serde_json::json!({"state": "active", "content": "- [ ] 分析需求
+- [x] 实现功能"})),
     );
-    let _ = tx.send(EngineEvent::Event {
-        session_id: sid,
-        event: pev,
-    });
+    let _ = tx.send(EngineEvent::Event { session_id: sid, event: pev });
 
     let mut harness = Harness::new_ui_state(
         |ui, chat: &mut ChatTab| {
-            // 侧栏形态（横向并排，与真实 app 一致）：左 172px 会话列表 + 全高中央区
             egui::Panel::left("test_session_list")
                 .exact_size(172.0)
                 .show(ui, |ui| {
@@ -1191,43 +1179,31 @@ fn plan_button_toggles_card() {
     );
     harness.set_size(Vec2::new(1000.0, 700.0));
     harness.run_steps(8);
-    // 初始：卡片关闭（只有展开按钮）
-    assert!(harness.query_by_label("🗺 计划").is_none(), "初始卡片应关闭");
-    let open_btn = harness.query_by_label("📋 计划 ▸");
-    assert!(open_btn.is_some(), "应显示计划展开按钮");
-
-    // 点击 → 卡片出现（含计划内容）
-    harness.get_by_label("📋 计划 ▸").click();
-    harness.run_steps(6);
+    // 面板自动出现（数据驱动），摘要含进度 1/2
     assert!(
-        harness.query_by_label("🗺 计划").is_some(),
-        "点击后计划卡片应显示"
+        harness.query_by_label("📋 1/2 ▸").is_some(),
+        "计划方块按钮应显示进度"
     );
-    // 富文本渲染：内容被 markdown 解析为块，不再是一个整体 label。
-    // 断言卡片已打开（标题在）且至少渲染出首个列表项文本。
-    let has_title = harness.query_by_label("🗺 计划").is_some();
-    let has_item = harness.query_by_label("1. 分析需求").is_some();
-    assert!(has_title, "点击后计划卡片应打开（标题显示）");
-    assert!(has_item, "计划内容首项应被渲染（富文本列表项）");
-
-    // 再次点击 → 关闭
-    harness.get_by_label("📋 计划 ▾").click();
-    harness.run_steps(6);
+    // 展开显示勾选清单
+    harness.get_by_label("📋 1/2 ▸").click();
+    harness.run_steps(5);
     assert!(
-        harness.query_by_label("🗺 计划").is_none(),
-        "再次点击应关闭卡片"
+        harness.query_by_label("实现功能").is_some(),
+        "已完成项保留历史（弱化显示，不隐藏）"
     );
+    assert!(harness.query_by_label("分析需求").is_some(), "待办项");
 }
+
 
 /// 回归：会话列表项排列整齐——所有项文本左对齐同一点（超长标题 ".." 截断），
 /// 删除按钮右缘对齐同一点（painter 绘制，像素级验证）。
-
+#[test]
 fn session_list_aligned_and_truncated() {
     let _theme_guard = THEME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -1300,8 +1276,8 @@ fn session_list_aligned_and_truncated() {
         assert!((l - lfirst).abs() <= 2.0, "删除按钮左缘应对齐: {lefts:?}");
     }
     // 名字 Label 左对齐（accesskit rect）：所有未截断的会话标题左缘一致
-    let n1 = harness.get_by_label("💬 中标题").rect();
-    let n2 = harness.get_by_label("💬 短标题").rect();
+    let n1 = harness.get_by_label("中标题").rect();
+    let n2 = harness.get_all_by_label("短标题").next().expect("短标题").rect();
     assert!(
         (n1.min.x - n2.min.x).abs() <= 2.0,
         "会话标题应左对齐同一位置: {n1:?} vs {n2:?}"
@@ -1309,7 +1285,7 @@ fn session_list_aligned_and_truncated() {
     // 长标题截断：完整长标题 label 不存在（被截断为 ".." 结尾的短文本）
     assert!(
         harness
-            .query_by_label("💬 这是一个非常长的会话标题用来测试截断显示效果")
+            .query_by_label("这是一个非常长的会话标题用来测试截断显示效果")
             .is_none(),
         "超长会话标题必须被截断（不得完整显示撑开列表）"
     );
@@ -1321,8 +1297,9 @@ fn session_list_aligned_and_truncated() {
     for x in (0..img.width()).step_by(2) {
         let p = img.get_pixel(x, y2 as u32);
         let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
-        // 名字文本（亮色）且位于 x 按钮左侧
-        if r > 90 && g > 100 && b > 120 && (x as f32) < x_left {
+        // 名字文本（明显亮于背景且偏蓝灰；细字抗锯齿像素是混合色，
+        // 阈值按"亮度和 + 冷色调"判而不是接近纯 text_dim 色）且在 x 按钮左侧
+        if r + g + b > 170 && b >= r && (x as f32) < x_left {
             name_right = Some(x);
         }
     }
@@ -1344,7 +1321,7 @@ fn session_click_switches_current() {
     let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx).expect("engine"),
     ));
@@ -1712,7 +1689,7 @@ fn chinese_user_message_visible() {
     let (tx, rx) = mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -1820,7 +1797,7 @@ fn long_chinese_user_message_visible() {
     let (tx, rx) = mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -2008,7 +1985,7 @@ fn fonts_mut_measure_safe() {
     let (tx, rx) = mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -2128,7 +2105,7 @@ fn send_immediately_has_user_message() {
     let mut settings = EngineSettings::default();
     settings.api_key = Some("fake-key-for-test".into());
     settings.base_url = "http://127.0.0.1:1".into(); // 不可达地址：后台 LLM 请求会失败，但不改变 send_message 返回 Ok。
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -2188,7 +2165,7 @@ fn sent_message_survives_session_switch() {
     let mut settings = EngineSettings::default();
     settings.api_key = Some("fake-key-for-test".into());
     settings.base_url = "http://127.0.0.1:1".into();
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -2268,7 +2245,7 @@ fn ask_user_question_bound_to_session() {
     let (tx, rx) = mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -2448,7 +2425,7 @@ fn approval_card_renders_inside_window() {
     let (tx, rx) = mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
@@ -2545,7 +2522,7 @@ fn toolbar_chips_uniform_height() {
     let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx).expect("engine"),
     ));

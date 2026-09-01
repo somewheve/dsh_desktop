@@ -14,7 +14,7 @@ use egui::{RichText, ScrollArea};
 use crate::core::DshEngine;
 use crate::engine::skill::{Skill, DEFAULT_GITHUB_SKILLS_REPO};
 use crate::ui::i18n::{tr, Lang};
-use crate::ui::theme::Theme;
+use crate::ui::theme::{ChipTint, Theme};
 
 /// 技能面板 Tab。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +57,7 @@ impl SkillsPanel {
 
     /// 从引擎重新加载技能列表。
     pub fn refresh(&mut self) {
-        self.skills = self.engine.lock().unwrap().skills_snapshot();
+        self.skills = self.engine.lock().unwrap_or_else(|p| p.into_inner()).skills_snapshot();
     }
 
     /// 后台操作收尾（drain rx）。
@@ -86,7 +86,7 @@ impl SkillsPanel {
             if done {
                 self.busy = false;
                 // 安装/导入/删除完成 → 引擎重载技能（agent 下一回合即可用）
-                self.engine.lock().unwrap().reload_skills();
+                self.engine.lock().unwrap_or_else(|p| p.into_inner()).reload_skills();
                 self.refresh();
             } else {
                 self.bg_rx = Some(rx);
@@ -131,11 +131,21 @@ impl SkillsPanel {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.pump_bg();
         let lang = self.lang;
-        ui.heading(tr(lang, "技能", "Skills"));
-        ui.add_space(2.0);
+        ui.label(Theme::page_title(tr(lang, "技能", "Skills")));
+        ui.add_space(3.0);
+        ui.label(
+            RichText::new(tr(
+                lang,
+                "技能是可加载的说明文档：模型在回合内用 load_skill 工具加载后按说明执行；也可手动浏览。",
+                "Skills are loadable instruction docs: the model loads them with the load_skill tool during a turn; you can also browse them manually.",
+            ))
+            .size(11.0)
+            .color(Theme::text_dim()),
+        );
+        ui.add_space(8.0);
 
-        // ===== 目录行 + 全局操作 =====
-        let dir = self.engine.lock().unwrap().skills_dir();
+        // ===== 目录行 + 全局操作（info 左 + chips 右，与扩展页同构） =====
+        let dir = self.engine.lock().unwrap_or_else(|p| p.into_inner()).skills_dir();
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!(
@@ -147,9 +157,12 @@ impl SkillsPanel {
                 .color(Theme::text_dim()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button(tr(lang, "打开目录", "Open folder"))
-                    .clicked()
+                if Theme::mini_button(
+                    ui,
+                    tr(lang, "打开目录", "Open folder"),
+                    ChipTint::Neutral,
+                )
+                .clicked()
                 {
                     #[cfg(windows)]
                     {
@@ -164,15 +177,22 @@ impl SkillsPanel {
                             .spawn();
                     }
                 }
-                if ui.small_button(tr(lang, "刷新", "Refresh")).clicked() {
+                if Theme::mini_button(
+                    ui,
+                    tr(lang, "刷新", "Refresh"),
+                    ChipTint::Neutral,
+                )
+                .clicked()
+                {
                     self.refresh();
                 }
             });
         });
-        ui.add_space(4.0);
+        ui.add_space(8.0);
 
-        // ===== Tab 行 =====
+        // ===== Tab 行（分段胶囊，与聊天输入框 chips 同风格） =====
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
             for (tab, zh, en) in [
                 (SkillsTab::Installed, "已安装", "Installed"),
                 (SkillsTab::Remote, "远程安装", "Remote"),
@@ -183,8 +203,7 @@ impl SkillsPanel {
                 } else {
                     tr(lang, zh, en)
                 };
-                if ui
-                    .selectable_label(self.tab == tab, label)
+                if Theme::segment_tab(ui, &label, self.tab == tab)
                     .on_hover_text(match tab {
                         SkillsTab::Installed => {
                             tr(lang, "管理已安装的技能", "Manage installed skills")
@@ -206,8 +225,7 @@ impl SkillsPanel {
                 ui.spinner();
             }
         });
-        ui.add_space(4.0);
-        ui.separator();
+        ui.add_space(8.0);
 
         match self.tab {
             SkillsTab::Installed => self.ui_installed(ui, lang),
@@ -248,39 +266,36 @@ impl SkillsPanel {
     }
 
     fn render_installed_card(&mut self, ui: &mut egui::Ui, skill: &Skill, lang: Lang) {
-        let frame = egui::Frame::default()
-            .fill(Theme::bg_elevated())
-            .stroke(egui::Stroke::new(1.0, Theme::border()))
-            .corner_radius(egui::CornerRadius::same(10))
-            .inner_margin(egui::Margin::symmetric(12, 10));
-        frame.show(ui, |ui| {
+        Theme::card().show(ui, |ui| {
             // 名称 + 状态 + 删除
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(&skill.name)
-                        .size(15.0)
+                        .size(13.5)
                         .strong()
                         .color(Theme::accent_light()),
                 );
-                ui.label(
-                    RichText::new(if skill.invocation.model_invocable {
-                        tr(lang, "模型可调用", "model-invocable")
-                    } else {
-                        tr(lang, "仅手动", "manual only")
-                    })
-                    .size(11.0)
-                    .color(Theme::ok()),
-                );
+                if skill.invocation.model_invocable {
+                    Theme::status_pill(
+                        ui,
+                        tr(lang, "模型可调用", "model-invocable"),
+                        Theme::ok(),
+                    );
+                } else {
+                    Theme::status_pill(
+                        ui,
+                        tr(lang, "仅手动", "manual only"),
+                        Theme::text_dim(),
+                    );
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let is_confirm = self.pending_delete.as_deref() == Some(skill.name.as_str());
-                    let del_label = if is_confirm { "OK" } else { "✕" };
-                    let del_color = if is_confirm {
-                        Theme::err()
+                    let (del_label, tint) = if is_confirm {
+                        ("OK", ChipTint::Danger)
                     } else {
-                        Theme::text_faint()
+                        ("✕", ChipTint::Danger)
                     };
-                    if ui
-                        .small_button(RichText::new(del_label).color(del_color))
+                    if Theme::mini_button(ui, del_label, tint)
                         .on_hover_text(tr(
                             lang,
                             "删除此技能（再次点击确认）",
@@ -290,7 +305,7 @@ impl SkillsPanel {
                     {
                         if is_confirm {
                             let name = skill.name.clone();
-                            let mut engine = self.engine.lock().unwrap();
+                            let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
                             match engine.remove_skill(&name) {
                                 Ok(()) => {
                                     self.status =
@@ -312,7 +327,11 @@ impl SkillsPanel {
             if let Some(desc) = &skill.description {
                 if !desc.is_empty() {
                     ui.add_space(2.0);
-                    ui.label(RichText::new(desc).color(Theme::text()));
+                    ui.label(
+                        RichText::new(desc)
+                            .size(12.0)
+                            .color(Theme::text()),
+                    );
                 }
             }
             // 说明预览（可读性：截断 + 等宽字体）
@@ -340,22 +359,17 @@ impl SkillsPanel {
     fn ui_remote(&mut self, ui: &mut egui::Ui, lang: Lang, dir: &std::path::Path) {
         let (gh_owner, gh_repo, gh_branch) = DEFAULT_GITHUB_SKILLS_REPO;
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!(
-                    "{}: {gh_owner}/{gh_repo}",
-                    tr(lang, "来源", "Source")
-                ))
-                .size(12.0)
-                .color(Theme::accent_light())
-                .strong(),
-            );
+            ui.label(Theme::card_section_title(&format!(
+                "{}: {gh_owner}/{gh_repo}",
+                tr(lang, "来源", "Source")
+            )));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(
-                        !self.busy,
-                        egui::Button::new(tr(lang, "刷新列表", "Refresh list")),
-                    )
-                    .clicked()
+                if Theme::primary_button(
+                    ui,
+                    tr(lang, "刷新列表", "Refresh list"),
+                    !self.busy,
+                )
+                .clicked()
                 {
                     let owner = gh_owner.to_string();
                     let repo = gh_repo.to_string();
@@ -406,33 +420,36 @@ impl SkillsPanel {
         ScrollArea::vertical().show(ui, |ui| {
             for name in remote {
                 let is_installed = installed.contains(&name);
-                let frame = egui::Frame::default()
-                    .fill(Theme::bg_elevated())
-                    .stroke(egui::Stroke::new(1.0, Theme::border()))
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .inner_margin(egui::Margin::symmetric(10, 8));
-                frame.show(ui, |ui| {
+                Theme::card().show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(&name).strong().color(Theme::accent_light()));
+                        ui.label(
+                            RichText::new(&name)
+                                .size(13.0)
+                                .strong()
+                                .color(Theme::accent_light()),
+                        );
                         if is_installed {
-                            ui.label(
-                                RichText::new(tr(lang, "✓ 已安装", "✓ installed"))
-                                    .size(11.0)
-                                    .color(Theme::ok()),
+                            Theme::status_pill(
+                                ui,
+                                tr(lang, "已安装", "installed"),
+                                Theme::ok(),
                             );
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if is_installed {
                                 ui.label(Theme::dim(&tr(lang, "已就绪", "ready")));
                             } else {
-                                if ui
-                                    .small_button(tr(lang, "安装", "Install"))
-                                    .on_hover_text(tr(
-                                        lang,
-                                        "下载 SKILL.md 到本地技能目录",
-                                        "Download SKILL.md into the local skills dir",
-                                    ))
-                                    .clicked()
+                                if Theme::mini_button(
+                                    ui,
+                                    tr(lang, "安装", "Install"),
+                                    ChipTint::Accent,
+                                )
+                                .on_hover_text(tr(
+                                    lang,
+                                    "下载 SKILL.md 到本地技能目录",
+                                    "Download SKILL.md into the local skills dir",
+                                ))
+                                .clicked()
                                 {
                                     let name2 = name.clone();
                                     let owner = gh_owner.to_string();
@@ -496,18 +513,18 @@ impl SkillsPanel {
         );
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            let pick_file = ui
-                .add(egui::Button::new(
-                    RichText::new(tr(lang, "📄 选择文件导入", "📄 Import from file"))
-                        .color(Theme::accent_light()),
-                ))
-                .clicked();
-            let pick_dir = ui
-                .add(egui::Button::new(
-                    RichText::new(tr(lang, "📁 选择目录导入", "📁 Import from folder"))
-                        .color(Theme::accent_light()),
-                ))
-                .clicked();
+            let pick_file = Theme::primary_button(
+                ui,
+                tr(lang, "📄 选择文件导入", "📄 Import from file"),
+                true,
+            )
+            .clicked();
+            let pick_dir = Theme::mini_button(
+                ui,
+                tr(lang, "📁 选择目录导入", "📁 Import from folder"),
+                ChipTint::Accent,
+            )
+            .clicked();
             if pick_file {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("Skill 文件", &["md"])
@@ -518,7 +535,7 @@ impl SkillsPanel {
                     ))
                     .pick_file()
                 {
-                    let mut engine = self.engine.lock().unwrap();
+                    let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
                     match engine.import_skill_file(&path) {
                         Ok(name) => {
                             self.status = format!("{} {name}", tr(lang, "已导入", "Imported"));
@@ -535,7 +552,7 @@ impl SkillsPanel {
                     .set_title(tr(lang, "选择技能目录", "Pick skill folder"))
                     .pick_folder()
                 {
-                    let mut engine = self.engine.lock().unwrap();
+                    let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
                     match engine.import_skill_dir(&path) {
                         Ok(name) => {
                             self.status = format!("{} {name}", tr(lang, "已导入", "Imported"));
@@ -550,18 +567,12 @@ impl SkillsPanel {
         });
         ui.add_space(8.0);
         // 导入格式说明卡片
-        let frame = egui::Frame::default()
-            .fill(Theme::bg_elevated())
-            .stroke(egui::Stroke::new(1.0, Theme::border()))
-            .corner_radius(egui::CornerRadius::same(8))
-            .inner_margin(egui::Margin::symmetric(10, 8));
-        frame.show(ui, |ui| {
-            ui.label(
-                RichText::new(tr(lang, "文件格式（front-matter + 说明正文）:", "File format (front-matter + instructions):"))
-                    .size(11.0)
-                    .color(Theme::accent_light())
-                    .strong(),
-            );
+        Theme::card().show(ui, |ui| {
+            ui.label(Theme::card_section_title(&tr(
+                lang,
+                "文件格式（front-matter + 说明正文）:",
+                "File format (front-matter + instructions):",
+            )));
             ui.add_space(2.0);
             ui.label(
                 RichText::new("---\nname: my-skill\ndescription: 技能描述\nmodelInvocable: true\n---\n\n技能说明正文…")

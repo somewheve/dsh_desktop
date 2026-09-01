@@ -1,6 +1,7 @@
 //! UI 聚合模块。
 
 pub mod chat_tab;
+pub mod code_browser;
 pub mod danmaku;
 pub mod extensions_tab;
 pub mod i18n;

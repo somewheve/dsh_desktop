@@ -30,6 +30,34 @@ pub struct EngineSettings {
     pub skills_dir: Option<PathBuf>,
     /// 插件目录（默认 $DSH_HOME/plugins；测试可指向临时目录）
     pub plugins_dir: Option<PathBuf>,
+    /// 定时任务（重启恢复；next_at 不持久化，载入时按 interval 重排）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduled_tasks: Vec<StoredScheduledTask>,
+    /// DPAPI 解密失败时保留的原始密文（save 原样写回，防止内存 None 抹盘）
+    #[serde(skip)]
+    pub locked_api_key: Option<String>,
+    /// 会话级 token 用量累计（重启保留；UI 标题行显示）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub token_usage: Vec<StoredTokenUsage>,
+}
+
+/// 持久化形态的会话 token 用量。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredTokenUsage {
+    pub session_id: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+/// 持久化形态的定时任务（engine/schedule 的存储镜像）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredScheduledTask {
+    pub id: String,
+    pub name: String,
+    pub interval_secs: u64,
+    pub prompt: String,
+    pub session_id: String,
+    pub enabled: bool,
 }
 
 impl Default for EngineSettings {
@@ -45,6 +73,9 @@ impl Default for EngineSettings {
             default_preset: "standard".into(),
             skills_dir: None,
             plugins_dir: None,
+            scheduled_tasks: Vec::new(),
+            locked_api_key: None,
+            token_usage: Vec::new(),
         }
     }
 }
@@ -89,6 +120,26 @@ impl EngineSettings {
         Self::settings_file_for(&dd)
     }
 
+    /// 从指定 data_dir 对应的设置文件加载（测试/多实例场景）。
+    pub fn load_for(data_dir: &Path) -> Self {
+        let path = Self::settings_file_for(data_dir);
+        match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Self>(&t).ok())
+        {
+            Some(mut s) => {
+                // data_dir 以构造参数为准（文件里可能是别的实例路径）
+                s.data_dir = data_dir.to_path_buf();
+                s
+            }
+            None => {
+                let mut s = Self::default();
+                s.data_dir = data_dir.to_path_buf();
+                s
+            }
+        }
+    }
+
     pub fn load() -> Self {
         let path = Self::settings_file();
         let mut s: Self = match std::fs::read_to_string(&path) {
@@ -102,13 +153,18 @@ impl EngineSettings {
             Err(_) => Self::default(),
         };
         // api_key 解密（dpapi: 前缀 = DPAPI 加密存储；旧明文格式直接兼容）
-        if let Some(stored) = &s.api_key {
+        let stored_key = s.api_key.clone();
+        if let Some(stored) = &stored_key {
             if let Some(plain) = unprotect_key(stored) {
                 s.api_key = Some(plain);
             } else if stored.starts_with("dpapi:") {
-                // 加密条目解密失败（换机器/用户）：按无 key 处理，不覆盖落盘
+                // 加密条目解密失败（换机器/用户）：按无 key 处理。
+                // 关键：保留原始密文在 `locked_api_key`，save() 时原样写回——
+                // 否则内存 None 会在下一次任意 save()（flush_usage 等）把
+                // 磁盘密钥静默抹掉（历史 bug：迁移一次即永久丢 key）。
                 log::warn!("api_key 解密失败（可能跨用户/机器迁移），已忽略");
                 s.api_key = None;
+                s.locked_api_key = Some(stored.clone());
             }
         }
         // 防污染：data_dir 指向 tempfile 特征目录（`.tmpXXXXXX` 尾部形态，
@@ -137,8 +193,15 @@ impl EngineSettings {
         if let Some(k) = &plain.api_key {
             let protected = protect_key(k);
             plain.api_key = Some(protected);
+        } else if let Some(locked) = &self.locked_api_key {
+            // 解密失败的密文原样回写（见 load() 注释：防静默清 key）
+            plain.api_key = Some(locked.clone());
         }
-        std::fs::write(&path, serde_json::to_string_pretty(&plain)?)?;
+        // 原子写：先写临时文件再替换，中途崩溃不会损坏设置文件
+        // （历史风险：裸 write 崩溃后 JSON 残缺，下次 load 回 default 丢全部）
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(&plain)?)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 

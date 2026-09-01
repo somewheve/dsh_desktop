@@ -5,6 +5,7 @@ pub mod compaction;
 pub mod feedback;
 pub mod goal;
 pub mod jobs;
+pub mod lessons;
 pub mod plan;
 pub mod plugin;
 pub mod schedule;

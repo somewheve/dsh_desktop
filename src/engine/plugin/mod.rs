@@ -185,6 +185,18 @@ impl PluginRuntime {
                     match reader.read_line(&mut line) {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {
+                            // 行上限（历史缺陷：插件输出超长单行/二进制
+                            // 可让 String 无限膨胀）。字符边界安全截断：
+                            // String::truncate 在非边界时 panic → 读线程
+                            // 死 → 插件假活（Running 但 IO 断）
+                            if line.len() > 1_000_000 {
+                                let mut cut = 1_000_000;
+                                while cut > 0 && !line.is_char_boundary(cut) {
+                                    cut -= 1;
+                                }
+                                line.truncate(cut);
+                                line.push('\n');
+                            }
                             let _ = tx.send(line.clone());
                         }
                     }
@@ -594,6 +606,11 @@ impl PluginManager {
 
     pub fn get_mut(&mut self, name: &str) -> Option<&mut PluginRuntime> {
         self.plugins.get_mut(name)
+    }
+
+    /// 从注册表移除（不删文件；删除本地插件用——进程停止后调用）。
+    pub fn remove(&mut self, name: &str) -> Option<PluginRuntime> {
+        self.plugins.remove(name)
     }
 }
 

@@ -9,6 +9,7 @@
 //! - settings.rs    API key/model/proxy（dsh-settings + dsh-credentials）
 
 pub mod agent;
+pub mod diff;
 pub mod llm;
 pub mod preset;
 pub mod session;

@@ -131,6 +131,31 @@ impl ApprovalRegistry {
     }
 
     /// 撤销/取消一个待审批请求（超时清理）。
+    /// 清除某会话的全部挂起审批（会话删除时调用——悬卡点允许会唤醒
+    /// 已删会话的旧回合执行真实写操作，历史安全缺陷）。
+    pub fn cancel_session(&mut self, session_id: &str) {
+        let stale: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, (req, _))| req.session_id == session_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            self.cancel(&id);
+        }
+    }
+
+    /// 清空全部 AlwaysAllow（工作区/沙箱切换时——旧语境的放行不再适用）。
+    pub fn clear_allowances(&mut self) {
+        if !self.always_allow.is_empty() {
+            log::info!(
+                "cleared {} always-allow entries (workspace/sandbox switched)",
+                self.always_allow.len()
+            );
+        }
+        self.always_allow.clear();
+    }
+
     pub fn cancel(&mut self, id: &str) {
         self.pending.remove(id);
     }

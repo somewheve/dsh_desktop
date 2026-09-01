@@ -11,6 +11,10 @@ pub struct ScheduledTask {
     pub name: String,
     /// 触发间隔（秒）
     pub interval_secs: u64,
+    /// 到期时发送到绑定会话的提示词（name 的完整版）
+    pub prompt: String,
+    /// 绑定会话（到期在此会话发起回合）
+    pub session_id: String,
     /// 下次触发时间戳
     pub next_at: f64,
     pub enabled: bool,
@@ -22,7 +26,14 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn add(&mut self, id: &str, name: &str, interval_secs: u64) {
+    pub fn add(
+        &mut self,
+        id: &str,
+        name: &str,
+        interval_secs: u64,
+        prompt: &str,
+        session_id: &str,
+    ) {
         if interval_secs == 0 {
             log::warn!("schedule add rejected: interval_secs must be > 0");
             return;
@@ -34,6 +45,8 @@ impl Scheduler {
                 id: id.to_string(),
                 name: name.to_string(),
                 interval_secs,
+                prompt: prompt.to_string(),
+                session_id: session_id.to_string(),
                 next_at: now + interval_secs as f64,
                 enabled: true,
             },
@@ -97,7 +110,7 @@ mod tests {
     fn scheduler_due() {
         use std::time::Duration;
         let mut s = Scheduler::default();
-        s.add("t1", "job1", 1);
+        s.add("t1", "job1", 1, "检查构建", "s-1");
         thread::sleep(Duration::from_millis(1200));
         let due = s.due();
         assert_eq!(due, vec!["t1".to_string()]);

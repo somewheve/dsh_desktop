@@ -2,17 +2,18 @@
 
 ## 0 一句话
 
-为 DeepSeek Harness (DSH) 打造的 **Rust 原生桌面终端**：egui 即时模式 GUI + portable-pty
-(ConPTY) 真终端模拟 + **Rust 原生重写的 DSH 核心引擎**（不桥接外部 Node 服务）。
+为 DeepSeek Harness (DSH) 打造的 **Rust 原生桌面客户端**：egui 即时模式 GUI +
+**Rust 原生重写的 DSH 核心引擎**（不桥接外部 Node 服务）。
 目标：性能快（无 WebView、GPU 文本渲染、按需重绘）、可扩展（模块化分层）、可测试。
+
+> 历史：早期版本含 portable-pty (ConPTY) 终端模拟（term/ 模块），现已移除——
+> 会话对话 + 工具执行已覆盖终端场景；架构文档以现状为准。
 
 ## 1 技术选型（为什么）
 
 | 关注点 | 选型 | 理由 |
 |---|---|---|
 | GUI | eframe/egui 0.36 | 纯 Rust 即时模式，GPU 加速文本，无浏览器包袱，热更新友好 |
-| PTY | portable-pty 0.9 (wezterm) | 跨平台（Windows ConPTY / unix pty），API 稳定 |
-| 终端模拟 | vt100 0.16 | VT100/ANSI 解析 + 回滚，纯 Rust，无原生依赖 |
 | DSH 引擎 | src/core/*（Rust 原生） | 重写自 DSH 开源实现：agent 循环/LLM/工具/会话/存储 |
 | LLM | reqwest + rustls | DeepSeek 官方 API（OpenAI 兼容、流式 SSE） |
 | 访问交互 | xitca-web 0.8（本地桥） | 与 ada-rs 同款框架，暴露 /api/session/* |
@@ -100,28 +101,6 @@ DshEngine（src/core/agent.rs）—— 重写自 DSH 开源实现
   KNOWN_SESSION_EVENT_TYPES 对齐，JSONL 日志格式兼容。
 - 访问交互层用 xitca-web（用户指定），暴露本地 REST API，UI 直连引擎。
 
-### 3.1 终端会话
-
-```
-UI 按键事件 ──egui──▶ input.rs 译码 ──▶ session.write(bytes)
-                                        │
-PTY (ConPTY) ◀──portable-pty── session.master
-        │
-        ▼  reader 线程（阻塞读）
-   mpsc channel (bytes)
-        │
-        ▼  UI 帧内 drain
-   screen.rs: Parser.process(bytes) ──▶ ScreenSnapshot(脏区)
-        │
-        ▼
-   render.rs: 只重绘脏行（LayoutJob 按颜色 run 合并）→ GPU 文本
-```
-
-- reader 线程在输出到达时 `ctx.request_repaint()`，无输出不重绘（性能）。
-- 行尺寸变化 → `master.resize(PtySize)` + parser.set_size()。
-- 终端渲染按行构造 LayoutJob：同色连续字符合并为一个 run，背景色通过
-  TextFormat.background 表达，避免逐 cell 绘制（性能）。
-
 ### 3.2 沙箱（Windows ACL restricted-token）
 
 `src/exec/sandbox.rs` 是沙箱策略层（模式/升级阶梯/路径裁决 `can_write`）；
@@ -207,8 +186,8 @@ PluginsTab ──▶ dsh/plugins.rs
 
 - 单元：input.rs 按键→ANSI 译码表；screen.rs 喂 ANSI 序列断言快照；
   profile.rs 读写 package.json/cordis.patch.yml 往返；plugins.rs 临时 DSH_HOME 导入。
-- 集成：tests/integration.rs 用 portable-pty 起 cmd/pwsh 冒烟 echo；
-  插件导入在临时 profile 上跑（不碰真实 ~/.dsh）。
+- 集成：tests/integration.rs 覆盖插件/引擎/工具（临时 profile 与 data_dir 隔离，
+  不碰真实 ~/.dsh）；tests/ui_layout.rs 用 egui_kittest 做像素/a11y 断言。
 - 回归原则：修复必须先能在旧代码上 FAIL 再改（约束 #5）。
 
 ## 7 构建环境（本机沙箱特殊处理）

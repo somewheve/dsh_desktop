@@ -59,6 +59,11 @@ impl WindowsAclSandbox {
         true
     }
 
+    /// 当前沙箱模式。
+    pub fn mode(&self) -> crate::exec::SandboxMode {
+        self.mode
+    }
+
     /// 受限执行入口。
     ///
     /// - `DangerFullAccess`：返回 `None`（调用方走普通直通）。
@@ -68,13 +73,14 @@ impl WindowsAclSandbox {
         if matches!(self.mode, SandboxMode::DangerFullAccess) {
             return None;
         }
-        // workspace-write：用正常用户令牌执行（不再修改文件系统 ACL）。
-        // 历史 bug：grant_dir_write 每次执行都 SetNamedSecurityInfoW 修改
-        // 工作区目录 DACL → 破坏继承链 → 子文件权限损坏（空 DACL = 拒绝所有人）。
-        // 应用层 check_write_allowed 已限制写路径（OS 层不需要再改 ACL）。
+        // workspace-write：正常用户令牌执行，但 bash/pwsh 的写目标在应用层
+        // 硬拒绝（fail-closed，见 tools.rs 的 check_write_allowed 接线——
+        // 历史缺陷：该模式直通返回 None，shell 写的唯一闸门只剩审批启发式）。
+        // OS 级按目录强制需要 per-directory ACL 授权（修改磁盘 DACL 有历史
+        // 事故），暂以应用层门 + 增强的重定向/写命令解析为界。
         if matches!(self.mode, SandboxMode::WorkspaceWrite) {
             log::info!(
-                "sandbox workspace-write: normal token, app-level path check only (no ACL modification)"
+                "sandbox workspace-write: normal token + app-level write gate for shell"
             );
             return None;
         }

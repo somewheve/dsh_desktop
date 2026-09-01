@@ -72,13 +72,23 @@ impl SessionEvent {
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
     #[serde(rename = "user")]
-    User { content: String },
+    User {
+        content: String,
+        /// 随消息附带的图片文件路径（vision 多模态；JSONL 只存路径不存
+        /// 字节，重放/后续回合按路径读取编码 base64）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<String>>,
+    },
     #[serde(rename = "assistant")]
     Assistant {
         content: String,
         /// 本轮调用的工具（OpenAI 要求 tool 消息前必须有带 tool_calls 的 assistant 消息）
         #[serde(default)]
         tool_calls: Vec<ToolCall>,
+        /// 思考过程（reasoning 模型流式思考；持久化于事件，重放恢复——
+        /// UI 折叠展示为"思考时间线"，弹幕划过后仍可回看）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
     },
     #[serde(rename = "tool")]
     Tool {
@@ -178,7 +188,7 @@ impl Session {
             self.messages
                 .iter()
                 .find_map(|m| match m {
-                    Message::User { content } => Some(content.chars().take(24).collect()),
+                    Message::User { content, .. } => Some(title_from_message(content)),
                     _ => None,
                 })
                 .unwrap_or_else(|| "新会话".into())
@@ -192,5 +202,70 @@ impl Session {
             blank: self.messages.is_empty(),
             title,
         }
+    }
+}
+
+/// 从用户消息提炼会话标题：取首个非空行、剥 markdown 前缀符号、
+/// 压缩空白、截 24 字符（自动命名的唯一实现，summary 回退与
+/// send_message 首条消息持久化命名共用）。
+pub fn title_from_message(content: &str) -> String {
+    // 1) 首个非空行
+    let line = content
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    // 2) 剥 markdown 前缀（#+、引用、列表符、代码围栏）
+    let mut s = line.trim_start_matches(['#', '>', '`']);
+    if let Some(rest) = s.strip_prefix("- ") {
+        s = rest;
+    } else if let Some(rest) = s.strip_prefix("* ") {
+        s = rest;
+    }
+    // 3) 压缩内部空白（多空格/制表符 → 单空格），截 24 字符
+    let mut out = String::new();
+    let mut last_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !last_space && !out.is_empty() {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_space = false;
+        }
+        if out.chars().count() >= 24 {
+            break;
+        }
+    }
+    out.trim_end().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 标题提炼：首行 / markdown 前缀剥离 / 空白压缩 / 24 字符截断。
+    #[test]
+    fn title_from_message_rules() {
+        // 普通单行
+        assert_eq!(title_from_message("帮我修复登录 bug"), "帮我修复登录 bug");
+        // 多行取首个非空行
+        assert_eq!(
+            title_from_message("\n\n  \n第一行很重要\n第二行"),
+            "第一行很重要"
+        );
+        // markdown 前缀剥离
+        assert_eq!(title_from_message("## 重构计划"), "重构计划");
+        assert_eq!(title_from_message("- 列表项开头"), "列表项开头");
+        // 连续空白压缩为单空格
+        assert_eq!(title_from_message("读   一下\t这段   代码"), "读 一下 这段 代码");
+        // 超长截断（24 字符）
+        let long = "一二三四五六七八九十一二三四五六七八九十一二三四五六七八九";
+        let t = title_from_message(long);
+        assert_eq!(t.chars().count(), 24);
+        // 纯空白 → 空（调用方跳过命名）
+        assert_eq!(title_from_message("   \n  "), "");
     }
 }

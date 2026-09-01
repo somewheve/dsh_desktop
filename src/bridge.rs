@@ -36,11 +36,23 @@ struct SessionParams {
     id: String,
 }
 
+/// 常量时间比较（本地回环下时序侧信道利用难度高，仍按最佳实践）。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// 共享引擎。
 pub type SharedEngine = Arc<Mutex<DshEngine>>;
 
 /// 桥接服务状态（handler 共享）。
-pub struct BridgeState {
+struct BridgeState {
     pub engine: SharedEngine,
     /// 本次启动的随机鉴权 token
     token: String,
@@ -128,7 +140,7 @@ fn authorized(req: &WebRequest<()>, state: &BridgeState) -> bool {
                 .map(str::to_owned)
         });
     match supplied {
-        Some(t) => t == state.token,
+        Some(t) => constant_time_eq(t.as_bytes(), state.token.as_bytes()),
         None => false,
     }
 }
@@ -142,7 +154,7 @@ async fn list_sessions(
     if !authorized(req, &state) {
         return unauthorized();
     }
-    let engine = state.engine.lock().unwrap();
+    let engine = state.engine.lock().unwrap_or_else(|p| p.into_inner());
     let sessions = engine.list_sessions();
     Json(serde_json::to_value(&sessions).unwrap_or_else(|_| serde_json::json!([])))
 }
@@ -154,7 +166,7 @@ async fn create_session(
     if !authorized(req, &state) {
         return unauthorized();
     }
-    let mut engine = state.engine.lock().unwrap();
+    let mut engine = state.engine.lock().unwrap_or_else(|p| p.into_inner());
     match engine.create_session(None) {
         Ok(id) => Json(serde_json::json!({"sessionId": id})),
         Err(e) => Json(serde_json::json!({"error": format!("{e:#}"), "code": 500})),
@@ -173,7 +185,7 @@ async fn get_session(
         Ok(p) => p.0,
         Err(_) => return Json(json!({"error": "missing id", "code": 400})),
     };
-    let mut engine = state.engine.lock().unwrap();
+    let mut engine = state.engine.lock().unwrap_or_else(|p| p.into_inner());
     match engine.open_session(&params.id) {
         Ok(session) => Json(session_payload(&session)),
         Err(e) => Json(serde_json::json!({"error": format!("{e:#}"), "code": 404})),
@@ -206,7 +218,7 @@ async fn send_message(
         params.id,
         content.len()
     );
-    let mut engine = state.engine.lock().unwrap();
+    let mut engine = state.engine.lock().unwrap_or_else(|p| p.into_inner());
     match engine.send_message(&params.id, &content) {
         Ok(()) => Json(serde_json::json!({"ok": true})),
         Err(e) => Json(serde_json::json!({"error": format!("{e:#}"), "code": 400})),
@@ -220,7 +232,7 @@ async fn get_settings(
     if !authorized(req, &state) {
         return unauthorized();
     }
-    let engine = state.engine.lock().unwrap();
+    let engine = state.engine.lock().unwrap_or_else(|p| p.into_inner());
     let s = engine.settings();
     Json(serde_json::json!({
         "model": s.model,

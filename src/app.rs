@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use egui::{CentralPanel, Panel, RichText};
-use log::info;
+use log::{info, warn};
 
 use crate::bridge::start_bridge;
 use crate::config::AppConfig;
@@ -23,10 +23,12 @@ enum Tab {
     Chat,
     Skills,
     Extensions,
+    Code,
     Settings,
 }
 
 pub struct DshDesktopApp {
+    code: crate::ui::code_browser::CodeBrowser,
     cfg: AppConfig,
     tab: Tab,
     chat: ChatTab,
@@ -36,6 +38,11 @@ pub struct DshDesktopApp {
     settings: SettingsTab,
     /// DSH web 子进程托管（启动/停止/重启；侧边栏手动控制）
     web: crate::dsh::WebHandle,
+    /// dsh CLI 是否已安装（启动时探测一次；未安装隐藏 web 操作按钮）
+    dsh_installed: bool,
+    /// 插件变更后请求重启 web（扩展页置位，帧循环消费——使 web 进程内
+    /// 的 cordis 插件配置生效；注释承诺的联动此前从未接线）
+    web_restart_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     bridge_port: Option<u16>,
     /// 桥鉴权 token（调用方需带 Authorization: Bearer <token>）
     bridge_token: Option<String>,
@@ -70,6 +77,8 @@ impl DshDesktopApp {
                 .unwrap_or_else(crate::ui::theme::Palette::dark);
             crate::ui::theme::Theme::set_palette(&palette);
             Theme::apply(&cc.egui_ctx);
+            // 字体大小（全局缩放）：16=1.0x；用户保存的偏好在此生效
+            cc.egui_ctx.set_zoom_factor(crate::config::ui_zoom(cfg.font_size));
         }
         setup_fonts(&cc.egui_ctx);
 
@@ -111,7 +120,7 @@ impl DshDesktopApp {
         // 恢复上次打开的工作区（工具根目录 / 新会话 / 终端直接可用）
         if let Some(ws) = &cfg.last_workspace {
             if ws.is_dir() {
-                match engine.lock().unwrap().set_workspace(ws) {
+                match engine.lock().unwrap_or_else(|p| p.into_inner()).set_workspace(ws) {
                     Ok(root) => info!("startup: restored workspace {root}"),
                     Err(e) => log::warn!("startup: workspace restore failed: {e}"),
                 }
@@ -126,7 +135,8 @@ impl DshDesktopApp {
         let lang = crate::ui::i18n::Lang::parse(&cfg.lang);
         let settings = SettingsTab::new(&cfg, engine.clone());
         let skills = SkillsPanel::new(engine.clone(), lang);
-        let ext = ExtensionsTab::new(engine.clone(), lang);
+        let mut ext = ExtensionsTab::new(engine.clone(), lang);
+        let code = crate::ui::code_browser::CodeBrowser::new(engine.clone(), lang);
         let mut chat = ChatTab::new(engine.clone(), event_rx);
         chat.lang = lang;
 
@@ -135,15 +145,24 @@ impl DshDesktopApp {
             .last_workspace
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned());
+        let web_restart_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        ext.set_web_restart_flag(web_restart_flag.clone());
+        let dsh_installed = crate::dsh::cli::find_dsh().is_some();
+        if !dsh_installed {
+            log::info!("startup: dsh CLI not found — DSH Web 操作按钮隐藏");
+        }
         let mut app = Self {
             cfg,
             tab: Tab::Chat,
             chat,
             skills,
             ext,
+            code,
             web_probe,
             settings,
             web: crate::dsh::WebHandle::new(),
+            dsh_installed,
+            web_restart_flag,
             bridge_port,
             bridge_token,
             engine,
@@ -158,7 +177,7 @@ impl DshDesktopApp {
             );
         }
         {
-            let engine = app.engine.lock().unwrap();
+            let engine = app.engine.lock().unwrap_or_else(|p| p.into_inner());
             let sessions = engine.list_sessions();
             drop(engine);
             log::info!("startup: {} sessions found", sessions.len());
@@ -171,6 +190,21 @@ impl DshDesktopApp {
         }
         let dsh_home_display = app.cfg.dsh_home.display().to_string();
         info!("app started; dsh_home={dsh_home_display}");
+        // 首启引导：无 API key 时直接落到设置页（否则首次发送才报错，
+        // 错误又只出现在底部状态栏，发现性差）
+        {
+            let has_key = app
+                .engine
+                .lock()
+                .map(|e| e.settings().api_key.is_some())
+                .unwrap_or(false);
+            if !has_key {
+                info!("startup: no api key -> opening settings tab");
+                app.tab = Tab::Settings;
+                app.settings.status =
+                    "请填写 DeepSeek API Key 并保存后，回到会话页开始使用".into();
+            }
+        }
         app
     }
 
@@ -235,7 +269,7 @@ impl DshDesktopApp {
                 .clone()
                 .on_hover_text(tr(lang, "新建会话", "New session"));
             if plus_resp.clicked() {
-                let mut engine = self.engine.lock().unwrap();
+                let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
                 if let Ok(id) = engine.create_session(None) {
                     drop(engine);
                     self.chat.refresh_sessions();
@@ -268,6 +302,14 @@ impl DshDesktopApp {
         }
         if Theme::nav_button(
             ui,
+            &tr(lang, "代码", "Code"),
+            "📂",
+            self.tab == Tab::Code,
+        ) {
+            self.tab = Tab::Code;
+        }
+        if Theme::nav_button(
+            ui,
             &tr(lang, "设置", "Settings"),
             "⚙️",
             self.tab == Tab::Settings,
@@ -280,8 +322,13 @@ impl DshDesktopApp {
             if let Some(port) = self.bridge_port {
                 ui.label(Theme::dim(&format!("bridge 127.0.0.1:{port}")));
             }
-            // DSH Web：状态一行 + 极简文字按钮（不再是按钮堆）
+            // DSH Web：状态一行 + 极简文字按钮（不再是按钮堆）。
+            // dsh CLI 未安装且 web 未运行 → 整行隐藏（启动按钮对未安装
+            // 机器只会报错）；未安装但外部 web 在跑 → 只显示状态和打开。
+            let web_row_visible = self.dsh_installed || self.web_probe.is_up();
+            if web_row_visible {
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(5.0, 0.0);
                 let web_running = self.web_probe.is_up();
                 let managed = self.web.managed();
                 let dot = if web_running { "●" } else { "○" };
@@ -294,50 +341,159 @@ impl DshDesktopApp {
                 } else {
                     tr(lang, "DSH Web", "DSH Web")
                 };
-                ui.label(RichText::new(format!("{dot} {status}")).size(11.0).color(
-                    if web_running {
-                        Theme::ok()
-                    } else {
-                        Theme::text_faint()
-                    },
-                ));
-                if web_running {
-                    ui.hyperlink_to(
-                        RichText::new(tr(lang, "打开", "open")).size(11.0),
-                        self.cfg.web_url(),
-                    );
-                } else if ui
-                    .small_button(tr(lang, "启动", "start"))
+                // 状态文本与"打开"链接：24px 行高内 galley 垂直居中
+                //（历史缺陷：11px 文本与 24px mini_button 顶对齐不匹配）
+                let status_color = if web_running {
+                    Theme::ok()
+                } else {
+                    Theme::text_faint()
+                };
+                let text = format!("{dot} {status}");
+                let galley = ui.fonts_mut(|f| {
+                    f.layout_no_wrap(
+                        text.clone(),
+                        egui::FontId::proportional(11.0),
+                        status_color,
+                    )
+                });
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(galley.size().x, 24.0),
+                    egui::Sense::hover(),
+                );
+                let mb = galley.mesh_bounds;
+                ui.painter().galley(
+                    egui::pos2(
+                        rect.left(),
+                        rect.center().y - mb.height() / 2.0 - mb.min.y,
+                    ),
+                    galley,
+                    egui::Color32::WHITE,
+                );
+                // 自绘文本补 a11y 标签（读屏可见）
+                let a11y = text.clone();
+                resp.widget_info(move || {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Label,
+                        true,
+                        a11y.clone(),
+                    )
+                });
+                if web_running && !managed {
+                    // 外部 web：可按端口终止（历史缺陷:外部态无任何控制,
+                    // 端口被占后用户走投无路——只能去任务管理器找 node）
+                    if Theme::mini_button(
+                        ui,
+                        tr(lang, "停止", "stop"),
+                        crate::ui::theme::ChipTint::Danger,
+                    )
                     .on_hover_text(tr(
                         lang,
-                        "启动 DSH Web（插件功能的入口：web 进程承载插件）",
-                        "Start DSH Web (plugins live in the web process)",
+                        "终止占用端口的外部 web 进程（netstat 定位 PID）",
+                        "Terminate the external web process holding the port (PID via netstat)",
                     ))
                     .clicked()
-                {
-                    let profile = self
-                        .cfg
-                        .profile
-                        .clone()
-                        .unwrap_or_else(|| "web".to_string());
-                    match self.web.start(&profile) {
-                        Ok(()) => info!("web started from sidebar (profile {profile})"),
-                        Err(e) => {
-                            log::warn!("web start failed: {e:#}");
-                            self.chat.error = Some(format!("启动 DSH Web 失败：{e:#}"));
+                    {
+                        match crate::dsh::cli::kill_web_by_port(self.cfg.web_port) {
+                            Ok(msg) => {
+                                info!("{msg}");
+                                self.settings.status = msg.clone();
+                                self.chat.status = msg.clone();
+                            }
+                            Err(e) => {
+                                warn!("kill external web failed: {e}");
+                                self.settings.status = format!("停止外部 web 失败：{e}");
+                                self.chat.status = format!("停止外部 web 失败：{e}");
+                            }
                         }
                     }
                 }
+                if web_running {
+                    // "打开"链接：同样 24px 行高居中（自绘 + 点击开 URL）
+                    let label = tr(lang, "打开", "open");
+                    let galley = ui.fonts_mut(|f| {
+                        f.layout_no_wrap(
+                            label.clone(),
+                            egui::FontId::proportional(11.0),
+                            Theme::accent_light(),
+                        )
+                    });
+                    let w = galley.size().x;
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(w, 24.0),
+                        egui::Sense::click(),
+                    );
+                    let mb = galley.mesh_bounds;
+                    ui.painter().galley(
+                        egui::pos2(
+                            rect.left(),
+                            rect.center().y - mb.height() / 2.0 - mb.min.y,
+                        ),
+                        galley,
+                        egui::Color32::WHITE,
+                    );
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::same_tab(
+                            self.cfg.web_url(),
+                        ));
+                    }
+                } else if self.dsh_installed
+                    && !managed
+                    && Theme::mini_button(
+                    ui,
+                    &tr(lang, "启动", "start"),
+                    crate::ui::theme::ChipTint::Accent,
+                )
+                .on_hover_text(tr(
+                    lang,
+                    "启动 DSH Web（插件功能的入口：web 进程承载插件）",
+                    "Start DSH Web (plugins live in the web process)",
+                ))
+                .clicked()
+                {
+                    // 失败信息经 WebHandle::last_error 显示在 web 行内
+                    //（spawn 失败即时可见；进程秒退由 reap 捕获 stderr 后
+                    // 写入 last_error）——不再塞到聊天页（与点击位置脱节）
+                    if let Err(e) = self.web.start() {
+                        log::warn!("web start failed: {e:#}");
+                    }
+                }
                 if managed {
-                    if ui.small_button(tr(lang, "停止", "stop")).clicked() {
+                    if Theme::mini_button(
+                        ui,
+                        &tr(lang, "停止", "stop"),
+                        crate::ui::theme::ChipTint::Neutral,
+                    )
+                    .clicked()
+                    {
                         self.web.stop();
                     }
-                    if ui.small_button(tr(lang, "重启", "restart")).clicked() {
-                        let profile = self.web.profile().to_string();
-                        self.web.restart(&profile);
+                    if Theme::mini_button(
+                        ui,
+                        &tr(lang, "重启", "restart"),
+                        crate::ui::theme::ChipTint::Neutral,
+                    )
+                    .clicked()
+                    {
+                        self.web.restart();
                     }
                 }
             });
+            // 启动失败信息（spawn 失败 / 秒退 stderr）：紧跟 web 行显示，
+            // 红色小字 + 悬浮全文；下次启动成功自动清除
+            if let Some(err) = self.web.last_error() {
+                let short: String = err.chars().take(90).collect();
+                let ell = if err.chars().count() > 90 { "…" } else { "" };
+                let resp = ui.label(
+                    RichText::new(format!("⚠ {short}{ell}"))
+                        .size(10.5)
+                        .color(Theme::err()),
+                );
+                resp.on_hover_text(err);
+            }
+            }
         });
     }
 }
@@ -349,11 +505,13 @@ impl eframe::App for DshDesktopApp {
         self.chat.lang = lang;
         self.skills.lang = lang;
         self.ext.lang = lang;
+        self.code.lang = lang;
+        self.settings.lang = lang;
         // 全局快捷键：Ctrl+N 新建会话 / Escape 关浮动卡片
         {
             let ctx = ui.ctx();
             if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::N)) {
-                let mut engine = self.engine.lock().unwrap();
+                let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
                 if let Ok(id) = engine.create_session(None) {
                     drop(engine);
                     self.chat.refresh_sessions();
@@ -362,7 +520,7 @@ impl eframe::App for DshDesktopApp {
                 }
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.chat.card = crate::ui::chat_tab::CardKind::None;
+                self.chat.panel_expanded = crate::ui::chat_tab::PanelKind::None;
             }
         }
         // 引擎事件泵置顶（任何标签页都处理）：事件只驱动 ChatTab 状态，
@@ -371,7 +529,7 @@ impl eframe::App for DshDesktopApp {
         self.chat.pump(&ui.ctx().clone());
         // 工作区变更 → 立即持久化 last_workspace（避免崩溃/异常退出丢失）
         {
-            let ws = self.engine.lock().unwrap().workspace_root().cloned();
+            let ws = self.engine.lock().unwrap_or_else(|p| p.into_inner()).workspace_root().cloned();
             let ws_str = ws.as_ref().map(|p| p.to_string_lossy().into_owned());
             if ws_str != self.ws_saved {
                 self.ws_saved = ws_str;
@@ -399,6 +557,11 @@ impl eframe::App for DshDesktopApp {
             )
         });
 
+        // AI 消息里的文件路径点击 → 代码浏览器打开并切页（ZCode 式跳转）
+        if let Some(p) = self.chat.open_file_req.take() {
+            self.code.open_file(&p);
+            self.tab = Tab::Code;
+        }
         CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Chat => self.chat.ui(ui),
             Tab::Skills => self.skills.ui(ui),
@@ -406,17 +569,31 @@ impl eframe::App for DshDesktopApp {
                 self.ext.lang = lang;
                 self.ext.ui(ui);
             }
+            Tab::Code => self.code.ui(ui),
             Tab::Settings => self.settings.ui(ui, &mut self.cfg),
         });
         // 桥访问信息（端口/token）注入设置页展示
         if let (Some(p), Some(t)) = (self.bridge_port, self.bridge_token.as_deref()) {
             self.settings.set_bridge_info(Some(p), Some(t.to_string()));
         }
+        // web 子进程 reap（外部退出后清托管态）+ 插件变更重启信号
+        self.web.reap();
+        if self.web_restart_flag.swap(false, std::sync::atomic::Ordering::Relaxed)
+            && self.web.managed()
+        {
+            info!("plugin change → restarting dsh web");
+            self.web.restart();
+        }
         // 排队消息泵：回合结束（idle）的会话自动取队首发起（FIFO）
-        self.engine.lock().unwrap().pump_message_queue();
+        {
+            let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+            engine.pump_message_queue();
+            // token 用量脏时落盘（无更新时零开销）
+            engine.flush_usage();
+        }
         // 插件（子进程扩展）输出泵：每帧处理响应/握手/退出（引擎短锁）
         let plugin_busy = {
-            let engine = self.engine.lock().unwrap();
+            let engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
             engine.plugin_pump();
             engine.plugin_has_live_work()
         };
@@ -437,54 +614,104 @@ impl eframe::App for DshDesktopApp {
     }
 }
 
-/// 加载字体（Consolas 界面主字体 + 等宽回退 + CJK 回退）到 egui。
-fn setup_fonts(ctx: &egui::Context) {
+/// 加载字体（Consolas 界面主字体 + 等宽回退 + CJK 回退 + emoji 回退）到 egui。
+///
+/// CJK 与 emoji 回退注册前先做**度量归一**（[`util::font_tweak_to_match_primary`]）：
+/// egui 按一行内每个字形所属字体自身的 ascent/row_height 摆放基线并取行高
+/// 最大值，而雅黑（行高 1.32em）/Segoe Emoji 与 Consolas（1.17em）度量差异大，
+/// 不归一则中英混排行高跳变、基线错位。归一后所有字体共用主字体的行高与
+/// 基线，对任意字号成立。
+pub(crate) fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+
+    let primary = util::load_ui_font_consolas();
+    let mono = util::load_mono_font();
+    let cjk = util::load_cjk_font();
+    let emoji = util::load_emoji_font();
+
     // Consolas：界面文字主字体（Windows 系统自带，含 Bold 四风格）。
     // 插到 Proportional 与 Monospace 家族首位；无中文字形 → 自动落到
-    // 下方 CJK 回退链（雅黑），emoji 落 Segoe。
-    if let Some((name, bytes)) = util::load_ui_font_consolas() {
+    // 下方 CJK 回退链（雅黑，已归一到 Consolas 度量），emoji 落 Segoe。
+    if let Some((name, bytes)) = primary.clone() {
         fonts
             .font_data
             .insert(name.clone(), egui::FontData::from_owned(bytes).into());
-        if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-            mono.insert(0, name.clone());
-        }
-        if let Some(prop) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-            prop.insert(0, name);
-        }
-    }
-    if let Some((name, bytes)) = util::load_mono_font() {
-        fonts
-            .font_data
-            .insert(name.clone(), egui::FontData::from_owned(bytes).into());
-        if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-            mono.insert(1, name);
+        for family in [
+            egui::FontFamily::Proportional,
+            egui::FontFamily::Monospace,
+        ] {
+            if let Some(list) = fonts.families.get_mut(&family) {
+                list.insert(0, name.clone());
+            }
         }
     }
-    if let Some((name, bytes)) = util::load_cjk_font() {
+    if let Some((name, bytes)) = mono {
         fonts
             .font_data
             .insert(name.clone(), egui::FontData::from_owned(bytes).into());
+        if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+            list.insert(1, name);
+        }
+    }
+    // CJK 回退：度量归一（行高一致 + 基线对齐），追加到所有家族末尾。
+    // 探测需要主字体存在；主字体缺失（非 Windows）时跳过归一。
+    if let Some((name, bytes)) = cjk {
+        let tweak = primary.as_ref().and_then(|p| {
+            util::font_tweak_to_match_primary(
+                p,
+                &(name.clone(), bytes.clone()),
+                '中',
+            )
+        });
+        let mut data = egui::FontData::from_owned(bytes);
+        if let Some(t) = tweak {
+            data = data.tweak(t);
+        }
+        fonts.font_data.insert(name.clone(), data.into());
         for family in fonts.families.values_mut() {
             family.push(name.clone());
         }
     }
-    // emoji 字体：插到主字体之后、egui 内置 NotoEmoji 之前。
+    // emoji 字体：插到主字体之后、egui 内置 NotoEmoji 之前，并同样归一。
     // 原因：NotoEmoji 单色字形被 egui 缩小到 0.81，📋 等 emoji 在 12px 下
     // 形似"口"字（用户报告的口字/tofu）；Segoe UI Emoji 字形更大更清晰。
     // 拉丁/中文等主字体已有的字符不受影响（resolve 按家族顺序取第一个
     // 有该字符的字体，主字体优先）。
-    if let Some((name, bytes)) = util::load_emoji_font() {
-        fonts
-            .font_data
-            .insert(name.clone(), egui::FontData::from_owned(bytes).into());
+    if let Some((name, bytes)) = emoji {
+        let tweak = primary.as_ref().and_then(|p| {
+            util::font_tweak_to_match_primary(
+                p,
+                &(name.clone(), bytes.clone()),
+                '📋',
+            )
+        });
+        let mut data = egui::FontData::from_owned(bytes);
+        if let Some(t) = tweak {
+            data = data.tweak(t);
+        }
+        fonts.font_data.insert(name.clone(), data.into());
         for family in fonts.families.values_mut() {
             if family.is_empty() {
                 family.push(name.clone());
             } else {
                 family.insert(1, name.clone());
             }
+        }
+    }
+    // 符号字体：⧉（U+29C9 复制图标）等字形主字体/雅黑/emoji 都没有，
+    // 只在 Segoe UI Symbol 中存在——注册为所有家族的最后兜底，避免
+    // 渲染成 tofu"口"。放在末尾：已有字形仍由前面的字体优先提供。
+    if let Some((name, bytes)) = util::load_symbol_font() {
+        let tweak = primary.as_ref().and_then(|p| {
+            util::font_tweak_to_match_primary(p, &(name.clone(), bytes.clone()), '⧉')
+        });
+        let mut data = egui::FontData::from_owned(bytes);
+        if let Some(t) = tweak {
+            data = data.tweak(t);
+        }
+        fonts.font_data.insert(name.clone(), data.into());
+        for family in fonts.families.values_mut() {
+            family.push(name.clone());
         }
     }
     // 粗体字体族（Markdown **加粗**）：egui 默认 strong 只是颜色增强，

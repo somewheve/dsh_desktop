@@ -18,6 +18,8 @@ pub struct CompactionPlan {
     pub removed: usize,
     /// 摘要文本
     pub summary: String,
+    /// 保留尾部在原列表中的起始下标（重放折叠锚点）
+    pub keep_from: usize,
 }
 
 /// 简单策略：保留最近 keep_tail 条，头部压缩为摘要 User 消息。
@@ -27,6 +29,7 @@ pub fn plan_compaction(messages: &[Message], keep_tail: usize) -> CompactionPlan
             kept: messages.to_vec(),
             removed: 0,
             summary: String::new(),
+            keep_from: usize::MAX, // 无折叠标记（不触发重放折叠）
         };
     }
     let mut keep_from = messages.len() - keep_tail;
@@ -40,6 +43,7 @@ pub fn plan_compaction(messages: &[Message], keep_tail: usize) -> CompactionPlan
             kept: messages.to_vec(),
             removed: 0,
             summary: String::new(),
+            keep_from: usize::MAX,
         };
     }
     let removed = keep_from;
@@ -52,7 +56,7 @@ pub fn plan_compaction(messages: &[Message], keep_tail: usize) -> CompactionPlan
     let sample: String = head
         .iter()
         .filter_map(|m| match m {
-            Message::User { content } => Some(content.chars().take(80).collect::<String>()),
+            Message::User { content, .. } => Some(content.chars().take(80).collect::<String>()),
             _ => None,
         })
         .take(2)
@@ -67,12 +71,14 @@ pub fn plan_compaction(messages: &[Message], keep_tail: usize) -> CompactionPlan
         content: format!(
             "[context summary] 以下是本会话早期内容的压缩摘要，作为上下文背景：{summary}"
         ),
+        images: None,
     });
     kept.extend_from_slice(&messages[keep_from..]);
     CompactionPlan {
         kept,
         removed,
         summary,
+        keep_from,
     }
 }
 
@@ -83,10 +89,13 @@ pub fn compaction_start_event() -> SessionEvent {
 pub fn compaction_end_event() -> SessionEvent {
     SessionEvent::new(types::COMPACTION_END, None)
 }
-pub fn compaction_summary_event(summary: &str) -> SessionEvent {
+/// summary 事件带 `kept_from`：重放折叠的锚点——该下标之前的历史消息
+/// 已被压缩为 summary，不再恢复（否则压缩只活一个回合，长会话照样顶
+/// API 上限；历史缺陷）。
+pub fn compaction_summary_event(summary: &str, kept_from: usize) -> SessionEvent {
     SessionEvent::new(
         types::COMPACTION_SUMMARY,
-        Some(serde_json::json!({"summary": summary})),
+        Some(serde_json::json!({"summary": summary, "kept_from": kept_from})),
     )
 }
 
@@ -100,6 +109,7 @@ mod tests {
         for i in 0..10 {
             msgs.push(Message::User {
                 content: format!("msg {i}"),
+                images: None,
             });
         }
         let plan = plan_compaction(&msgs, 3);
@@ -114,6 +124,7 @@ mod tests {
     fn no_compaction_when_small() {
         let msgs = vec![Message::User {
             content: "hi".into(),
+            images: None,
         }];
         let plan = plan_compaction(&msgs, 10);
         assert_eq!(plan.removed, 0);
@@ -125,6 +136,7 @@ mod tests {
     fn boundary_never_starts_with_orphan_tool() {
         let mut msgs = vec![Message::User {
             content: "go".into(),
+            images: None,
         }];
         for i in 0..8 {
             msgs.push(Message::Assistant {
@@ -137,6 +149,7 @@ mod tests {
                         arguments: "{}".into(),
                     },
                 }],
+                reasoning: None,
             });
             msgs.push(Message::Tool {
                 tool_call_id: format!("c{i}"),
@@ -191,11 +204,12 @@ mod tests {
         for i in 0..20 {
             msgs.push(Message::User {
                 content: format!("msg {i}"),
+                images: None,
             });
         }
         let plan = plan_compaction(&msgs, 5);
         match &plan.kept[0] {
-            Message::User { content } => {
+            Message::User { content, .. } => {
                 assert!(
                     content.contains("[context summary]"),
                     "摘要应为 User 消息: {content}"

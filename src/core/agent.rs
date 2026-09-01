@@ -121,7 +121,21 @@ pub struct DshEngine {
     scheduler: Arc<std::sync::Mutex<crate::engine::schedule::Scheduler>>,
     /// 排队消息（会话级 FIFO）：回合运行中以"排队"模式发送的消息，
     /// 回合结束后由 pump_message_queue 逐条自动发起
-    queued_messages: std::collections::HashMap<String, std::collections::VecDeque<String>>,
+    queued_messages: std::collections::HashMap<
+        String,
+        std::collections::VecDeque<(String, Vec<String>)>,
+    >,
+    /// 会话级 token 用量累计（LLM usage 事件累加；内存态，重启清零）
+    token_usage: Arc<std::sync::Mutex<HashMap<String, crate::core::llm::TokenUsage>>>,
+    /// 消息反馈（👍👎；registry 内存态 + feedback/record 事件持久化）
+    feedback: Arc<std::sync::Mutex<crate::engine::FeedbackStore>>,
+    /// token 用量有更新（回合线程置位；UI 帧循环 flush 落盘）
+    usage_dirty: Arc<std::sync::atomic::AtomicBool>,
+    /// 排队消息重试计数 (session_id, 消息) → 次数（超过 2 次丢弃）
+    queue_retries: HashMap<(String, String), u32>,
+    /// 工具调用教训库（失败记忆 → 修正配对 → 下次直跑修正版；
+    /// 持久化 data_dir/tool_lessons.json，按工作区分域）
+    lessons: Arc<std::sync::Mutex<crate::engine::lessons::LessonStore>>,
 }
 
 impl DshEngine {
@@ -188,6 +202,19 @@ impl DshEngine {
         let scheduler = Arc::new(std::sync::Mutex::new(
             crate::engine::schedule::Scheduler::default(),
         ));
+        // 定时任务重启恢复（settings 持久化；next_at 按 interval 重新排程）
+        for t in &settings.scheduled_tasks {
+            scheduler
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .add(&t.id, &t.name, t.interval_secs, &t.prompt, &t.session_id);
+            if !t.enabled {
+                scheduler
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .toggle(&t.id, false);
+            }
+        }
         Self::spawn_scheduler_thread(scheduler.clone(), tx.clone());
         // 自动启动 autostart 插件（安装即生效：agent 回合可直接调用其工具）
         {
@@ -208,6 +235,19 @@ impl DshEngine {
             info!("plugins autostarted: {}", mgr.plugins.len());
         }
         info!("engine core ready");
+        // 教训库文件路径（data_dir/tool_lessons.json；加载失败从空库开始）
+        let store_dir_for_lessons = settings.data_dir.join("tool_lessons.json");
+        // token 用量恢复（settings 持久化）
+        let mut usage_map: HashMap<String, crate::core::llm::TokenUsage> = HashMap::new();
+        for u in &settings.token_usage {
+            usage_map.insert(
+                u.session_id.clone(),
+                crate::core::llm::TokenUsage {
+                    prompt_tokens: u.prompt_tokens,
+                    completion_tokens: u.completion_tokens,
+                },
+            );
+        }
         Ok(Self {
             settings,
             store,
@@ -247,7 +287,97 @@ impl DshEngine {
             )),
             scheduler,
             queued_messages: std::collections::HashMap::new(),
+            token_usage: Arc::new(std::sync::Mutex::new(usage_map)),
+            feedback: Arc::new(std::sync::Mutex::new(
+                crate::engine::FeedbackStore::default(),
+            )),
+            usage_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            queue_retries: HashMap::new(),
+            lessons: Arc::new(std::sync::Mutex::new(
+                crate::engine::lessons::LessonStore::load(
+                    store_dir_for_lessons.clone(),
+                ),
+            )),
         })
+    }
+
+    /// 测试辅助：置用量脏标记（真实路径是回合线程的 Usage 事件）。
+    #[cfg(test)]
+    pub(crate) fn mark_usage_dirty_for_test(&self) {
+        self.usage_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 用量落盘（UI 帧循环调用；无更新时为一次原子读，零开销）。
+    pub fn flush_usage(&mut self) {
+        if !self
+            .usage_dirty
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let map = self
+            .token_usage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        self.settings.token_usage = map
+            .iter()
+            .map(|(sid, u)| crate::core::settings::StoredTokenUsage {
+                session_id: sid.clone(),
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+            })
+            .collect();
+        let _ = self.settings.save();
+    }
+
+    /// 会话累计 token 用量（prompt + completion，内存态）。
+    pub fn token_usage(&self, session_id: &str) -> crate::core::llm::TokenUsage {
+        self.token_usage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// 全部会话合计 token 用量。
+    pub fn token_usage_total(&self) -> crate::core::llm::TokenUsage {
+        self.token_usage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .fold(Default::default(), |mut acc, u| {
+                acc += *u;
+                acc
+            })
+    }
+
+    /// 当前会话上下文占用估算（token，粗估：CJK 字 0.75/字、其余 4 字符/词）。
+    /// 与模型上下文窗口之比供 UI 展示"上下文用量 ≈ N%"。
+    pub fn context_estimate(&self, session_id: &str) -> u64 {
+        let messages = self
+            .sessions
+            .get(session_id)
+            .map(|s| s.messages.clone())
+            .or_else(|| {
+                lock_shared(&self.sessions_shared)
+                    .get(session_id)
+                    .map(|s| s.messages.clone())
+            })
+            .unwrap_or_default();
+        let text_len = messages
+            .iter()
+            .map(|m| match m {
+                crate::core::session::Message::User { content, .. } => content.len(),
+                crate::core::session::Message::Assistant { content, .. } => content.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        // 混合中英的粗略估算：按字节（中文 UTF-8 3 字节 ≈ 0.75 token/字 →
+        // 0.25 token/字节；ASCII ≈ 0.25 token/字节），两者巧合接近，统一
+        // bytes/4 即可，误差可接受（仅用于百分比提示）。
+        (text_len as u64) / 4
     }
 
     /// 定时任务驱动线程：每秒检查到期任务并发事件（独立于 UI 帧循环——
@@ -260,8 +390,12 @@ impl DshEngine {
             .name("dsh-scheduler".into())
             .spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
+                // panic 恢复：锁毒化/意外 panic 不让调度线程死亡
+                // （历史缺陷：线程一死所有定时任务静默停摆）
                 let due = {
-                    let mut s = scheduler.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut s = scheduler
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
                     s.due()
                 };
                 for id in due {
@@ -291,6 +425,13 @@ impl DshEngine {
     /// 切换沙箱模式并重建工具注册表（bash/pwsh 随新模式受限/直通）。
     /// danger-full-access → 直通；workspace-write / read-only → restricted-token。
     pub fn set_sandbox_mode(&mut self, mode: crate::exec::SandboxMode) {
+    // 切换工作区/沙箱后旧的 AlwaysAllow 全部失效（历史缺陷：旧工作区
+    // 放行过的区外路径在新工作区语境下变成无审批直通）
+    self.approvals
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear_allowances();
+
         self.sandbox_mode = mode;
         // 持久化（重启恢复用户选择的沙箱模式）
         self.settings.sandbox_mode = Some(mode.as_str().to_string());
@@ -361,7 +502,7 @@ impl DshEngine {
                 s.sandbox_mode = Some(mode.as_str().to_string());
             }
         }
-        let _ = self.store.append(session_id, &ev);
+        if let Err(e) = self.store.append(session_id, &ev) { log::warn!("persist failed: {e:#}"); }
         let _ = self.tx.send(EngineEvent::Event {
             session_id: session_id.to_string(),
             event: ev,
@@ -391,7 +532,7 @@ impl DshEngine {
                 s.model = Some(model.to_string());
             }
         }
-        let _ = self.store.append(session_id, &ev);
+        if let Err(e) = self.store.append(session_id, &ev) { log::warn!("persist failed: {e:#}"); }
         info!("session {session_id} model -> {model}");
     }
 
@@ -417,7 +558,7 @@ impl DshEngine {
                 s.effort = Some(effort.to_string());
             }
         }
-        let _ = self.store.append(session_id, &ev);
+        if let Err(e) = self.store.append(session_id, &ev) { log::warn!("persist failed: {e:#}"); }
         info!("session {session_id} effort -> {effort}");
     }
 
@@ -526,6 +667,8 @@ impl DshEngine {
     ) -> Result<String> {
         let cwd = cwd.or_else(|| self.workspace_root.clone());
         let id = format!("s-{}", uuid());
+        // 新会话 id 唯一,但防御性清墓碑(未来 id 复用场景)
+        self.store.clear_tombstone(&id);
         let mut session = Session::new(id.clone());
         session.cwd = cwd;
         // 创建时的 cwd 持久化（session/cwd 事件，重启重放恢复独立工作区）
@@ -535,7 +678,7 @@ impl DshEngine {
                 Some(json!({"cwd": c.to_string_lossy().into_owned()})),
             );
             session.push_event(cev.clone());
-            let _ = self.store.append(&id, &cev);
+            if let Err(e) = self.store.append(&id, &cev) { log::warn!("persist failed: {e:#}"); }
         }
         session.preset = preset;
         // preset 持久化事件（重放恢复模式）
@@ -563,6 +706,31 @@ impl DshEngine {
 
     /// 打开会话（优先读共享内存，其次存储重放）。
     /// 打开会话（优先读共享内存——agent 线程写入最新状态，其次引擎缓存，最后存储重放）。
+    /// 从事件重放 feedback（重启后 👍/👎 状态恢复；历史缺陷：事件落盘
+    /// 但 registry 纯内存，重启全丢）。
+    fn replay_feedback(&self, session_id: &str) {
+        for ev in self.store.load_events(session_id) {
+            if ev.r#type != types::FEEDBACK_RECORD {
+                continue;
+            }
+            let Some(d) = &ev.data else { continue };
+            let (Some(mid), Some(kind)) = (
+                d.get("messageId").and_then(|v| v.as_str()),
+                d.get("kind").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let k = match kind {
+                "upvote" => crate::engine::FeedbackKind::Upvote,
+                _ => crate::engine::FeedbackKind::Downvote,
+            };
+            self.feedback
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .record(mid, k);
+        }
+    }
+
     pub fn open_session(&mut self, session_id: &str) -> Result<Session> {
         // 1) 共享内存（agent 线程结束时会写入完整消息 + running=false，最新）
         //    但 shared 里可能是 create 时的空版本（仅 preset/title 事件、无消息）
@@ -601,7 +769,10 @@ impl DshEngine {
                 return Ok(s);
             }
         }
-        // 3) 存储重放
+        // 3) 存储重放（feedback registry 冷启动恢复一次）
+        if self.feedback.lock().unwrap_or_else(|p| p.into_inner()).count() == 0 {
+            self.replay_feedback(session_id);
+        }
         let s = self.store.load_session(session_id)?;
         self.sessions.insert(session_id.to_string(), s.clone());
         self.sessions_shared
@@ -616,6 +787,13 @@ impl DshEngine {
     /// 注意：不覆盖已打开会话的 cwd——每个会话有自己独立的工作区
     /// （见 set_session_workspace）。
     pub fn set_workspace(&mut self, path: &Path) -> Result<String, String> {
+    // 切换工作区/沙箱后旧的 AlwaysAllow 全部失效（历史缺陷：旧工作区
+    // 放行过的区外路径在新工作区语境下变成无审批直通）
+    self.approvals
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear_allowances();
+
         let ws = self.workspaces.open(path)?;
         self.tools.cwd = ws.root.clone();
         self.workspace_root = Some(ws.root.clone());
@@ -832,6 +1010,35 @@ impl DshEngine {
         self.plugins.lock().unwrap().discover();
     }
 
+    /// 删除本地子进程插件：停止进程 → 删除 $DSH_HOME/plugins/<name> 目录
+    /// → 重新发现。名称按 kebab-case 白名单校验（只允许小写字母/数字/连
+    /// 字符——天然排除路径穿越）；canonical 前缀校验确保删除目标就在
+    /// 插件根之下。
+    pub fn remove_plugin(&self, name: &str) -> Result<(), String> {
+        if !crate::engine::skill::is_skill_name(name) {
+            return Err(format!("插件名非法: {name}"));
+        }
+        let mut mgr = self.plugins.lock().unwrap();
+        if let Some(p) = mgr.get_mut(name) {
+            p.stop();
+        }
+        let root = mgr.ensure_dir();
+        let dir = root.join(name);
+        if !dir.is_dir() {
+            return Err(format!("插件目录不存在: {}", dir.display()));
+        }
+        let dir_c = dir.canonicalize().map_err(|e| format!("{e}"))?;
+        let root_c = root.canonicalize().map_err(|e| format!("{e}"))?;
+        if !dir_c.starts_with(&root_c) {
+            return Err(format!("拒绝删除插件根之外的路径: {}", dir.display()));
+        }
+        mgr.remove(name);
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("删除失败: {e}"))?;
+        mgr.discover();
+        info!("plugin removed: {name}");
+        Ok(())
+    }
+
     /// 每帧泵：处理插件输出 / 响应 / 退出检测（app 每帧调用）。
     pub fn plugin_pump(&self) {
         self.plugins.lock().unwrap().pump();
@@ -976,12 +1183,17 @@ impl DshEngine {
 
     /// 排队一条消息（不打断当前回合；回合结束后由 pump_message_queue 逐条发出）。
     /// 返回排队位置（1 = 下一条）。
-    pub fn enqueue_message(&mut self, session_id: &str, content: &str) -> usize {
+    pub fn enqueue_message(
+        &mut self,
+        session_id: &str,
+        content: &str,
+        images: Vec<String>,
+    ) -> usize {
         let q = self
             .queued_messages
             .entry(session_id.to_string())
             .or_default();
-        q.push_back(content.to_string());
+        q.push_back((content.to_string(), images));
         let pos = q.len();
         info!("message queued for {session_id} (position {pos})");
         pos
@@ -1004,7 +1216,10 @@ impl DshEngine {
     /// 取队首自动发起回合（FIFO 逐条执行）。发送失败的消息丢弃并记日志
     /// （保留会卡死队列；失败原因已通过 Error 事件可见）。
     pub fn pump_message_queue(&mut self) {
-        let ready: Vec<(String, String)> = {
+        // 重试计数持久化在字段(历史缺陷:局部 map 每次调用重建 → 计数
+        // 恒 1,上限无效,持久失败时 pop→fail→push_front 帧循环无限抖动)
+        self.queue_retries.retain(|_, c| *c > 0);
+        let ready: Vec<(String, (String, Vec<String>))> = {
             let shared = lock_shared(&self.sessions_shared);
             self.queued_messages
                 .iter()
@@ -1015,26 +1230,61 @@ impl DshEngine {
                 })
                 .collect()
         };
-        for (sid, msg) in ready {
+        for (sid, (msg, images)) in ready {
             if let Some(q) = self.queued_messages.get_mut(&sid) {
                 q.pop_front();
                 if q.is_empty() {
                     self.queued_messages.remove(&sid);
                 }
             }
-            if let Err(e) = self.send_message(&sid, &msg) {
-                warn!("queued message dropped ({sid}): {e:#}");
+            if let Err(e) = self.send_message_with_images(&sid, &msg, images.clone()) {
+                // 失败重入队首（历史缺陷：弹出后失败即静默丢弃消息文本）。
+                // 重试计数挂在消息上（第 3 元素），超过 2 次才真正丢弃。
+                warn!("queued message send failed, re-queueing ({sid}): {e:#}");
+                let attempts = self
+                    .queue_retries
+                    .entry((sid.clone(), msg.clone()))
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                if *attempts <= 2 {
+                    self.queued_messages
+                        .entry(sid.clone())
+                        .or_default()
+                        .push_front((msg, images));
+                } else {
+                    warn!("queued message dropped after retries ({sid})");
+                }
+            } else {
+                // send 成功 → 清计数（历史缺陷:remove 在 send 之前,失败
+                // 后 or_insert(1) 重建 → 计数恒 1,上限永不可达）
+                self.queue_retries.remove(&(sid, msg));
             }
         }
     }
 
     /// 用户发送消息 → 异步 agent 回合。
     pub fn send_message(&mut self, session_id: &str, content: &str) -> Result<()> {
-        log::debug!("send_message called for {session_id}: {content}");
+        self.send_message_with_images(session_id, content, Vec::new())
+    }
+
+    /// 发送消息（可附图片路径：vision 模型多模态；非 vision 模型由
+    /// to_llm_messages 侧按 data URI 编码，API 不支持时服务端忽略）。
+    pub fn send_message_with_images(
+        &mut self,
+        session_id: &str,
+        content: &str,
+        images: Vec<String>,
+    ) -> Result<()> {
+        log::debug!(
+            "send_message called for {session_id} ({} chars)",
+            content.chars().count()
+        );
         // 0) 先校验 API key：无 key 时报错且不改任何会话状态
-        let llm = self.llm.clone().ok_or_else(|| {
-            anyhow::anyhow!("API key 未配置：请在设置页填写 DeepSeek API key 后重试")
-        })?;
+        // API key 存在性校验（无 key 不进入回合；实际客户端在下方按会话级
+        // 模型/effort 覆盖构建，历史缺陷：全局 llm 直接透传，会话级设置无效）
+        if self.llm.is_none() {
+            anyhow::bail!("API key 未配置：请在设置页填写 DeepSeek API key 后重试");
+        }
         // 1) 从共享内存同步最新状态（上一回合结束后的 running=false + 完整消息）
         if let Err(e) = self.open_session(session_id) {
             log::warn!("send_message: open_session({session_id}) 失败: {e:#}");
@@ -1047,34 +1297,82 @@ impl DshEngine {
             shared.get(session_id).map(|s| s.running).unwrap_or(false)
         };
         if is_running {
-            // 回合运行中 → 插话：消息立即入列并打断当前 step，
-            // 旧回合在下一轮自动继续处理插话（run_turn 续跑逻辑）
-            log::info!("send_message: session {session_id} running -> interject");
-            return self.interject(session_id, content);
+            // 回合运行中 → 插话。二次复查消除孤儿窗口（历史缺陷:读
+            // running=true 后 TurnGuard 恰好收尾置 false → cancelled 置
+            // 在已死信号上,消息落盘但永远无人回答）:
+            // 若此刻已 false,走下方新回合路径重新发起。
+            let still_running = lock_shared(&self.sessions_shared)
+                .get(session_id)
+                .map(|s| s.running)
+                .unwrap_or(false);
+            if still_running {
+                log::info!(
+                    "send_message: session {session_id} running -> interject"
+                );
+                return self.interject(session_id, content, images.clone());
+            }
+            log::info!(
+                "send_message: session {session_id} race resolved -> new turn"
+            );
         }
         // 3) 新回合信号（整体替换：旧回合持有旧 Arc，新取消/停止不影响旧回合收尾）
         let signal = Arc::new(TurnSignal::default());
         self.turn_signals
             .insert(session_id.to_string(), signal.clone());
         // 先 clone 需要的快照，避免与持久化 borrow 冲突
-        let (epoch, snapshot, session_cwd, session_preset, _sess_sb, _sess_model, _sess_effort) = {
+        let (epoch, snapshot, session_cwd, session_preset, sess_sb, sess_model, sess_effort) = {
             let session = self
                 .sessions
                 .get_mut(session_id)
                 .ok_or_else(|| anyhow::anyhow!("session not open: {session_id}"))?;
-            if session.running {
-                log::info!("send_message: session {session_id} running (local) -> interject");
-                return self.interject(session_id, content);
+            // running 判定只信 shared（唯一由回合线程 TurnGuard 收尾的地方）。
+            // 历史缺陷：此处读本地缓存副本，open_session 克隆与回合一瞬收尾的
+            // 窗口里副本陈旧为 true → 已结束回合被误判插话，消息永不回答。
+            {
+                let shared_running = lock_shared(&self.sessions_shared)
+                    .get(session_id)
+                    .map(|s| s.running)
+                    .unwrap_or(false);
+                if shared_running {
+                    log::info!(
+                        "send_message: session {session_id} running (shared) -> interject"
+                    );
+                    return self.interject(session_id, content, images.clone());
+                }
             }
             session.running = true;
             session.turn_epoch += 1;
 
-            // user/message 事件
-            let ev = SessionEvent::new(types::USER_MESSAGE, Some(json!({"content": content})));
+            // user/message 事件（图片路径随消息持久化：JSONL 只存路径）
+            let mut payload = json!({"content": content});
+            if !images.is_empty() {
+                payload["images"] = json!(images);
+            }
+            let ev = SessionEvent::new(types::USER_MESSAGE, Some(payload));
             session.push_event(ev.clone());
             session.messages.push(Message::User {
                 content: content.to_string(),
+                images: if images.is_empty() { None } else { Some(images.clone()) },
             });
+            // 首条消息自动命名（标题为空时）：提炼首行 24 字符并持久化，
+            // 会话列表立即显示有意义的名字（此前只靠 summary 回退，重启
+            // 前列表内存态标题不更新）。用户手动重命名后 title 非空，不再覆盖。
+            if session.title.trim().is_empty() {
+                let auto = crate::core::session::title_from_message(content);
+                if !auto.is_empty() {
+                    let tev = SessionEvent::new(
+                        types::SESSION_TITLE,
+                        Some(json!({"title": auto, "auto": true})),
+                    );
+                    session.title = auto.clone();
+                    session.push_event(tev.clone());
+                    if let Err(e) = self.store.append(session_id, &tev) { log::warn!("persist failed: {e:#}"); }
+                    let _ = self.tx.send(EngineEvent::Event {
+                        session_id: session_id.to_string(),
+                        event: tev,
+                    });
+                }
+            }
             // 同步到共享 map（agent 线程与桥都读它）
             {
                 let mut shared = lock_shared(&self.sessions_shared);
@@ -1082,6 +1380,7 @@ impl DshEngine {
                     s.running = true;
                     s.turn_epoch = session.turn_epoch;
                     s.messages = session.messages.clone();
+                    s.title = session.title.clone();
                 }
             }
             let _ = self.tx.send(EngineEvent::Event {
@@ -1104,10 +1403,16 @@ impl DshEngine {
                 session_effort,
             )
         };
-        // 失败必须回滚 running（否则会话永久卡 Running，后续全部变成插话）
+        // 失败必须回滚 running（否则会话永久卡 Running，后续全部变成插话）。
+        // 落盘事件与上方内存事件同构（含 images——历史 bug：裸事件丢图，
+        // 回合结束 TurnGuard 从 store 重载后图片引用消失）。
+        let mut persist_payload = json!({"content": content});
+        if !images.is_empty() {
+            persist_payload["images"] = json!(images);
+        }
         if let Err(e) = self.persist(
             session_id,
-            &SessionEvent::new(types::USER_MESSAGE, Some(json!({"content": content}))),
+            &SessionEvent::new(types::USER_MESSAGE, Some(persist_payload)),
         ) {
             log::warn!("send_message: persist 失败: {e:#}");
             self.rollback_turn_start(session_id, epoch);
@@ -1126,17 +1431,52 @@ impl DshEngine {
         let tx = self.tx.clone();
         let session_id = session_id.to_string();
         let store = self.store.clone_handle();
-        let tools = {
-            // 快照注入技能（load_skill 工具 + persona 技能列表用）
-            let mut t = self.tools.clone_handle();
-            t.skills = self.skills.list().into_iter().cloned().collect();
-            t
-        };
-        let model = self
+        let global_model = self
             .llm
             .as_ref()
             .map(|l| l.model().to_string())
             .unwrap_or_default();
+        // 会话级模型/思考深度生效（历史缺陷：快照后被弃用，UI 切换会话级
+        // 设置对实际回合零影响）。覆盖项与全局不同 → 构建会话专用 LLM 客户端。
+        let llm = if self.llm.is_some()
+            && (sess_model.as_deref().is_some_and(|m| m != global_model)
+                || sess_effort.is_some())
+        {
+            let key = self.settings.api_key.clone().unwrap_or_default();
+            LlmClient::new(
+                self.settings.base_url.clone(),
+                key,
+                sess_model.clone().unwrap_or(global_model.clone()),
+                sess_effort.clone().or_else(|| self.settings.reasoning_effort.clone()),
+                self.settings.http_proxy.clone(),
+            )
+            .map(Arc::new)
+            .unwrap_or_else(|e| {
+                log::warn!("session llm build failed, fallback global: {e:#}");
+                self.llm.clone().expect("checked above")
+            })
+        } else {
+            self.llm.clone().expect("checked at entry")
+        };
+        let model = llm.model().to_string();
+        let tools = {
+            // 快照注入技能（load_skill 工具 + persona 技能列表用）；
+            // 会话级沙箱覆盖（会话 read-only/write → 受限工具集，此前死代码）
+            let mut t = self.tools.clone_handle();
+            t.skills = self.skills.list().into_iter().cloned().collect();
+            if let Some(sb) = sess_sb
+                .as_deref()
+                .and_then(crate::exec::SandboxMode::parse)
+            {
+                let ws = self.workspace_root.clone().unwrap_or_default();
+                t = t.with_sandbox(if matches!(sb, crate::exec::SandboxMode::DangerFullAccess) {
+                    None
+                } else {
+                    Some(crate::exec::acl::WindowsAclSandbox::new(sb, ws))
+                });
+            }
+            t
+        };
         let sessions_shared = self.sessions_shared.clone();
         let cwd = session_cwd;
         let preset = session_preset;
@@ -1163,6 +1503,9 @@ impl DshEngine {
         let subagents = self.subagents.clone();
         let plugins = self.plugins.clone();
         let approvals = self.approvals.clone();
+        let token_usage = self.token_usage.clone();
+        let usage_dirty = self.usage_dirty.clone();
+        let lessons_store = self.lessons.clone();
         // spawn 失败处理路径用的克隆（闭包按 move 捕获原值）
         let err_session_id = session_id.clone();
         let err_jobs = jobs.clone();
@@ -1215,6 +1558,9 @@ impl DshEngine {
                         &subagents,
                         &plugins,
                         &approvals,
+                        &token_usage,
+                        &usage_dirty,
+                        &lessons_store,
                     )),
                     Err(rt_err) => Err(rt_err.into()),
                 };
@@ -1270,6 +1616,464 @@ impl DshEngine {
 
     /// 重命名会话：追加 session/title 事件（持久化，重启重放恢复标题），
     /// 同步更新引擎缓存与共享 map。空标题忽略。
+    /// 分叉会话：复制当前全部消息（含工具调用配对）到新会话——
+    /// 探索性改动的"安全副本"（原会话不动，在新分支继续）。
+    /// 标题 = "⑂ 原标题"；预设与工作区继承。
+    pub fn fork_session(&mut self, session_id: &str) -> Result<String> {
+        let (title, preset, cwd, messages, sess_sb, sess_model, sess_effort) = {
+            let local = self.sessions.get(session_id);
+            let snapshot = match local {
+                Some(s) => (
+                    s.title.clone(),
+                    s.preset,
+                    s.cwd.clone(),
+                    s.messages.clone(),
+                    s.sandbox_mode.clone(),
+                    s.model.clone(),
+                    s.effort.clone(),
+                ),
+                None => {
+                    let shared = lock_shared(&self.sessions_shared);
+                    let s = shared
+                        .get(session_id)
+                        .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+                    (
+                        s.title.clone(),
+                        s.preset,
+                        s.cwd.clone(),
+                        s.messages.clone(),
+                        s.sandbox_mode.clone(),
+                        s.model.clone(),
+                        s.effort.clone(),
+                    )
+                }
+            };
+            snapshot
+        };
+        let new_id = self.create_session_full(None, cwd, preset)?;
+        // 复制会话级覆盖并落盘（历史缺陷:只改内存不落盘 → 重启后
+        // fork 会话静默回落全局设置）
+        if let Some(sb) = sess_sb.as_deref().and_then(crate::exec::SandboxMode::parse) {
+            let _ = self.set_session_sandbox(&new_id, sb);
+        }
+        if let Some(m) = sess_model.as_deref().filter(|m| !m.is_empty()) {
+            let _ = self.set_session_model(&new_id, m);
+        }
+        if let Some(e) = sess_effort.as_deref().filter(|e| !e.is_empty()) {
+            let _ = self.set_session_effort(&new_id, e);
+        }
+        // 消息 → 事件复制（tool/result 需先有 tool/call 声明，重放才能配对）
+        let mut calls: HashMap<String, (String, String)> = HashMap::new();
+        for m in &messages {
+            match m {
+                Message::User { content, images } => {
+                    let mut payload = json!({"content": content});
+                    if let Some(imgs) = images {
+                        payload["images"] = json!(imgs);
+                    }
+                    self.fork_append(&new_id, types::USER_MESSAGE, payload, Some(m.clone()))?;
+                }
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                    reasoning,
+                } => {
+                    for tc in tool_calls {
+                        calls.insert(
+                            tc.id.clone(),
+                            (tc.function.name.clone(), tc.function.arguments.clone()),
+                        );
+                    }
+                    self.fork_append(
+                        &new_id,
+                        types::ASSISTANT_MESSAGE,
+                        json!({
+                            "content": content,
+                            "reasoning_content": reasoning.clone().unwrap_or_default(),
+                            "tool_calls": tool_calls,
+                        }),
+                        Some(m.clone()),
+                    )?;
+                }
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                } => {
+                    if let Some((name, args)) = calls.get(tool_call_id) {
+                        self.fork_append(
+                            &new_id,
+                            types::TOOL_CALL,
+                            json!({"call_id": tool_call_id, "name": name, "arguments": args}),
+                            None,
+                        )?;
+                    }
+                    self.fork_append(
+                        &new_id,
+                        types::TOOL_RESULT,
+                        json!({"call_id": tool_call_id, "value": content}),
+                        Some(m.clone()),
+                    )?;
+                }
+            }
+        }
+        // 标题：原标题或首条消息提炼，加分支前缀
+        let base = if title.trim().is_empty() {
+            messages
+                .iter()
+                .find_map(|m| match m {
+                    Message::User { content, .. } => {
+                        Some(crate::core::session::title_from_message(content))
+                    }
+                    _ => None,
+                })
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "会话".into())
+        } else {
+            title
+        };
+        self.rename_session(&new_id, &format!("⑂ {base}"))?;
+        info!("forked session {session_id} -> {new_id} ({} messages)", messages.len());
+        Ok(new_id)
+    }
+
+    /// fork 事件落地：store 持久化 + 引擎缓存/共享 map 同步 + 事件流出。
+    fn fork_append(
+        &mut self,
+        session_id: &str,
+        ty: &str,
+        data: serde_json::Value,
+        msg: Option<Message>,
+    ) -> Result<()> {
+        let ev = SessionEvent::new(ty, Some(data));
+        self.store.append(session_id, &ev)?;
+        if let Some(s) = self.sessions.get_mut(session_id) {
+            s.push_event(ev.clone());
+            if let Some(m) = &msg {
+                s.messages.push(m.clone());
+            }
+        }
+        {
+            let mut shared = lock_shared(&self.sessions_shared);
+            if let Some(s) = shared.get_mut(session_id) {
+                if let Some(m) = &msg {
+                    s.messages.push(m.clone());
+                }
+            }
+        }
+        let _ = self.tx.send(EngineEvent::Event {
+            session_id: session_id.to_string(),
+            event: ev,
+        });
+        Ok(())
+    }
+
+    /// 记录消息反馈（👍/👎）：registry 更新 + feedback/record 事件持久化。
+    pub fn record_message_feedback(
+        &mut self,
+        session_id: &str,
+        message_id: &str,
+        kind: crate::engine::FeedbackKind,
+    ) -> Result<()> {
+        {
+            let mut fb = self
+                .feedback
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            fb.record(message_id, kind);
+        }
+        let ev = crate::engine::FeedbackStore::record_event(message_id, kind);
+        self.store.append(session_id, &ev)?;
+        let _ = self.tx.send(EngineEvent::Event {
+            session_id: session_id.to_string(),
+            event: ev,
+        });
+        Ok(())
+    }
+
+    /// 跨会话全文搜索：标题/ID/消息内容不区分大小写匹配，
+    /// 返回 (会话摘要, 首个命中片段)。片段取命中点前后各 ~30 字符。
+    /// 注意：每次调用从磁盘重放全部会话——侧栏逐键调用时可接受
+    /// （会话数几十级别、JSONL 小），大量会话时需加缓存。
+    pub fn search_sessions(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Vec<(crate::core::session::SessionSummary, String)> {
+        let q = query.to_lowercase();
+        if q.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for summary in self.list_sessions() {
+            if out.len() >= limit {
+                break;
+            }
+            // 标题/ID 命中：无片段
+            if summary.title.to_lowercase().contains(&q)
+                || summary.session_id.to_lowercase().contains(&q)
+            {
+                out.push((summary, String::new()));
+                continue;
+            }
+            // 内容命中：取首个命中片段
+            let session = self.store.load_session(&summary.session_id);
+            if let Ok(sess) = session {
+                for m in &sess.messages {
+                    let content = match m {
+                        Message::User { content, .. } => content,
+                        Message::Assistant { content, .. } => content,
+                        Message::Tool { .. } => continue,
+                    };
+                    if let Some(pos) = content.to_lowercase().find(&q) {
+                        let chars: Vec<char> = content.chars().collect();
+                        let pos_c = content[..pos].chars().count();
+                        let lo = pos_c.saturating_sub(30);
+                        let hi = (pos_c + q.chars().count() + 30).min(chars.len());
+                        let mut snip: String = chars[lo..hi].iter().collect();
+                        if lo > 0 {
+                            snip.insert(0, '…');
+                        }
+                        if hi < chars.len() {
+                            snip.push('…');
+                        }
+                        out.push((summary, snip.replace('\n', " ")));
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 本地时间 "YYYY-MM-DD HH:MM"（无 chrono 依赖的天数换算）。
+    fn export_timestamp() -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        // UTC+8（用户时区为东八区；导出时间戳仅作参考）
+        let local = secs + 8 * 3600;
+        let days = local.div_euclid(86400);
+        let tod = local.rem_euclid(86400);
+        // 1970-01-01 起的 civil 日历换算（Howard Hinnant 算法）
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", tod / 3600, tod % 3600 / 60)
+    }
+
+    /// 会话导出为 Markdown（用户/AI 消息完整保留，工具调用与结果以
+    /// 代码块附录，思考过程折叠于 details——可直接归档/分享）。
+    pub fn export_session_markdown(&self, session_id: &str) -> Result<String> {
+        let sess = self
+            .store
+            .load_session(session_id)
+            .map_err(|e| anyhow::anyhow!("load session failed: {e:#}"))?;
+        let title = if sess.title.is_empty() {
+            "未命名会话".to_string()
+        } else {
+            sess.title.clone()
+        };
+        let mut out = format!(
+            "# {title}
+
+> 会话 `{}` · {} 条消息 · 导出于 {}
+
+---
+
+",
+            sess.id,
+            sess.messages.len(),
+            Self::export_timestamp(),
+        );
+        for m in &sess.messages {
+            match m {
+                Message::User { content, .. } => {
+                    out.push_str(&format!("## 🧑 用户
+
+{content}
+
+"));
+                }
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                    reasoning,
+                } => {
+                    if let Some(r) = reasoning.as_ref().filter(|r| !r.trim().is_empty()) {
+                        out.push_str(&format!(
+                            "<details><summary>💭 思考过程</summary>
+
+{}
+
+</details>
+
+",
+                            r
+                        ));
+                    }
+                    if !content.trim().is_empty() {
+                        out.push_str(&format!("## 🤖 助手
+
+{content}
+
+"));
+                    }
+                    for tc in tool_calls {
+                        out.push_str(&format!(
+                            "**🔧 {}**
+
+```json
+{}
+```
+
+",
+                            tc.function.name, tc.function.arguments
+                        ));
+                    }
+                }
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                } => {
+                    out.push_str(&format!(
+                        "<details><summary>📎 工具结果（{tool_call_id}）</summary>
+
+```json
+{}
+```
+
+</details>
+
+",
+                        {
+                            let t: String = content.chars().take(2000).collect();
+                            t
+                        }
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 新增定时任务：到期把 prompt 发送到绑定会话（发起 AI 回合）。
+    /// 持久化到 settings（重启恢复）。返回任务 id。
+    pub fn schedule_add(
+        &mut self,
+        name: &str,
+        prompt: &str,
+        interval_secs: u64,
+        session_id: &str,
+    ) -> String {
+        let id = format!("sc-{}", uuid());
+        {
+            let mut s = self
+                .scheduler
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            s.add(&id, name, interval_secs, prompt, session_id);
+        }
+        self.persist_scheduled();
+        info!("scheduled task added: {id} ({name}) every {interval_secs}s -> {session_id}");
+        id
+    }
+
+    /// 删除定时任务（同步持久化）。
+    pub fn schedule_remove(&mut self, id: &str) {
+        self.scheduler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(id);
+        self.persist_scheduled();
+    }
+
+    /// 启停定时任务（同步持久化）。
+    pub fn schedule_toggle(&mut self, id: &str, enabled: bool) {
+        self.scheduler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .toggle(id, enabled);
+        self.persist_scheduled();
+    }
+
+    /// 定时任务快照（UI 列表）。
+    pub fn schedule_list(&self) -> Vec<crate::engine::schedule::ScheduledTask> {
+        self.scheduler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .list()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// 到期任务触发：把 prompt 发到绑定会话（由 UI 事件泵调用——
+    /// 调度线程没有引擎访问权）。会话已删除则移除任务。
+    pub fn fire_scheduled(&mut self, id: &str) {
+        let task = {
+            let s = self
+                .scheduler
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            s.list().into_iter().find(|t| t.id == id).cloned()
+        };
+        let Some(t) = task else { return };
+        // 存活判定查 store（磁盘事实）而非内存 map——重启后仅首个会话被
+        // 打开，内存不含其余会话，按内存判会把合法定时任务误删（历史 bug）。
+        let alive = self.store.list_sessions().iter().any(|sid| sid == &t.session_id);
+        if !alive {
+            info!("scheduled task {id}: session {} gone, removing", t.session_id);
+            self.schedule_remove(id);
+            return;
+        }
+        info!("scheduled task {id} firing -> session {}", t.session_id);
+        if let Err(e) = self.send_message(&t.session_id, &t.prompt) {
+            log::warn!("scheduled send failed for {id}: {e:#}");
+        }
+    }
+
+    /// 调度器 → settings 持久化。
+    fn persist_scheduled(&mut self) {
+        let tasks: Vec<_> = {
+            let s = self
+                .scheduler
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            s.list()
+                .into_iter()
+                .map(|t| crate::core::settings::StoredScheduledTask {
+                    id: t.id.clone(),
+                    name: t.name.clone(),
+                    interval_secs: t.interval_secs,
+                    prompt: t.prompt.clone(),
+                    session_id: t.session_id.clone(),
+                    enabled: t.enabled,
+                })
+                .collect()
+        };
+        self.settings.scheduled_tasks = tasks;
+        let _ = self.settings.save();
+    }
+
+    /// 查询消息反馈（UI 高亮当前态）。
+    pub fn message_feedback(
+        &self,
+        message_id: &str,
+    ) -> Option<crate::engine::FeedbackKind> {
+        self.feedback
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(message_id)
+    }
+
     pub fn rename_session(&mut self, session_id: &str, new_title: &str) -> Result<()> {
         let title = new_title.trim();
         if title.is_empty() {
@@ -1323,6 +2127,20 @@ impl DshEngine {
         self.turn_signals.remove(session_id);
         self.turn_locks.lock().unwrap().remove(session_id);
         self.queued_messages.remove(session_id);
+        // 清用量记账并置脏（历史缺陷:不清理 → settings 无限膨胀;
+        // 只清 map 不置脏 → settings 里残留死条目直到下次 LLM 调用）
+        self.token_usage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(session_id);
+        self.usage_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // 清除该会话全部挂起审批（历史安全缺陷：悬卡点允许会唤醒已删
+        // 会话的旧回合执行真实文件写入；点 AlwaysAllow 还污染全局放行表）
+        self.approvals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cancel_session(session_id);
         info!("deleted session {session_id}");
         Ok(())
     }
@@ -1395,8 +2213,18 @@ impl DshEngine {
     /// 同时置取消标志打断当前 step。运行中的回合在下一轮检测到
     /// "store 中有比初始快照更新的用户消息"后自动续跑处理插话
     /// （见 run_turn_inner 的 cancelled 分支），无需等待回合结束。
-    fn interject(&mut self, session_id: &str, content: &str) -> Result<()> {
-        let ev = SessionEvent::new(types::USER_MESSAGE, Some(json!({"content": content})));
+    fn interject(
+        &mut self,
+        session_id: &str,
+        content: &str,
+        images: Vec<String>,
+    ) -> Result<()> {
+        // 插话同样携带图片（vision 多模态）：事件与消息都带 images
+        let mut payload = json!({"content": content});
+        if !images.is_empty() {
+            payload["images"] = json!(images);
+        }
+        let ev = SessionEvent::new(types::USER_MESSAGE, Some(payload));
         {
             let session = self
                 .sessions
@@ -1405,6 +2233,7 @@ impl DshEngine {
             session.push_event(ev.clone());
             session.messages.push(Message::User {
                 content: content.to_string(),
+                images: if images.is_empty() { None } else { Some(images) },
             });
         }
         {
@@ -1417,7 +2246,20 @@ impl DshEngine {
                     .unwrap_or_default();
             }
         }
-        self.store.append(session_id, &ev)?;
+        if let Err(e) = self.store.append(session_id, &ev) {
+            // 回滚内存（历史缺陷：persist 失败不回滚，内存里留下
+            // store 没有的消息，TurnGuard 重载后被静默抹掉）
+            if let Some(s) = self.sessions.get_mut(session_id) {
+                s.messages.pop();
+                s.events.pop();
+            }
+            lock_shared(&self.sessions_shared)
+                .get_mut(session_id)
+                .map(|s| {
+                    s.messages.pop();
+                });
+            return Err(anyhow::anyhow!("插话消息持久化失败：{e:#}"));
+        }
         let _ = self.tx.send(EngineEvent::Event {
             session_id: session_id.to_string(),
             event: ev,
@@ -1454,7 +2296,14 @@ impl ToolRegistry {
 
 impl SessionStore {
     fn clone_handle(&self) -> SessionStore {
-        SessionStore::new(self.dir.clone()).unwrap()
+        // 直接构造（不走 SessionStore::new 的 create_dir_all——目录已存在，
+        // 且失败时 unwrap 会毒化持引擎锁的 UI 线程）。墓碑必须 Arc 共享：
+        // 回合线程的副本必须看到引擎实例的删除记录，否则 TOCTOU 复活
+        // 防护对真正要防的路径（回合线程 append）无效。
+        SessionStore {
+            dir: self.dir.clone(),
+            tombstones: std::sync::Arc::clone(&self.tombstones),
+        }
     }
 }
 
@@ -1464,13 +2313,16 @@ enum ApprovalOutcome {
     Denied { note: String },
 }
 
-/// 走一轮权限审批：登记请求 → 发 UI 事件 → await 用户决定（超时默认拒绝）。
-async fn run_approval(
+/// 可中止审批：登记请求 → 发 UI 事件 → await 用户决定（300s 超时默认拒绝；
+/// 审批：监听停止信号（历史缺陷：await 只有 300s 超时，用户点停止后
+/// 再点"允许"，被批准的写工具仍会执行——stop 穿透）。signal 触发即拒。
+async fn run_approval_cancellable(
     tx: &Sender<EngineEvent>,
     approvals: &Arc<std::sync::Mutex<crate::engine::approval::ApprovalRegistry>>,
     target: String,
     reason: String,
     session_id: &str,
+    signal: Option<&Arc<TurnSignal>>,
 ) -> anyhow::Result<ApprovalOutcome> {
     let id = uuid();
     let rx = {
@@ -1488,20 +2340,34 @@ async fn run_approval(
         target: target.clone(),
         reason: reason.clone(),
     });
-    let awaited = tokio::time::timeout(std::time::Duration::from_secs(300), rx).await;
-    let decision = match awaited {
-        Ok(Ok(d)) => d,
-        Ok(Err(_)) => {
+    // 停止信号轮询（10Hz）+ 300s 超时 + 用户决定 三路竞争
+    let started = std::time::Instant::now();
+    let mut rx = rx;
+    let decision = loop {
+        if signal
+            .as_ref()
+            .is_some_and(|sg| TurnSignal::is_set(&sg.stopping))
+        {
             approvals.lock().unwrap().cancel(&id);
             return Ok(ApprovalOutcome::Denied {
-                note: "审批通道已关闭（未收到用户决定）".into(),
+                note: "回合已停止，审批作废".into(),
             });
         }
-        Err(_) => {
+        if started.elapsed() >= std::time::Duration::from_secs(300) {
             approvals.lock().unwrap().cancel(&id);
             return Ok(ApprovalOutcome::Denied {
                 note: "审批超时（300s 未响应），已拒绝".into(),
             });
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(100), &mut rx).await {
+            Ok(Ok(d)) => break d,
+            Ok(Err(_)) => {
+                approvals.lock().unwrap().cancel(&id);
+                return Ok(ApprovalOutcome::Denied {
+                    note: "审批通道已关闭（未收到用户决定）".into(),
+                });
+            }
+            Err(_) => continue, // 本轮超时 → 复查停止信号
         }
     };
     match decision {
@@ -1582,6 +2448,226 @@ impl Drop for TurnGuard {
     }
 }
 
+/// 读取工作区根的 AGENTS.md（大小写不敏感；找不到/为空返回 None）。
+/// 超 32KB 按字符边界截断（防提示词膨胀，不切坏 UTF-8）。
+pub fn read_agents_md(cwd: &Path) -> Option<String> {
+    const MAX: usize = 32 * 1024;
+    for name in ["AGENTS.md", "agents.md"] {
+        if let Ok(text) = std::fs::read_to_string(cwd.join(name)) {
+            let text = text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            return Some(if text.len() > MAX {
+                let cut = text
+                    .char_indices()
+                    .take_while(|(i, _)| *i <= MAX)
+                    .map(|(i, _)| i)
+                    .last()
+                    .unwrap_or(0);
+                format!("{}
+…（AGENTS.md 过大已截断）", &text[..cut])
+            } else {
+                text.to_string()
+            });
+        }
+    }
+    None
+}
+
+/// persona 注入段截断（提示词膨胀 / prompt-injection 面）。
+fn clamp_block(s: &mut String, label: &str) {
+    const MAX: usize = 4 * 1024;
+    if s.len() > MAX {
+        let cut = s
+            .char_indices()
+            .take_while(|(i, _)| *i <= MAX)
+            .map(|(i, _)| i)
+            .last()
+            .unwrap_or(0);
+        s.truncate(cut);
+        s.push_str(&format!("...(over-long {label} list truncated)"));
+    }
+}
+
+/// 单个 subagent_fork 的完整执行（供 join_all 并发调用）：
+/// spawn(带任务) → running descriptor → 独立 LLM 回合 → 终态 descriptor
+/// （含完整 result，重放/卡片展开可见）→ ToolOutput（回喂主代理）。
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent_fork(
+    call_id: String,
+    args: Value,
+    llm: Arc<LlmClient>,
+    subagents: &Arc<std::sync::Mutex<SubagentManager>>,
+    jobs: &Arc<std::sync::Mutex<JobManager>>,
+    store: &SessionStore,
+    sessions_shared: &Arc<std::sync::Mutex<HashMap<String, Session>>>,
+    tx: &Sender<EngineEvent>,
+    session_id: &str,
+    preset: AgentPreset,
+    approvals: &Arc<std::sync::Mutex<crate::engine::approval::ApprovalRegistry>>,
+    signal: &Arc<TurnSignal>,
+    token_usage: &Arc<
+        std::sync::Mutex<HashMap<String, crate::core::llm::TokenUsage>>,
+    >,
+    usage_dirty: &Arc<std::sync::atomic::AtomicBool>,
+) -> ToolOutput {
+    let _ = call_id;
+    if let Some(err) = args.get("__args_parse_error") {
+        return ToolOutput::err(format!("subagent_fork: 参数不是合法 JSON: {err}"));
+    }
+    // 预设白名单（当前两模式均含子代理；保留检查供未来扩展）
+    if let Some(wl) = preset.tool_whitelist() {
+        if !wl.contains(&"subagent_fork") {
+            return ToolOutput::err(format!(
+                "subagent_fork 在当前预设（{}）不可用",
+                preset.name()
+            ));
+        }
+    }
+    let desc = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("子代理任务")
+        .to_string();
+    let prompt = args
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if prompt.trim().is_empty() {
+        return ToolOutput::err("subagent_fork: prompt 不能为空");
+    }
+    // 标准模式：子代理派生需审批（每次 fork = 独立 LLM 回合，token 放大器；
+    // "总是允许"可记住决定不再打扰）。自主规划模式：AI 自行决定，免审。
+    if preset.subagent_needs_approval() {
+        let target = format!("subagent:{desc}");
+        let skip = {
+            let reg = approvals.lock().unwrap();
+            reg.should_skip(&target)
+        };
+        if !skip {
+            match run_approval_cancellable(
+                tx,
+                approvals,
+                target.clone(),
+                format!(
+                    "派生子代理「{desc}」执行独立 LLM 回合（消耗额外 token）。
+任务：{}",
+                    prompt.chars().take(200).collect::<String>()
+                ),
+                session_id,
+                Some(signal),
+            )
+            .await
+            {
+                Ok(ApprovalOutcome::Allowed) => {}
+                Ok(ApprovalOutcome::Denied { note }) => {
+                    return ToolOutput::err(format!(
+                        "用户拒绝了子代理派生{note}；请直接在主回合完成任务，或询问用户如何拆分"
+                    ));
+                }
+                Err(e) => {
+                    return ToolOutput::err(format!("子代理审批失败: {e:#}"));
+                }
+            }
+        }
+    }
+    // spawn（带任务全文）
+    let spawn_res = {
+        let mut mgr = subagents.lock().unwrap();
+        mgr.spawn(session_id, 1, 3, &prompt)
+    };
+    let sub_id = match spawn_res {
+        Err(e) => return ToolOutput::err(format!("subagent_fork: {e:#}")),
+        Ok(id) => id,
+    };
+    // 子代理任务（pending → running）
+    let sjid = {
+        let mut jm = jobs.lock().unwrap();
+        let id = jm.create("subagent", Some(format!("{desc}（{sub_id}）")));
+        jm.start(&id);
+        id
+    };
+    subagents
+        .lock()
+        .unwrap()
+        .mark(&sub_id, SubagentStatus::Running);
+    if let Some(d) = subagents.lock().unwrap().get(&sub_id).cloned() {
+        let dev = SubagentManager::descriptor_event(&d);
+        if let Err(e) = append_alive(store, sessions_shared, session_id, &dev) {
+            warn!("subagent descriptor append failed: {e:#}");
+        }
+        let _ = tx.send(EngineEvent::Event {
+            session_id: session_id.to_string(),
+            event: dev,
+        });
+    }
+    // 独立 LLM 回合
+    let sys = format!(
+        "You are a subagent of a coding agent running on DeepSeek          Harness. Your parent session is {session_id}. Complete the          task below and reply with a concise summary of what you did          and the result."
+    );
+    let summary = match crate::engine::subagent::run_subagent_turn_counted(
+        llm, &sys, &prompt, 8,
+    )
+    .await
+    {
+        Ok((text, u)) => {
+            #[allow(clippy::let_unit_value)]
+            let _ = 0;
+            // 子代理用量记账到绑定会话（token 放大器必须可见）
+            {
+                let mut map =
+                    token_usage.lock().unwrap_or_else(|p| p.into_inner());
+                *map.entry(session_id.to_string()).or_default() += u;
+                usage_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(text)
+        }
+        Err(e) => Err(e),
+    };
+    let out = match &summary {
+        Ok(text) => {
+            // 摘要（卡片行/主代理）+ 完整输出（用户展开查看）
+            let brief: String = text.chars().take(200).collect();
+            {
+                let mut mgr = subagents.lock().unwrap();
+                mgr.set_summary(&sub_id, brief);
+                mgr.set_result(&sub_id, text.clone());
+                mgr.mark(&sub_id, SubagentStatus::Done);
+            }
+            jobs.lock().unwrap().finish(&sjid, true, Some(text.clone()));
+            ToolOutput::ok(json!({
+                "subagent_id": sub_id,
+                "summary": text,
+                "note": "子代理已完成，总结如上",
+            }))
+        }
+        Err(e) => {
+            subagents
+                .lock()
+                .unwrap()
+                .mark(&sub_id, SubagentStatus::Failed);
+            jobs.lock()
+                .unwrap()
+                .finish(&sjid, false, Some(format!("{e:#}")));
+            ToolOutput::err(format!("subagent_fork 执行失败: {e:#}"))
+        }
+    };
+    // 终态 descriptor（含 task/result 全文，重放恢复）
+    if let Some(d) = subagents.lock().unwrap().get(&sub_id).cloned() {
+        let dev = SubagentManager::descriptor_event(&d);
+        if let Err(e) = append_alive(store, sessions_shared, session_id, &dev) {
+            warn!("subagent final descriptor append failed: {e:#}");
+        }
+        let _ = tx.send(EngineEvent::Event {
+            session_id: session_id.to_string(),
+            event: dev,
+        });
+    }
+    out
+}
+
 /// 回合主体（LLM 循环 + 工具执行）。
 /// 状态收尾见 send_message 线程体中的 TurnGuard。
 #[allow(clippy::too_many_arguments)]
@@ -1602,8 +2688,18 @@ async fn run_turn_inner(
     subagents: &Arc<std::sync::Mutex<SubagentManager>>,
     plugins: &Arc<std::sync::Mutex<crate::engine::plugin::PluginManager>>,
     approvals: &Arc<std::sync::Mutex<crate::engine::approval::ApprovalRegistry>>,
+    token_usage: &Arc<
+        std::sync::Mutex<HashMap<String, crate::core::llm::TokenUsage>>,
+    >,
+    usage_dirty: &Arc<std::sync::atomic::AtomicBool>,
+    lessons: &Arc<std::sync::Mutex<crate::engine::lessons::LessonStore>>,
 ) -> Result<()> {
     let mut tools = tools;
+    // 教训库分域键：会话工作区（缺省引擎工作目录）
+    let lesson_ws = session_cwd
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| tools.cwd.to_string_lossy().into_owned());
     if let Some(ref cwd) = session_cwd {
         tools = tools.with_cwd(cwd.clone());
     }
@@ -1645,7 +2741,26 @@ async fn run_turn_inner(
         }
         for pt in ptools {
             // 插件工具可**覆盖**内置同名工具（如提供真正的 web_search 实现，
-            // 核心层能力增强）；同名不去重会被 API 拒绝（duplicate tool）
+            // 核心层能力增强）；同名不去重会被 API 拒绝（duplicate tool）。
+            // 沙箱关键名（bash/pwsh/write_file/str_replace_editor/node_called）
+            // 不允许覆盖——插件进程跑在完整令牌下，覆盖即静默绕过受限令牌
+            // 与应用层写门（历史安全缺陷）。插件仍可注册新名工具。
+            const SANDBOX_CRITICAL: &[&str] = &[
+                "bash",
+                "pwsh",
+                "write_file",
+                "str_replace_editor",
+                "node_called",
+                "run_code",
+                "read_file",
+            ];
+            if SANDBOX_CRITICAL.contains(&pt.name.as_str()) {
+                warn!(
+                    "plugin tool '{}' blocked from overriding sandbox-critical built-in",
+                    pt.name
+                );
+                continue;
+            }
             s.retain(|x| x.function.name != pt.name);
             s.push(crate::core::llm::tool_spec(
                 &pt.name,
@@ -1658,6 +2773,8 @@ async fn run_turn_inner(
     // 回合步数：不做上限（用户要求）。循环由工具收敛/取消/插话自然退出；
     // 步数仅用于任务进度显示。
     let mut step = 0;
+    // 本回合是否已压缩过 + 压缩时消息基数（防每 step 重复压缩膨胀事件）
+    let mut compacted_baseline: Option<usize> = None;
 
     'outer: loop {
         // 停止（cancel）：立即退出回合，不续跑。
@@ -1696,19 +2813,29 @@ async fn run_turn_inner(
         let est_chars: usize = messages
             .iter()
             .map(|m| match m {
-                Message::User { content } | Message::Assistant { content, .. } => content.len(),
+                Message::User { content, .. } | Message::Assistant { content, .. } => content.len(),
                 Message::Tool { content, .. } => content.len(),
             })
             .sum();
         const CHAR_LIMIT: usize = 80_000;
+        // 防膨胀：上一 step 已压缩且消息数没再显著增长（阈值*1.5）就不重复压缩。
+        // 历史缺陷：keep_tail 条超长工具结果仍超 CHAR_LIMIT 时，每个 step 都
+        // 追加 3 条压缩事件，JSONL 无界膨胀。
+        let grown_since_compact = messages.len() as f64
+            > compacted_baseline.map(|b| b as f64 * 1.5).unwrap_or(0.0);
         let should_compact = preset.has_compaction()
-            && (messages.len() > COMPACTION_THRESHOLD || est_chars > CHAR_LIMIT);
+            && (messages.len() > COMPACTION_THRESHOLD || est_chars > CHAR_LIMIT)
+            && (compacted_baseline.is_none() || grown_since_compact);
         if should_compact {
             let plan = crate::engine::compaction::plan_compaction(&messages, COMPACTION_KEEP_TAIL);
             if plan.removed > 0 {
+                compacted_baseline = Some(messages.len());
                 for ev in [
                     crate::engine::compaction::compaction_start_event(),
-                    crate::engine::compaction::compaction_summary_event(&plan.summary),
+                    crate::engine::compaction::compaction_summary_event(
+                        &plan.summary,
+                        plan.keep_from,
+                    ),
                     crate::engine::compaction::compaction_end_event(),
                 ] {
                     if let Err(e) = append_alive(&store, sessions_shared, session_id, &ev) {
@@ -1748,13 +2875,48 @@ async fn run_turn_inner(
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|| tools.cwd.to_string_lossy().into_owned());
             let mut persona = preset.persona(model, &cwd_str);
-            // 协作机制引导：告诉 AI 何时自动使用 Goal / Plan / Subagent / Jobs。
+            // AGENTS.md 项目记忆：工作区根的约定文件自动注入系统提示
+            // （项目结构/编码规范/历史教训等，用户与 AI 均可维护——AI 用
+            // write_file 修改走既有审批/沙箱通道）。
+            if let Some(text) =
+                read_agents_md(session_cwd.as_ref().unwrap_or(&tools.cwd))
+            {
+                persona.push_str(&format!(
+                    "
+
+=== AGENTS.md (project instructions from the workspace root) ===
+{text}
+=== end AGENTS.md ===
+"
+                ));
+            }
+            // 工具教训注入：本工作区已失败过的调用 + 已验证修正方案
+            //（模型下回合直接跑修正版，不再原样重试）
+            {
+                let block = lessons
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .prompt_block(&lesson_ws, 6);
+                if let Some(b) = block {
+                    persona.push_str("\n\n");
+                    persona.push_str(&b);
+                }
+            }
+            // 协作机制引导 + 输出风格
             persona.push_str(
-                "\n\nCollaboration mechanisms (use them proactively when appropriate):\n\
-                 - Goals: when the user states a long-term objective to track across turns, call goal_create so it shows on the Goals card.\n\
-                 - Plan: for complex multi-step tasks, write a plan with plan_write (Plan card), then exit_plan_mode when the plan is done and start executing.\n\
-                 - Subagents: split clearly independent subtasks (file analysis, isolated research) into subagent_fork calls to run in parallel; results come back as summaries.\n\
-                 - Jobs: your turns and subagent runs are tracked automatically on the Jobs card; no action needed from you.\n",
+                "\n\nCollaboration mechanisms:\n\
+                 - Goals: long-term objective → goal_create.\n\
+                 - Plan: complex multi-step → plan_write, then exit_plan_mode.\n\
+                 - Subagents: independent subtasks → subagent_fork (parallel).\n\
+                 - Jobs: automatic.\n\
+                 - GUI automation: take_screenshot to locate (coordinates = screenshot pixels), then mouse_click / mouse_move / mouse_drag / mouse_scroll / key_type / key_press. Always screenshot FIRST, then act; after acting, screenshot again to verify.\n\
+                 \n\
+                 Output style (IMPORTANT):\n\
+                 - CONCISE. No filler, no emoji unless user uses them, no \"let me\" narration.\n\
+                 - State what you did and the result, 1-3 sentences max.\n\
+                 - Code: show only changed lines / minimal diff, not entire files.\n\
+                 - Lists: bullet points, not full sentences.\n\
+                 - Task succeeded → say so briefly and stop. Don't over-explain.\n",
             );
             // 可用技能（modelInvocable）列出；模型可按需 load_skill 加载说明
             let invocable: Vec<_> = tools
@@ -1771,6 +2933,7 @@ async fn run_turn_inner(
                         s.description.as_deref().unwrap_or("")
                     ));
                 }
+                clamp_block(&mut list, "inject");
                 persona.push_str(&list);
             }
             // 可用插件工具（运行中扩展插件；与普通工具一样直接调用）。
@@ -1792,6 +2955,7 @@ async fn run_turn_inner(
                         t.description.as_deref().unwrap_or("")
                     ));
                 }
+                clamp_block(&mut list, "inject");
                 persona.push_str(&list);
             }
             // DSH 官方 cordis 插件：通过 node_called 工具直接调用（无需转写、无需安装）。
@@ -1816,6 +2980,7 @@ async fn run_turn_inner(
                      so require() resolves these packages directly. Use their exported services/commands \
                      to fulfill the user's request. Wrap long-running work in try/catch and print results with console.log.\n",
                 );
+                clamp_block(&mut list, "inject");
                 persona.push_str(&list);
             }
             llm_messages.insert(
@@ -1826,6 +2991,7 @@ async fn run_turn_inner(
                     tool_call_id: None,
                     tool_calls: None,
                     name: None,
+                    images: None,
                 },
             );
         }
@@ -1841,6 +3007,8 @@ async fn run_turn_inner(
 
         let session_id2 = session_id.to_string();
         let tx2 = tx.clone();
+        let usage_acc = token_usage.clone();
+        let usage_dirty_cb = usage_dirty.clone();
         let stream_res = llm
             .stream(&llm_messages, Some(&spec), move |evt| match evt {
                 StreamEvent::Chunk(c) => {
@@ -1864,6 +3032,14 @@ async fn run_turn_inner(
                         session_id: session_id2.clone(),
                         event: rev,
                     });
+                }
+                StreamEvent::Usage(u) => {
+                    // 会话累计（UI 标题行显示 token 用量）+ 置脏（帧循环落盘）
+                    let mut map = usage_acc.lock().unwrap_or_else(|p| p.into_inner());
+                    let entry = map.entry(session_id2.clone()).or_default();
+                    *entry += u;
+                    usage_dirty_cb
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 StreamEvent::ToolCallAccum {
                     index,
@@ -1910,6 +3086,7 @@ async fn run_turn_inner(
                 messages.push(Message::Assistant {
                     content,
                     tool_calls: Vec::new(),
+                    reasoning: None,
                 });
             }
             return Err(anyhow::anyhow!("{e:#}"));
@@ -1948,6 +3125,11 @@ async fn run_turn_inner(
         let assistant_msg = Message::Assistant {
             content: full_text,
             tool_calls: tool_calls.clone(),
+            reasoning: if reasoning_snapshot.is_empty() {
+                None
+            } else {
+                Some(reasoning_snapshot.clone())
+            },
         };
         messages.push(assistant_msg);
 
@@ -1962,6 +3144,60 @@ async fn run_turn_inner(
             break 'outer;
         }
 
+        // ===== subagent_fork 并行预执行 =====
+        // 工具描述承诺"并行执行独立子任务"，但顺序循环里逐个 await 是串行。
+        // 这里把本批所有 subagent_fork 先并发跑完（join_all），结果按 call_id
+        // 存入 stash；下方顺序循环只做事件落盘与消息回填——TOOL_CALL/RESULT
+        // 事件顺序保持与模型返回一致，主代理视角无变化。
+        let mut sub_stash: HashMap<String, ToolOutput> = HashMap::new();
+        {
+            let forks: Vec<&ToolCall> = tool_calls
+                .iter()
+                .filter(|tc| tc.function.name == "subagent_fork")
+                .collect();
+            if !forks.is_empty() {
+                info!(
+                    "subagent_fork: running {} forks concurrently for {session_id}",
+                    forks.len()
+                );
+                let futs = forks.into_iter().map(|tc| {
+                    let parsed: Value = serde_json::from_str(&tc.function.arguments)
+                        .unwrap_or_else(|e| json!({"__args_parse_error": e.to_string()}));
+                    async {
+                        // 停止信号：已停止的回合不再启动子代理（历史缺陷：
+                        // join_all 前不检查，停止后本批子代理照烧 token）
+                        if TurnSignal::is_set(&signal.stopping) {
+                            return (
+                                tc.id.clone(),
+                                ToolOutput::err("回合已停止，子代理派生取消"),
+                            );
+                        }
+                        let out = run_subagent_fork(
+                            tc.id.clone(),
+                            parsed,
+                            llm.clone(),
+                            subagents,
+                            jobs,
+                            &store,
+                            sessions_shared,
+                            tx,
+                            session_id,
+                            preset,
+                            approvals,
+                            &signal,
+                            &token_usage,
+                            &usage_dirty,
+                        )
+                        .await;
+                        (tc.id.clone(), out)
+                    }
+                });
+                let results = futures_util::future::join_all(futs).await;
+                for (id, out) in results {
+                    sub_stash.insert(id, out);
+                }
+            }
+        }
         // 逐个执行工具（停止/插话后不再执行剩余工具）
         for tc in &tool_calls {
             if TurnSignal::is_set(&signal.stopping) || TurnSignal::is_set(&signal.cancelled) {
@@ -1995,130 +3231,37 @@ async fn run_turn_inner(
                     "__raw": tc.function.arguments,
                 }),
             };
+            // 教训拦截：与已失败教训**完全相同**的调用且失败≥2 次（或已有
+            // 修正方案）→ 不再执行，直接返回教训提示（模型下一轮直跑修正版；
+            // 同时打断同参死循环）。subagent_fork 走预执行路径，不拦。
+            let lesson_blocked = if tc.function.name != "subagent_fork" {
+                lessons
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .blocked_hint(&lesson_ws, &tc.function.name, &parsed_args)
+                    .map(ToolOutput::err)
+            } else {
+                None
+            };
             // 预设白名单（对所有执行路径生效：内置 / subagent_fork / 插件工具）
             let blocked_by_whitelist = preset
                 .tool_whitelist()
                 .map(|wl| !wl.contains(&tc.function.name.as_str()))
                 .unwrap_or(false);
-            let out = if blocked_by_whitelist {
+            let mut out = if let Some(b) = lesson_blocked {
+                b
+            } else if blocked_by_whitelist {
                 ToolOutput::err(format!(
                     "tool {} 在当前预设（{}）不可用",
                     tc.function.name,
                     preset.name()
                 ))
             } else if tc.function.name == "subagent_fork" {
-                // 子代理：独立单轮 LLM 问答（对齐 dsh-subagent-fork）。
-                // 注册 descriptor（subagent/descriptor 事件持久化，重放可恢复）、
-                // 创建子代理任务，总结返回主代理继续回合。
-                let desc = parsed_args
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("子代理任务")
-                    .to_string();
-                let prompt = parsed_args
-                    .get("prompt")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                if prompt.trim().is_empty() {
-                    ToolOutput::err("subagent_fork: prompt 不能为空")
-                } else {
-                    info!("subagent_fork: entering spawn for {session_id}");
-                    // 注意：MutexGuard 临时值在 `match 表达式` 中会存活到整个
-                    // match 结束（Rust 临时生命周期规则）。若在 match 的
-                    // 分支体内再次 subagents.lock()，就是同一线程重复获取
-                    // 非重入 Mutex → 死锁（历史回归：subagent_fork 调用后
-                    // 回合永久卡死，descriptor/tool/result 均不落盘）。
-                    // 因此先在小块内完成加锁+spawn，guard 立即释放再 match。
-                    let spawn_res = {
-                        let mut mgr = subagents.lock().unwrap();
-                        mgr.spawn(session_id, 1, 3)
-                    };
-                    match spawn_res {
-                        Err(e) => ToolOutput::err(format!("subagent_fork: {e:#}")),
-                        Ok(sub_id) => {
-                            info!("subagent_fork: spawned {sub_id}");
-                            // 子代理任务（pending → running）
-                            let sjid = {
-                                let mut jm = jobs.lock().unwrap();
-                                let id = jm.create("subagent", Some(format!("{desc}（{sub_id}）")));
-                                jm.start(&id);
-                                id
-                            };
-                            // descriptor: running
-                            info!("subagent_fork: marking running {sub_id}");
-                            subagents
-                                .lock()
-                                .unwrap()
-                                .mark(&sub_id, SubagentStatus::Running);
-                            if let Some(d) = subagents.lock().unwrap().get(&sub_id).cloned() {
-                                let dev = SubagentManager::descriptor_event(&d);
-                                info!("subagent_fork: appending descriptor {sub_id}");
-                                append_alive(&store, sessions_shared, session_id, &dev)?;
-                                info!("subagent_fork: descriptor appended ok");
-                                let _ = tx.send(EngineEvent::Event {
-                                    session_id: session_id.to_string(),
-                                    event: dev,
-                                });
-                            }
-                            // 独立 LLM 调用
-                            let sys = format!(
-                                "You are a subagent of a coding agent running on DeepSeek \
-                                 Harness. Your parent session is {session_id}. Complete the \
-                                 task below and reply with a concise summary of what you did \
-                                 and the result."
-                            );
-                            let summary = crate::engine::subagent::run_subagent_turn(
-                                llm.clone(),
-                                &sys,
-                                &prompt,
-                                8,
-                            )
-                            .await;
-                            info!(
-                                "subagent_fork: llm turn done for {sub_id}: {:?}",
-                                summary.as_ref().map(|s| s.chars().count())
-                            );
-                            let out = match &summary {
-                                Ok(s) => {
-                                    subagents.lock().unwrap().set_summary(&sub_id, s.clone());
-                                    subagents
-                                        .lock()
-                                        .unwrap()
-                                        .mark(&sub_id, SubagentStatus::Done);
-                                    jobs.lock().unwrap().finish(&sjid, true, Some(s.clone()));
-                                    ToolOutput::ok(json!({
-                                        "subagent_id": sub_id,
-                                        "summary": s,
-                                        "note": "子代理已完成，总结如上",
-                                    }))
-                                }
-                                Err(e) => {
-                                    subagents
-                                        .lock()
-                                        .unwrap()
-                                        .mark(&sub_id, SubagentStatus::Failed);
-                                    jobs.lock().unwrap().finish(
-                                        &sjid,
-                                        false,
-                                        Some(format!("{e:#}")),
-                                    );
-                                    ToolOutput::err(format!("subagent_fork 执行失败: {e:#}"))
-                                }
-                            };
-                            // descriptor: done/failed（终态）
-                            if let Some(d) = subagents.lock().unwrap().get(&sub_id).cloned() {
-                                let dev = SubagentManager::descriptor_event(&d);
-                                append_alive(&store, sessions_shared, session_id, &dev)?;
-                                let _ = tx.send(EngineEvent::Event {
-                                    session_id: session_id.to_string(),
-                                    event: dev,
-                                });
-                            }
-                            out
-                        }
-                    }
-                }
+                // 子代理结果：并行预执行阶段已完成（见上方 join_all），
+                // 此处仅按 call_id 取回，保持事件/消息顺序与模型返回一致。
+                sub_stash.remove(&tc.id).unwrap_or_else(|| {
+                    ToolOutput::err("subagent_fork: 预执行结果缺失（内部错误）")
+                })
             } else {
                 // 公共治理门：越权审批。插件工具与内置工具一视同仁——
                 // 插件可以覆盖内置工具（如提供真正的 web_search 实现，
@@ -2140,7 +3283,15 @@ async fn run_turn_inner(
                             if skip {
                                 true
                             } else {
-                                match run_approval(tx, approvals, target, reason, session_id).await
+                                match run_approval_cancellable(
+                                    tx,
+                                    approvals,
+                                    target,
+                                    reason,
+                                    session_id,
+                                    Some(&signal),
+                                )
+                                .await
                                 {
                                     Ok(ApprovalOutcome::Allowed) => true,
                                     Ok(ApprovalOutcome::Denied { note }) => {
@@ -2232,6 +3383,36 @@ async fn run_turn_inner(
                 }
                 out
             };
+            // 教训记录：失败 → 记 (工具, 参数, 错误)；成功 → 相似失败配对
+            // 修正方案 / 完全相同的失败教训吸收删除。审批拒绝/白名单拦截
+            // 属治理提示而非用法错误，同样值得记忆（提示会告诉模型改法）。
+            {
+                let mut ls = lessons.lock().unwrap_or_else(|p| p.into_inner());
+                if out.ok {
+                    ls.record_success(&lesson_ws, &tc.function.name, &parsed_args);
+                } else {
+                    let err_txt = out
+                        .value
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .filter(|t| !t.trim().is_empty())
+                        .or_else(|| {
+                            if out.stderr.trim().is_empty() {
+                                None
+                            } else {
+                                Some(out.stderr.clone())
+                            }
+                        })
+                        .unwrap_or_else(|| out.value.to_string());
+                    // 治理类错误（权限拦截/审批拒绝/白名单）不记教训：
+                    // 用户切换权限模式或审批后同一调用合法，记入会被
+                    // blocked_hint 永久拦死
+                    if !crate::engine::lessons::is_governance_error(&err_txt) {
+                        ls.record_failure(&lesson_ws, &tc.function.name, &parsed_args, &err_txt);
+                    }
+                }
+            }
             let result_ev = SessionEvent::new(
                 types::TOOL_RESULT,
                 Some(json!({
@@ -2294,6 +3475,34 @@ async fn run_turn_inner(
                     info!("goal created {gid}: {obj}");
                 }
             }
+            // goal_create：创建长期目标（Goals 卡片显示 + goal/change 事件
+            // 持久化，重放恢复）。历史缺陷：dispatch 层只返回"目标已创建"
+            // 假成功，goal_op 从未被调用 → 无事件 → Goals 卡片永远为空
+            //（用户实测：AI 说创建成功、芯片亮了、卡片里什么都没有）。
+            if tc.function.name == "goal_create" {
+                if let Some(objective) =
+                    parsed_args.get("objective").and_then(|v| v.as_str())
+                {
+                    let objective = objective.trim();
+                    if !objective.is_empty() {
+                        let gid = format!("g-{}", crate::util::simple_id());
+                        // goal_op 需 &mut engine——回合线程持有的是克隆,
+                        // 这里直接构造事件走 append_alive（与 plan_write 同
+                        // 一模式），UI pump fold + 重放恢复都吃同一事件。
+                        let gev = crate::engine::goal::goal_change_event(
+                            crate::engine::goal::GoalOp::Create,
+                            &gid,
+                            Some(objective),
+                        );
+                        append_alive(&store, sessions_shared, session_id, &gev)?;
+                        let _ = tx.send(EngineEvent::Event {
+                            session_id: session_id.to_string(),
+                            event: gev,
+                        });
+                        info!("goal created for {session_id}: {objective}");
+                    }
+                }
+            }
             // plan_write：进入计划模式并写入计划内容（聊天界面计划卡片显示）
             if tc.function.name == "plan_write" {
                 if let Some(content) = parsed_args.get("content").and_then(|v| v.as_str()) {
@@ -2309,8 +3518,49 @@ async fn run_turn_inner(
                     );
                 }
             }
-            // exit_plan_mode：退出计划模式
+            // exit_plan_mode：退出计划模式。
+            // 历史缺陷：AI 完成最后一步后直接 exit 而忘了先用 plan_write
+            // 把 `- [ ]` 改 `[x]` → 计划卡停在 N-1/N，与 AI 声称"全部完成"
+            // 矛盾。修复：exit 时自动检查未勾选项；有则在工具结果中明确
+            // 告知 AI 需要再调一次 plan_write 补勾（下一轮 LLM 会修正）。
             if tc.function.name == "exit_plan_mode" {
+                // fold 当前计划内容,统计未勾选项
+                let (_, plan_content) = {
+                    let evs = store.load_events(session_id);
+                    crate::engine::plan::fold_plan_state(&evs)
+                };
+                let unchecked: Vec<&str> = plan_content
+                    .lines()
+                    .filter(|l| {
+                        let t = l.trim_start_matches(['-', '*', '+', ' ']);
+                        t.starts_with("[ ]")
+                    })
+                    .map(|l| l.trim())
+                    .collect();
+                if !unchecked.is_empty() {
+                    log::warn!(
+                        "exit_plan_mode with {} unchecked steps for {session_id}",
+                        unchecked.len()
+                    );
+                    // 覆盖工具结果：明确告知 AI 有未勾选项，下一轮 LLM
+                    // 会自动调 plan_write 补勾（比静默 exit 更可靠）
+                    let list: Vec<String> = unchecked
+                        .iter()
+                        .map(|s| s.chars().take(60).collect())
+                        .collect();
+                    out = ToolOutput::ok(json!({
+                        "exit_plan": true,
+                        "warning": format!(
+                            "计划已退出，但还有 {} 个步骤未标记完成：
+{}
+
+请立即调用 plan_write，把这些步骤的 [ ] 改成 [x]，让计划卡显示 N/N。",
+                            unchecked.len(),
+                            list.join("
+")
+                        ),
+                    }));
+                }
                 let xev = crate::engine::plan::plan_exit_event();
                 append_alive(&store, sessions_shared, session_id, &xev)?;
                 let _ = tx.send(EngineEvent::Event {
@@ -2439,14 +3689,86 @@ mod tests {
     fn test_engine() -> (DshEngine, std::sync::mpsc::Receiver<EngineEvent>) {
         let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
         let mut settings = EngineSettings::default();
+        // DSH_HOME 隔离：防止 default() 的 None 目录回退到真实 ~/.dsh
+        // 并 autostart 用户插件子进程（历史缺陷：测试触碰生产环境）
         settings.api_key = Some("fake-key".into());
         settings.base_url = "http://127.0.0.1:1".into(); // 不可达：回合线程会快速失败
-        settings.data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+        // 测试目录禁用自动删除：TempDir 守卫在函数返回即删目录，引擎后续
+        // 写盘随机失败（并行全量跑时 title 断言抖动的根因）。泄漏到系统
+        // 临时目录可接受（测试产物）。
+        let td_data = tempfile::tempdir().unwrap();
+        settings.data_dir = td_data.keep().join("sessions");
         // 隔离：技能/插件目录指向空临时目录（不加载用户环境，避免子进程副作用）
-        settings.skills_dir = Some(tempfile::tempdir().unwrap().path().join("skills"));
-        settings.plugins_dir = Some(tempfile::tempdir().unwrap().path().join("plugins"));
+        let td_skills = tempfile::tempdir().unwrap().keep();
+        let td_plugins = tempfile::tempdir().unwrap().keep();
+        settings.skills_dir = Some(td_skills.join("skills"));
+        settings.plugins_dir = Some(td_plugins.join("plugins"));
         let engine = DshEngine::new(settings, tx).expect("engine");
         (engine, rx)
+    }
+
+    /// goal_create 事件链：goal_change_event(Create) → GoalManager.apply
+    /// fold 出 Active 目标（UI 卡片数据源）。历史缺陷回归锚点：goal_create
+    /// 曾是假桩，无事件 → 卡片永远为空。
+    #[test]
+    fn goal_create_event_folds_into_card() {
+        let mut mgr = crate::engine::goal::GoalManager::default();
+        let ev = crate::engine::goal::goal_change_event(
+            crate::engine::goal::GoalOp::Create,
+            "g-test",
+            Some("完成体素游戏"),
+        );
+        mgr.apply(&ev);
+        let list = mgr.list();
+        assert_eq!(list.len(), 1, "创建后应有 1 个目标");
+        assert_eq!(list[0].objective, "完成体素游戏");
+        assert!(matches!(list[0].phase, crate::engine::goal::GoalPhase::Active));
+        // 完成后 Complete + 删除语义
+        let done = crate::engine::goal::goal_change_event(
+            crate::engine::goal::GoalOp::Complete,
+            "g-test",
+            None,
+        );
+        mgr.apply(&done);
+        assert!(matches!(mgr.list()[0].phase, crate::engine::goal::GoalPhase::Complete));
+    }
+
+    /// 删除本地插件：停进程 → 删目录 → 注册表清除；名称穿越/不存在
+    /// 目录拒绝。
+    #[test]
+    fn remove_plugin_deletes_dir_and_registry() {
+        let (engine, _rx) = test_engine();
+        // 构造一个插件目录（manifest 指向不存在的 exe —— 不会真正 spawn）
+        let dir = {
+            let mut mgr = engine.plugins.lock().unwrap();
+            let root = mgr.ensure_dir();
+            let pd = root.join("del-me");
+            std::fs::create_dir_all(&pd).unwrap();
+            std::fs::write(
+                pd.join("plugin.json"),
+                r#"{"name":"del-me","command":["no-such-exe"],"autostart":false}"#,
+            )
+            .unwrap();
+            mgr.discover();
+            root
+        };
+        assert!(
+            engine
+                .plugins
+                .lock()
+                .unwrap()
+                .get("del-me")
+                .is_some(),
+            "发现阶段应注册"
+        );
+        engine.remove_plugin("del-me").expect("删除应成功");
+        assert!(!dir.join("del-me").exists(), "目录应被删除");
+        assert!(engine.plugins.lock().unwrap().get("del-me").is_none());
+        // 重复删除 → 报错（目录已不存在）
+        assert!(engine.remove_plugin("del-me").is_err());
+        // 名称穿越拒绝（kebab-case 校验挡住 ../ 路径）
+        assert!(engine.remove_plugin("../evil").is_err());
+        assert!(engine.remove_plugin(r"..\evil").is_err());
     }
 
     /// 回归：回合运行中发送消息 = 插话（不得报 "already running"）。
@@ -2472,7 +3794,7 @@ mod tests {
         assert!(
             s.messages
                 .iter()
-                .any(|m| matches!(m, Message::User { content } if content == "插话消息")),
+                .any(|m| matches!(m, Message::User { content, .. } if content == "插话消息")),
             "插话消息必须立即进入会话消息列表"
         );
         // user/message 事件已发出（UI 同步显示）
@@ -2777,5 +4099,394 @@ mod tests {
         engine.cancel(&sid);
         assert!(TurnSignal::is_set(&sig.stopping), "停止应置 stopping");
         assert!(TurnSignal::is_set(&sig.cancelled));
+    }
+
+    /// 自动命名：无标题会话发送首条消息后，标题 = 首行提炼（≤24 字符），
+    /// 且持久化 session/title 事件（重启重放仍能恢复）；手动命名后不再覆盖。
+    #[test]
+    fn first_message_auto_titles_session() {
+        let (mut engine, _rx) = test_engine();
+        let sid = engine.create_session(None).unwrap();
+        engine.send_message(&sid, "帮我审查 bosk 代码的安全性\n\n重点看解析器").unwrap();
+
+        let title = engine.list_sessions().iter().find(|s| s.session_id == sid)
+            .map(|s| s.title.clone()).unwrap();
+        assert_eq!(title, "帮我审查 bosk 代码的安全性", "首条消息应自动命名");
+
+        // 持久化验证（重放路径）
+        let loaded = engine.store.load_session(&sid).unwrap();
+        assert_eq!(loaded.title, "帮我审查 bosk 代码的安全性");
+
+        // 手动重命名后，后续消息不再覆盖
+        engine.rename_session(&sid, "手动名").unwrap();
+        engine.send_message(&sid, "第二条完全不同的消息").unwrap();
+        let title2 = engine.list_sessions().iter().find(|s| s.session_id == sid)
+            .map(|s| s.title.clone()).unwrap();
+        assert_eq!(title2, "手动名", "手动命名后自动命名不得覆盖");
+    }
+
+    /// token 用量：引擎访问器（累计与合计）。
+    #[test]
+    fn token_usage_accessors() {
+        let (mut engine, _rx) = test_engine();
+        let sid = engine.create_session(Some("t")).unwrap();
+        {
+            let mut map = engine.token_usage.lock().unwrap();
+            map.insert(
+                sid.clone(),
+                crate::core::llm::TokenUsage {
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                },
+            );
+        }
+        let u = engine.token_usage(&sid);
+        assert_eq!(u.total(), 150);
+        assert_eq!(engine.token_usage_total().total(), 150);
+        // 未知会话 = 0
+        assert_eq!(engine.token_usage("no-such").total(), 0);
+    }
+
+    /// AGENTS.md 项目记忆：存在/缺失/空文件/超大截断四种形态。
+    #[test]
+    fn agents_md_injection_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_agents_md(dir.path()).is_none(), "缺失 → None");
+        std::fs::write(dir.path().join("AGENTS.md"), "# 项目约定
+用中文注释").unwrap();
+        assert!(read_agents_md(dir.path()).unwrap().contains("项目约定"));
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(dir2.path().join("agents.md"), "lower").unwrap();
+        assert_eq!(read_agents_md(dir2.path()).as_deref(), Some("lower"));
+        let dir3 = tempfile::tempdir().unwrap();
+        std::fs::write(dir3.path().join("AGENTS.md"), "   ").unwrap();
+        assert!(read_agents_md(dir3.path()).is_none(), "空文件 → None");
+        let dir4 = tempfile::tempdir().unwrap();
+        std::fs::write(dir4.path().join("AGENTS.md"), "中".repeat(40_000)).unwrap();
+        let t = read_agents_md(dir4.path()).unwrap();
+        assert!(t.contains("已截断"), "超大 → 截断标记");
+        assert!(t.chars().count() < 40_000);
+    }
+
+    /// 会话分叉：消息（含工具配对）完整复制到新会话，标题带 ⑂ 前缀；
+    /// 重放后工具消息仍在（tool/call 声明正确落盘）。
+    #[test]
+    fn fork_session_copies_messages_with_tool_pairing() {
+        let (mut engine, _rx) = test_engine();
+        let sid = engine.create_session(Some("原会话")).unwrap();
+        // 构造带工具配对的消息序列（直接经 fork_append 语义验证太绕；
+        // 走公共路径：手动 push 消息再 fork）
+        {
+            let s = engine.sessions.get_mut(&sid).unwrap();
+            s.messages.push(Message::User {
+                content: "看下代码".into(),
+                images: None,
+            });
+            s.messages.push(Message::Assistant {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    call_type: "function".into(),
+                    function: crate::core::session::FunctionCall {
+                        name: "bash".into(),
+                        arguments: r#"{"cmd":"ls"}"#.into(),
+                    },
+                }],
+                reasoning: Some("思考中…".into()),
+            });
+            s.messages.push(Message::Tool {
+                tool_call_id: "c1".into(),
+                content: r#"{"ok":true}"#.into(),
+            });
+        }
+        let new_id = engine.fork_session(&sid).unwrap();
+        // 新会话标题 + 消息数
+        let forked = engine.sessions.get(&new_id).unwrap();
+        assert_eq!(forked.title, "⑂ 原会话");
+        assert_eq!(forked.messages.len(), 3, "消息应全部复制");
+        // 重放路径：load_session 从 JSONL 重建（tool 配对 + reasoning 恢复）
+        let loaded = engine.store.load_session(&new_id).unwrap();
+        assert_eq!(loaded.messages.len(), 3, "重放后消息数不变");
+        match &loaded.messages[2] {
+            Message::Tool { tool_call_id, .. } => assert_eq!(tool_call_id, "c1"),
+            _ => panic!("tool 消息应在重放后保留"),
+        }
+        match &loaded.messages[1] {
+            Message::Assistant { reasoning, tool_calls, .. } => {
+                assert_eq!(reasoning.as_deref(), Some("思考中…"));
+                assert_eq!(tool_calls.len(), 1);
+            }
+            _ => panic!("assistant 应保留"),
+        }
+        // 原会话不动
+        assert_eq!(engine.sessions.get(&sid).unwrap().messages.len(), 3);
+        assert_eq!(engine.sessions.get(&sid).unwrap().title, "原会话");
+    }
+
+    /// 墓碑共享回归：clone_handle 产生的副本必须看到引擎实例的删除
+    /// 记录（否则回合线程 append 的 create(true) 会复活已删 .jsonl——
+    /// 历史缺陷:修复用 SessionStore::new 构造空墓碑,对目标路径无效）。
+    #[test]
+    fn tombstones_shared_across_clone() {
+        let (mut engine, _rx) = test_engine();
+        let sid = engine.create_session(Some("tomb")).unwrap();
+        let clone = engine.store.clone_handle();
+        // 引擎实例标记删除 → clone 必须看到;clone 的 append 被拦截,
+        // 文件若存在(创建时已建)不得包含新增事件
+        engine.store.mark_deleted(&sid);
+        let ev_before = engine.store.load_events(&sid).len();
+        let _ = clone.append(
+            &sid,
+            &SessionEvent::new(types::USER_MESSAGE, Some(json!({"content":"x"}))),
+        );
+        let ev_after = engine.store.load_events(&sid).len();
+        assert_eq!(
+            ev_before, ev_after,
+            "clone 的 append 应被共享墓碑拦截(事件数不变)"
+        );
+    }
+
+    /// B1 回归：新回合路径的用户消息持久化携带 images（历史缺陷：persist
+    /// 重建裸事件丢图，回合一结束图片引用消失）。
+    #[test]
+    fn new_turn_persists_images() {
+        let (mut engine, _rx) = test_engine();
+        let sid = engine.create_session(Some("img")).unwrap();
+        engine
+            .send_message_with_images(&sid, "看图", vec!["C:/tmp/x.png".into()])
+            .unwrap();
+        // 直接查 store 事件落盘形态
+        let evs = engine.store.load_events(&sid);
+        let user_ev = evs
+            .iter()
+            .find(|e| e.r#type == types::USER_MESSAGE)
+            .expect("user/message 事件应已落盘");
+        let imgs = user_ev
+            .data
+            .as_ref()
+            .and_then(|d| d.get("images"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(imgs, 1, "落盘事件必须携带 images");
+    }
+
+    /// C3 回归：删除会话清理其 pending 审批（悬卡点允许不再能唤醒
+    /// 已删会话的旧回合执行写操作）。
+    #[test]
+    fn delete_session_cancels_pending_approvals() {
+        let (mut engine, _rx) = test_engine();
+        let sid = engine.create_session(Some("ap")).unwrap();
+        // 手动注入一条 pending（模拟审批中删除）
+        {
+            let mut reg = engine.approvals.lock().unwrap();
+            let rx = reg.request("t1".into(), sid.clone(), "C:/out.txt".into(), "test".into());
+            std::mem::forget(rx); // 测试不消费
+        }
+        assert_eq!(
+            engine
+                .approvals
+                .lock()
+                .unwrap()
+                .pending_snapshot()
+                .iter()
+                .filter(|r| r.session_id == sid)
+                .count(),
+            1
+        );
+        engine.delete_session(&sid).unwrap();
+        assert_eq!(
+            engine
+                .approvals
+                .lock()
+                .unwrap()
+                .pending_snapshot()
+                .iter()
+                .filter(|r| r.session_id == sid)
+                .count(),
+            0,
+            "会话删除后其 pending 审批应全部清除"
+        );
+    }
+
+    /// B5 回归：compaction 事件重放折叠（压缩持久化，重启不回退全量）。
+    #[test]
+    fn compaction_replays_folded() {
+        let (mut engine, _rx) = test_engine();
+        let sid = engine.create_session(Some("cp")).unwrap();
+        // 手动落 6 条 user 事件 + 1 条 compaction summary(kept_from=3)。
+        // 不走 send_message(会 spawn 回合线程,失败时序与折叠竞态 → 测试抖动)
+        for i in 0..6 {
+            let ev = SessionEvent::new(
+                types::USER_MESSAGE,
+                Some(json!({"content": format!("m{i}")})),
+            );
+            engine.store.append(&sid, &ev).unwrap();
+        }
+        {
+            let ev = SessionEvent::new(
+                types::COMPACTION_SUMMARY,
+                Some(json!({"summary": "早期已压缩", "kept_from": 3})),
+            );
+            engine.store.append(&sid, &ev).unwrap();
+        }
+        let loaded = engine.store.load_session(&sid).unwrap();
+        // 折叠后:3 条尾部 + 1 条摘要头 = 4 条(6 条不再全量恢复)
+        assert_eq!(
+            loaded.messages.len(),
+            4,
+            "重放应折叠为 尾部3+摘要1: {:?}",
+            loaded.messages.len()
+        );
+        match &loaded.messages[0] {
+            Message::User { content, .. } => {
+                assert!(content.contains("[context summary]"), "{content}")
+            }
+            _ => panic!("首条应为摘要 User"),
+        }
+    }
+
+    /// token 用量持久化：脏标记 → flush 落盘 → 同 data_dir 新引擎恢复。
+    #[test]
+    fn token_usage_persist_roundtrip() {
+        let (mut engine, _rx) = test_engine();
+        let sid = engine.create_session(Some("u")).unwrap();
+        {
+            let mut map = engine.token_usage.lock().unwrap();
+            map.insert(
+                sid.clone(),
+                crate::core::llm::TokenUsage {
+                    prompt_tokens: 111,
+                    completion_tokens: 22,
+                },
+            );
+        }
+        // 置脏（模拟 Usage 事件路径）→ flush 落盘
+        engine.mark_usage_dirty_for_test();
+        engine.flush_usage();
+        assert!(!engine.settings().token_usage.is_empty(), "flush 应落盘(测试直接置入视作脏亦可)");
+        // 注:测试绕过脏标记直接验证 map→settings 的同步路径;
+        // 真实路径(Usage 事件置脏)由多线程时序保证。
+        let data_dir = engine.settings().data_dir.clone();
+        let (tx2, _rx2) = std::sync::mpsc::channel::<EngineEvent>();
+        let mut s2 = crate::core::settings::EngineSettings::load_for(&data_dir);
+        s2.api_key = Some("fake".into());
+        s2.base_url = "http://127.0.0.1:1".into();
+        s2.skills_dir = Some(tempfile::tempdir().unwrap().path().join("s"));
+        s2.plugins_dir = Some(tempfile::tempdir().unwrap().path().join("p"));
+        let engine2 = DshEngine::new(s2, tx2).unwrap();
+        let u = engine2.token_usage(&sid);
+        assert_eq!((u.prompt_tokens, u.completion_tokens), (111, 22), "重启应恢复用量");
+    }
+
+    /// 跨会话全文搜索：标题命中无片段；内容命中带片段；limit 生效。
+    #[test]
+    fn search_sessions_fulltext() {
+        let (mut engine, _rx) = test_engine();
+        let a = engine.create_session(Some("甲会话")).unwrap();
+        engine.send_message(&a, "帮我看下登录模块的边界条件").unwrap();
+        let b = engine.create_session(Some("乙会话")).unwrap();
+        engine.send_message(&b, "完全无关的话题").unwrap();
+
+        // 标题命中 → 空片段
+        let hits = engine.search_sessions("甲会话", 10);
+        assert!(hits.iter().any(|(s, snip)| s.session_id == a && snip.is_empty()));
+
+        // 内容命中 → 片段含关键词
+        let hits = engine.search_sessions("边界条件", 10);
+        let hit = hits.iter().find(|(s, _)| s.session_id == a).expect("内容应命中");
+        assert!(hit.1.contains("边界条件"), "片段应含关键词: {}", hit.1);
+
+        // 无命中
+        assert!(engine.search_sessions("不存在的词xyz", 10).is_empty());
+
+        // limit
+        assert!(engine.search_sessions("会话", 1).len() <= 1);
+    }
+
+    /// 导出 Markdown：标题/用户消息/结构完整。
+    #[test]
+    fn export_session_markdown_shape() {
+        let (mut engine, _rx) = test_engine();
+        let sid = engine.create_session(Some("导出测试")).unwrap();
+        engine.send_message(&sid, "第一条用户消息").unwrap();
+        let md = engine.export_session_markdown(&sid).unwrap();
+        assert!(md.contains("# 导出测试"), "{md}");
+        assert!(md.contains("🧑 用户"));
+        assert!(md.contains("第一条用户消息"));
+        assert!(md.contains("导出于"));
+    }
+
+    /// 定时任务：增/列/启停 + settings 持久化重启恢复 + 到期触发发消息。
+    #[test]
+    fn schedule_persist_and_fire() {
+        let (mut engine, _rx) = test_engine();
+        let sid = engine.create_session(Some("定时目标")).unwrap();
+        let tid = engine.schedule_add("检查构建", "请检查构建", 3600, &sid);
+        assert_eq!(engine.schedule_list().len(), 1);
+        engine.schedule_toggle(&tid, false);
+        assert!(!engine.schedule_list()[0].enabled);
+        engine.schedule_toggle(&tid, true);
+
+        // 持久化 → 同 data_dir 新引擎恢复（settings 从 data_dir 对应文件加载）
+        let data_dir = engine.settings().data_dir.clone();
+        let (tx2, _rx2) = std::sync::mpsc::channel::<EngineEvent>();
+        let mut settings2 = crate::core::settings::EngineSettings::load_for(&data_dir);
+        settings2.api_key = Some("fake".into());
+        settings2.base_url = "http://127.0.0.1:1".into();
+        settings2.skills_dir = Some(tempfile::tempdir().unwrap().path().join("s"));
+        settings2.plugins_dir = Some(tempfile::tempdir().unwrap().path().join("p"));
+        let engine2 = DshEngine::new(settings2, tx2).unwrap();
+        let restored = engine2.schedule_list();
+        assert_eq!(restored.len(), 1, "定时任务应重启恢复");
+        assert_eq!(restored[0].name, "检查构建");
+        assert!(restored[0].enabled);
+
+        // 到期触发：prompt 发到绑定会话（消息落盘；回合线程对假 URL 失败无碍）
+        engine.fire_scheduled(&tid);
+        let s = engine.sessions.get(&sid).unwrap();
+        assert!(
+            s.messages
+                .iter()
+                .any(|m| matches!(m, Message::User { content, .. } if content == "请检查构建")),
+            "到期应把 prompt 发进会话"
+        );
+
+        // 会话删除后触发：任务自动清理
+        engine.delete_session(&sid).unwrap();
+        engine.fire_scheduled(&tid);
+        assert!(engine.schedule_list().is_empty(), "绑定会话消失应移除任务");
+    }
+
+    /// 消息反馈：记录 + 查询 + 事件持久化（JSONL 有 feedback/record）。
+    #[test]
+    fn message_feedback_roundtrip() {
+        let (mut engine, _rx) = test_engine();
+        let sid = engine.create_session(Some("t")).unwrap();
+        engine
+            .record_message_feedback(&sid, "m1", crate::engine::FeedbackKind::Upvote)
+            .unwrap();
+        assert_eq!(
+            engine.message_feedback("m1"),
+            Some(crate::engine::FeedbackKind::Upvote)
+        );
+        assert_eq!(engine.message_feedback("m2"), None);
+        // 事件落盘
+        let events = engine.store.load_events(&sid);
+        assert!(
+            events.iter().any(|e| e.r#type == types::FEEDBACK_RECORD),
+            "feedback/record 事件应持久化"
+        );
+    }
+
+    /// 上下文估算：非负、随消息增长（粗估仅用于百分比展示）。
+    #[test]
+    fn context_estimate_grows_with_messages() {
+        let (mut engine, _rx) = test_engine();
+        let sid = engine.create_session(Some("t")).unwrap();
+        let empty = engine.context_estimate(&sid);
+        engine.send_message(&sid, "这是一段比较长的消息内容，用来撑大上下文估算值").unwrap();
+        let after = engine.context_estimate(&sid);
+        assert!(after > empty, "发送消息后估算应增大 ({empty} -> {after})");
     }
 }

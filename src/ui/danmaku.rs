@@ -113,13 +113,15 @@ impl DanmakuLayer {
             return;
         }
         // 找最空轨道：统计每条轨道上最靠右的弹幕位置
-        let tracks = (self.height() / self.track_h).max(1.0) as usize;
+        let tracks = ((self.height() / self.track_h) as f32).round().max(1.0) as usize;
         let mut track_right: Vec<f32> = vec![0.0; tracks];
         for d in &self.items {
             let ti = ((d.y / self.track_h) as usize).min(tracks - 1);
             // 弹幕右边缘 = x + width；越靠右（x 大）越"新"。
             // 预留左侧 lo 娘宽度，保证相邻弹幕（含 lo 娘）不重叠。
-            track_right[ti] = track_right[ti].max(d.x + d.width + LOLI_W);
+            // 未测量的弹幕 width=0 → 右边缘被低估 → gap 不足。用预估下界。
+            let w_est = if d.measured { d.width } else { (d.text.chars().count() as f32 * 12.0).min(300.0) };
+            track_right[ti] = track_right[ti].max(d.x + w_est + LOLI_W);
         }
         // 选一个右边缘最小的轨道（最空）
         let mut best = 0usize;
@@ -128,11 +130,33 @@ impl DanmakuLayer {
                 best = i;
             }
         }
-        // 新弹幕从宽度处（右侧外）进入；若轨道还有旧弹幕未走完，则从其右边缘外开始
+        // 同轨限速（防追赶重叠的核心）：新弹幕在该轨道的右后方出发，
+        // 若比轨道上任一旧弹幕快，长途跋涉必然追上（Δv 最高 9px/s ×
+        // ~20s 穿越 ≈ 180px ≫ 初始 22px 间隙）。取旧弹幕最小速度封顶：
+        // 同速则间隙恒定，慢则间隙拉大——永不重叠。
+        let track_min_speed = self
+            .items
+            .iter()
+            .filter(|d| {
+                ((d.y / self.track_h) as usize).min(tracks - 1) == best
+            })
+            .map(|d| d.speed)
+            .fold(None::<f32>, |acc: Option<f32>, s| {
+                Some(match acc {
+                    Some(m) if m < s => m,
+                    _ => s,
+                })
+            });
+        // 新弹幕从宽度处（右侧外）进入；若轨道还有旧弹幕未走完，则从其右边缘外开始。
+        // 注：self.width 在 advance() 才同步——首次 fire 时可能是 0（旧值），
+        // max(track_right) 保证至少不与现有弹幕重叠
         let start_x = self.width.max(track_right[best]);
-        // 速度加快（110~170 px/s）：弹幕更快通过，同时驻留数量更少，
-        // 渲染负担更低；低帧率（20fps）下依然流畅
-        let speed = 110.0 + ((text.len() % 5) as f32) * 15.0;
+        // 固定速度 120px/s + 内容 hash 微差（±9，同条内容稳定不变）。
+        // 旧版用 text.len()（字节数）做速度变量——中文/emoji 一个字符 3-4
+        // 字节，同一个流式 chunk 切出的段速度差达 60px/s，视觉忽快忽慢。
+        let hash = text.chars().fold(0u32, |h, c| h.wrapping_add(c as u32));
+        let desired = 120.0 + (hash % 4) as f32 * 3.0; // 120~129
+        let speed = track_min_speed.map_or(desired, |m| desired.min(m));
         self.items.push_back(Danmaku {
             text,
             full,
@@ -164,6 +188,39 @@ impl DanmakuLayer {
     pub fn measure(&mut self, ui: &egui::Ui, font: &FontId) {
         for d in self.items.iter_mut() {
             if !d.measured {
+                // 字形覆盖过滤（只做一次，在首次 layout 前）：弹幕文本来自
+                // 任意工具输出（JSON/路径/代码片段），可能含字体链
+                //（Consolas/雅黑/Segoe Emoji/Symbol）都没有的字符——缺字形
+                // 渲染成"口"（tofu，用户报告弹幕偶尔飘口字）。逐字符探测
+                // （epaint has_glyph 走完整回退链），无字形替换为"·"，
+                // 控制字符替换为空格。
+                let sanitized: String = d
+                    .text
+                    .chars()
+                    .map(|c| {
+                        if c.is_control() {
+                            ' '
+                        } else {
+                            let covered = ui.fonts_mut(|f| f.has_glyph(font, c));
+                            if covered { c } else { '·' }
+                        }
+                    })
+                    .collect();
+                d.text = sanitized;
+                // hover 全文同样过滤（否则 tooltip 里照样飘 tofu）
+                d.full = d
+                    .full
+                    .chars()
+                    .map(|c| {
+                        if c.is_control() {
+                            ' '
+                        } else if ui.fonts_mut(|f| f.has_glyph(font, c)) {
+                            c
+                        } else {
+                            '·'
+                        }
+                    })
+                    .collect();
                 // layout 一次并缓存：绘制阶段直接用 galley，避免每帧重新排版
                 // （颜色按种类排版，绘制时 fallback 同色保持一致）
                 let color = d.kind.fg();
@@ -178,7 +235,7 @@ impl DanmakuLayer {
 
     /// 绘制所有弹幕：每个弹幕左侧带一个小 lo 娘（拉着丝带），
     /// 弹幕按种类画气泡（颜色+形状），悬浮时显示全量内容。
-    pub fn draw(&self, painter: &egui::Painter, origin: Pos2, font: &FontId) {
+    pub fn draw(&self, painter: &egui::Painter, origin: Pos2, _font: &FontId) {
         let pad_x = 8.0;
         let bubble_h = self.track_h - 6.0;
         let hover_pos = painter.ctx().pointer_hover_pos();
@@ -200,11 +257,14 @@ impl DanmakuLayer {
 
             // 2) 气泡背景（种类颜色 + 形状）
             painter.rect_filled(bubble, d.kind.radius(bubble_h), d.kind.bg());
-            // 文本：用缓存的 galley（测量时 layout 一次），避免每帧重新排版
+            // 文本：用缓存的 galley。垂直居中用 mesh_bounds（墨迹边界）
+            // 而非 font.size——逻辑字号 ≠ 字形墨迹高度，混排 emoji/CJK
+            // 时文字在气泡内偏上/偏下（视觉不居中的根因）。
             if let Some(g) = &d.galley {
+                let mb = g.mesh_bounds;
                 let text_pos = pos2(
                     bubble.left() + pad_x,
-                    bubble.top() + (bubble_h - font.size) / 2.0,
+                    bubble.center().y - mb.height() / 2.0 - mb.min.y,
                 );
                 painter.galley(text_pos, g.clone(), d.kind.fg());
             }
@@ -256,10 +316,12 @@ impl DanmakuLayer {
     /// 气泡左侧的小 lo 娘：头发+蝴蝶结+脸+裙子+手臂，
     /// 右手牵着丝带连到气泡左缘（随弹幕一起移动）。
     fn draw_mini_loli(&self, painter: &egui::Painter, bubble: Rect, kind: DanmakuKind) {
-        // 基准高度 24px 的小人，按气泡高度缩放
-        let s = (bubble.height() / 24.0).clamp(0.5, 1.0);
-        let cx = bubble.left() - 12.0 * s; // lo 娘中心 x（气泡左侧）
-        let by = bubble.bottom() + 2.0 * s; // 底部
+        // 缩放固定 0.8：适配 24px 轨道 / 18px 气泡。旧版按 bubble.height()
+        // (18px) 算 s=0.75 再叠加 bubble.bottom()+2*s → lo 娘裙摆+腿超出
+        // 轨道底部，与下一轨弹幕重叠（视觉错乱根因之二）。
+        let s = 0.8;
+        let cx = bubble.left() - 13.0 * s; // lo 娘中心 x（气泡左侧）
+        let by = bubble.bottom() + 1.0;    // 底部贴气泡下缘，不出轨
                                             // 头发（后层大圆）
         painter.circle_filled(
             pos2(cx, by - 16.0 * s),
@@ -386,6 +448,41 @@ impl Default for DanmakuLayer {
 mod tests {
     use super::*;
 
+    /// 同轨限速防追赶：新弹幕速度 ≤ 同轨道旧弹幕最小速度 → 间隙永不缩小。
+    /// 模拟整条穿越（30s），断言同轨任意时刻右缘不越过前方左缘。
+    #[test]
+    fn same_track_speed_clamp_prevents_catchup() {
+        let mut d = DanmakuLayer::new();
+        d.set_height(24.0); // 单轨道
+        d.fire(DanmakuKind::ToolCall, "AAAA".into(), String::new()); // hash→某速度
+        // 强制第一条为最慢 120
+        d.items.back_mut().unwrap().speed = 120.0;
+        d.items.back_mut().unwrap().measured = true;
+        d.items.back_mut().unwrap().width = 100.0;
+        // 第二条:desired 可能 129,同轨封顶到 120
+        d.fire(DanmakuKind::ToolCall, "BBBBBBBB".into(), String::new());
+        {
+            let second = d.items.back_mut().unwrap();
+            assert_eq!(second.speed, 120.0, "同轨新弹幕速度必须被压到 120");
+            second.measured = true;
+            second.width = 100.0;
+        }
+        // 模拟 30 秒:间隙不变(同速)
+        let (mut x1, mut x2) = (
+            d.items.front().unwrap().x,
+            d.items.back().unwrap().x,
+        );
+        let init_gap = x2 - (x1 + 100.0);
+        for _ in 0..300 {
+            x1 -= 120.0 * 0.1;
+            x2 -= 120.0 * 0.1;
+        }
+        assert!(
+            x2 - (x1 + 100.0) >= init_gap - 0.5,
+            "同速穿越间隙不得缩小"
+        );
+    }
+
     #[test]
     fn fire_and_advance() {
         let mut layer = DanmakuLayer::new();
@@ -412,6 +509,43 @@ mod tests {
         assert!(layer.is_empty());
     }
 
+    /// 回归：同轨弹幕全程不重叠。速度统一 + 出生间距保证
+    /// （历史缺陷：速度差 9px/s × 6.7s 飞行 = 60px 漂移 → 追尾重叠）。
+    #[test]
+    fn no_overlap_same_track() {
+        let mut layer = DanmakuLayer::new();
+        layer.set_height(24.0); // 1 轨道
+        let w = 800.0;
+        // 连续发射多条（模拟流式 chunk 高频到达）
+        for i in 0..10 {
+            layer.fire(
+                DanmakuKind::Thinking,
+                format!("msg{i}"),
+                format!("msg{i}"),
+            );
+            // 每帧 advance + measure（真实时序）
+            let mut ui_ctx = egui::Context::default();
+            let _ = &mut ui_ctx;
+            layer.advance(0.016, w);
+        }
+        // 模拟多帧飞行，检查任意时刻同轨不重叠
+        for _ in 0..500 {
+            layer.advance(0.016, w);
+            let mut sorted: Vec<&Danmaku> = layer.items.iter().collect();
+            sorted.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
+            for pair in sorted.windows(2) {
+                let (left, right) = (pair[0], pair[1]);
+                // left 在左，right 在右；left 右边缘 + lo 娘不得越 right 左边缘
+                let left_right = left.x + left.width + LOLI_W;
+                assert!(
+                    left_right <= right.x + 0.5,
+                    "重叠: left_right={left_right:.1} right_x={:.1} (text={:?})",
+                    right.x, left.text
+                );
+            }
+        }
+    }
+
     #[test]
     fn cap_at_limit() {
         let mut layer = DanmakuLayer::new();
@@ -429,5 +563,38 @@ mod tests {
             "同屏弹幕不得超过 MAX_DANMAKU={MAX_DANMAKU}，实际 {}",
             layer.len()
         );
+    }
+
+    /// 弹幕字形过滤：无字形字符（如 U+30EDD 拓展区汉字，常见字体都没有）
+    /// 在首次测量时替换为"·"，永不飘 tofu"口"（弹幕文本来自任意工具输出）。
+    #[test]
+    fn danmaku_filters_missing_glyphs() {
+        let ctx = egui::Context::default();
+        // 装应用的系统字体链（egui 默认字体为空 → has_glyph 恒 false，
+        // 必须用真实链：Consolas/雅黑/Segoe Emoji/Symbol）
+        crate::app::setup_fonts(&ctx);
+        ctx.begin_pass(egui::RawInput::default());
+        let mut dan = DanmakuLayer::new();
+        dan.set_height(60.0);
+        let rare = char::from_u32(0x30EDD).expect("valid char");
+        dan.fire(
+            DanmakuKind::ToolCall,
+            format!("read file.rs {rare} done"),
+            String::new(),
+        );
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let ui = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new("danmaku_glyph_test"),
+            egui::UiBuilder::new().max_rect(rect),
+        );
+        dan.measure(&ui, &FontId::monospace(15.0));
+        let mut out = ctx.end_pass();
+        // 无渲染器：清掉字形光栅化产生的纹理增量（Drop 时未应用会 panic）
+        out.textures_delta.clear();
+        let text = dan.items.front().expect("弹幕应存在").text.clone();
+        assert!(text.contains("file.rs"), "有字形部分保留: {text}");
+        assert!(!text.contains(rare), "无字形字符应被替换: {text}");
+        assert!(text.contains('·'), "应替换为·: {text}");
     }
 }

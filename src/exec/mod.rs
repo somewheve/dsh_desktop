@@ -8,8 +8,10 @@
 //! 升级必须携带 justification 并经审批通道（fail-closed）。
 
 pub mod acl;
+pub mod input;
 pub mod sandbox;
 pub mod subprocess;
+pub mod capture;
 
 pub mod winacl;
 pub use acl::WindowsAclSandbox;

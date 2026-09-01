@@ -21,7 +21,7 @@ pub enum LlmRole {
     Tool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct LlmMessage {
     pub role: LlmRole,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -32,6 +32,102 @@ pub struct LlmMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// 多模态图片（data:image/...;base64,...）。有图时 content 在序列化时
+    /// 自动变为 OpenAI 视觉格式的分段数组：
+    /// `[{type:text},{type:image_url}]`；无图保持纯字符串（兼容旧行为）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<String>>,
+}
+
+impl LlmMessage {
+    /// 构造（无图，兼容旧调用点）。
+    pub fn text(role: LlmRole, content: Option<String>) -> Self {
+        Self {
+            role,
+            content,
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            images: None,
+        }
+    }
+}
+
+/// 多模态：有 images 时 content 序列化为分段数组。
+/// 手动实现（字段形状随 images 切换，无法用 derive 表达）。
+impl Serialize for LlmMessage {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        serialize_multimodal(self, s)
+    }
+}
+
+fn serialize_multimodal<S: serde::Serializer>(
+    msg: &LlmMessage,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut map = s.serialize_map(None)?;
+    map.serialize_entry("role", &msg.role)?;
+    match (&msg.content, &msg.images) {
+        (Some(text), Some(uris)) if !uris.is_empty() => {
+            let mut parts: Vec<serde_json::Value> = Vec::with_capacity(uris.len() + 1);
+            if !text.is_empty() {
+                parts.push(serde_json::json!({"type": "text", "text": text}));
+            }
+            for uri in uris {
+                parts.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {"url": uri}
+                }));
+            }
+            map.serialize_entry("content", &parts)?;
+        }
+        _ => {
+            if let Some(text) = &msg.content {
+                map.serialize_entry("content", text)?;
+            }
+        }
+    }
+    if let Some(id) = &msg.tool_call_id {
+        map.serialize_entry("tool_call_id", id)?;
+    }
+    if let Some(calls) = &msg.tool_calls {
+        map.serialize_entry("tool_calls", calls)?;
+    }
+    if let Some(name) = &msg.name {
+        map.serialize_entry("name", name)?;
+    }
+    map.end()
+}
+
+/// 图片扩展名 → data URI MIME。
+fn image_mime(path: &str) -> Option<&'static str> {
+    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => return None,
+    })
+}
+
+/// 单图大小护栏（data URI 前的原始字节）。
+const IMAGE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 读取图片文件 → data URI（超限/不可读/非图片扩展返回 None）。
+pub fn image_to_data_uri(path: &str) -> Option<String> {
+    let mime = image_mime(path)?;
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > IMAGE_MAX_BYTES {
+        log::warn!("image too large, skipped: {path} ({} bytes)", meta.len());
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Some(format!("data:{mime};base64,{b64}"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +167,44 @@ pub struct ChatRequest {
     /// effort=none → disabled，其余 enabled）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    /// 流式用量统计（include_usage：最后一个 chunk 携带 usage）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+}
+
+/// `{"include_usage": true}`。
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamOptions {
+    pub include_usage: bool,
+}
+
+/// 一次调用的 token 用量（API usage 字段）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn total(&self) -> u64 {
+        self.prompt_tokens + self.completion_tokens
+    }
+}
+
+impl std::ops::AddAssign for TokenUsage {
+    fn add_assign(&mut self, rhs: Self) {
+        self.prompt_tokens += rhs.prompt_tokens;
+        self.completion_tokens += rhs.completion_tokens;
+    }
+}
+
+/// 模型上下文窗口（token，估算用；未知模型取保守 64k）。
+pub fn context_window(model: &str) -> u64 {
+    if model.contains("v4") || model.contains("reasoner") {
+        128_000
+    } else {
+        64_000
+    }
 }
 
 /// `{"thinking": {"type": "enabled" | "disabled"}}`。
@@ -82,7 +216,20 @@ pub struct ThinkingConfig {
 /// 流式 chunk（OpenAI SSE data 行）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct StreamChunk {
+    #[serde(default)]
     pub choices: Vec<StreamChoice>,
+    /// include_usage 时最后一个 chunk 携带（此时 choices 为空数组）
+    #[serde(default)]
+    pub usage: Option<UsageChunk>,
+}
+
+/// usage 对象（缺字段按 0 处理）。
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct UsageChunk {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,6 +277,8 @@ pub enum StreamEvent {
         name: String,
         arguments: String,
     },
+    /// token 用量（include_usage 的末 chunk）
+    Usage(TokenUsage),
     /// 流结束
     Done,
     /// 错误
@@ -208,6 +357,8 @@ impl LlmClient {
                     _ => "enabled".into(),
                 },
             }),
+            // 请求用量统计：末 chunk 返回 usage（UI 显示 token 消耗）
+            stream_options: Some(StreamOptions { include_usage: true }),
         };
         let mut on_event = on_event;
         const MAX_ATTEMPTS: u32 = 3;
@@ -325,6 +476,13 @@ impl LlmClient {
                 }
                 match serde_json::from_str::<StreamChunk>(data) {
                     Ok(parsed) => {
+                        // 用量 chunk（include_usage：末尾携带，choices 为空）
+                        if let Some(u) = parsed.usage {
+                            on_event(StreamEvent::Usage(TokenUsage {
+                                prompt_tokens: u.prompt_tokens,
+                                completion_tokens: u.completion_tokens,
+                            }));
+                        }
                         for choice in parsed.choices {
                             if let Some(c) = choice.delta.content {
                                 if !c.is_empty() {
@@ -408,6 +566,7 @@ impl LlmClient {
                 Message::Assistant {
                     content,
                     tool_calls,
+                    ..
                 } => {
                     trim_pending(&mut out, &mut pending, &mut responded, &mut assistant_idx);
                     pending = tool_calls.iter().map(|tc| tc.id.clone()).collect();
@@ -427,6 +586,7 @@ impl LlmClient {
                             Some(tool_calls.clone())
                         },
                         name: None,
+                        images: None,
                     });
                 }
                 Message::Tool {
@@ -443,20 +603,39 @@ impl LlmClient {
                             tool_call_id: Some(tool_call_id.clone()),
                             tool_calls: None,
                             name: None,
+                            images: None,
                         });
                     } else {
                         // 孤立 tool 消息（前无 assistant tool_calls）→ 丢弃，避免 400
                         log::warn!("丢弃孤立 tool 消息（{tool_call_id}）");
                     }
                 }
-                Message::User { content } => {
+                Message::User { content, images } => {
                     trim_pending(&mut out, &mut pending, &mut responded, &mut assistant_idx);
+                    // 图片路径 → data URI（读盘 + base64；不可读/超限跳过并注记）
+                    let uris: Option<Vec<String>> = images.as_ref().map(|paths| {
+                        paths
+                            .iter()
+                            .filter_map(|p| match image_to_data_uri(p) {
+                                Some(uri) => Some(uri),
+                                None => {
+                                    log::warn!("图片不可读或超限，已跳过: {p}");
+                                    None
+                                }
+                            })
+                            .collect()
+                    });
+                    let uris = match uris {
+                        Some(u) if !u.is_empty() => Some(u),
+                        _ => None,
+                    };
                     out.push(LlmMessage {
                         role: LlmRole::User,
                         content: Some(content.clone()),
                         tool_call_id: None,
                         tool_calls: None,
                         name: None,
+                        images: uris,
                     });
                 }
             }
@@ -567,11 +746,13 @@ mod tests {
         let msgs = vec![
             Message::User {
                 content: "继续".into(),
+                images: None,
             },
             Message::Assistant {
                 content: String::new(), // 纯工具调用回合：无文本
                 tool_calls: vec![tc("call-1")],
-            },
+                reasoning: None,
+                },
         ];
         let out = LlmClient::to_llm_messages(&msgs);
         for m in &out {
@@ -592,11 +773,13 @@ mod tests {
         let msgs = vec![
             Message::User {
                 content: "hi".into(),
+                images: None,
             },
             Message::Assistant {
                 content: String::new(),
                 tool_calls: vec![tc("call-1")],
-            },
+                reasoning: None,
+                },
             Message::Tool {
                 tool_call_id: "call-1".into(),
                 content: "ok".into(),
@@ -615,11 +798,13 @@ mod tests {
         let msgs = vec![
             Message::User {
                 content: "hi".into(),
+                images: None,
             },
             Message::Assistant {
                 content: String::new(),
                 tool_calls: vec![tc("call-1"), tc("call-2")],
-            },
+                reasoning: None,
+                },
             Message::Tool {
                 tool_call_id: "call-1".into(),
                 content: "ok".into(),
@@ -644,11 +829,13 @@ mod tests {
         let msgs = vec![
             Message::User {
                 content: "跑一下".into(),
+                images: None,
             },
             Message::Assistant {
                 content: String::new(),
                 tool_calls: vec![tc("call-ask")],
-            },
+                reasoning: None,
+                },
             Message::Tool {
                 tool_call_id: "call-ask".into(),
                 content: "{\"await_user\":true,\"question\":\"继续？\"}".into(),
@@ -660,5 +847,106 @@ mod tests {
             a.tool_calls.is_some(),
             "ask_user 已配对时 tool_calls 必须保留"
         );
+    }
+
+    /// usage chunk 解析：include_usage 的末 chunk（choices 空 + usage 字段）
+    /// 与普通 chunk（无 usage）都必须可反序列化。
+    #[test]
+    fn usage_chunk_parses() {
+        let normal: StreamChunk = serde_json::from_str(
+            r#"{"choices":[{"delta":{"content":"hi"}}]}"#,
+        )
+        .unwrap();
+        assert!(normal.usage.is_none());
+        assert_eq!(normal.choices.len(), 1);
+
+        let usage_only: StreamChunk = serde_json::from_str(
+            r#"{"choices":[],"usage":{"prompt_tokens":1234,"completion_tokens":56}}"#,
+        )
+        .unwrap();
+        let u = usage_only.usage.expect("usage chunk");
+        assert_eq!(u.prompt_tokens, 1234);
+        assert_eq!(u.completion_tokens, 56);
+
+        // 未知扩展字段（prompt_cache_hit_tokens 等）不阻断解析
+        let extended: StreamChunk = serde_json::from_str(
+            r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"prompt_cache_hit_tokens":9}}"#,
+        )
+        .unwrap();
+        assert_eq!(extended.usage.unwrap().prompt_tokens, 1);
+    }
+
+    /// 多模态序列化：有 images 时 content 变分段数组，无图保持纯字符串。
+    #[test]
+    fn multimodal_message_serialization() {
+        let with_img = LlmMessage {
+            role: LlmRole::User,
+            content: Some("看这张图".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            images: Some(vec!["data:image/png;base64,QUJD".into()]),
+        };
+        let v = serde_json::to_value(&with_img).unwrap();
+        // content 是数组：[text, image_url]
+        let parts = v.get("content").unwrap().as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "看这张图");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+        // images 字段本身不出现在线上格式（已内联进 content）
+        assert!(v.get("images").is_none());
+
+        // 无图：content 纯字符串（兼容旧请求格式）
+        let plain = LlmMessage {
+            role: LlmRole::User,
+            content: Some("普通消息".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            images: None,
+        };
+        let v = serde_json::to_value(&plain).unwrap();
+        assert_eq!(v["content"], "普通消息");
+
+        // to_llm_messages：User.images 路径 → data URI（临时图片文件）
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("pic.png");
+        std::fs::write(&img, b"fakepng").unwrap();
+        let msgs = vec![Message::User {
+            content: "描述".into(),
+            images: Some(vec![img.display().to_string()]),
+        }];
+        let out = LlmClient::to_llm_messages(&msgs);
+        assert_eq!(out.len(), 1);
+        let uris = out[0].images.as_ref().unwrap();
+        assert!(uris[0].starts_with("data:image/png;base64,"), "{}", uris[0]);
+
+        // 不可读路径：跳过（images 归 None，不产生非法请求）
+        let msgs = vec![Message::User {
+            content: "x".into(),
+            images: Some(vec!["Z:/no/such/img.png".into()]),
+        }];
+        let out = LlmClient::to_llm_messages(&msgs);
+        assert!(out[0].images.is_none(), "不可读图片应跳过");
+    }
+
+    /// 用量累加与上下文窗口表。
+    #[test]
+    fn token_usage_math_and_context_window() {
+        let mut a = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+        };
+        a += TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 2,
+        };
+        assert_eq!(a.total(), 18);
+        assert_eq!(context_window("deepseek-v4-flash"), 128_000);
+        assert_eq!(context_window("deepseek-reasoner"), 128_000);
+        assert_eq!(context_window("deepseek-chat"), 64_000);
+        assert_eq!(context_window("unknown-model"), 64_000);
     }
 }

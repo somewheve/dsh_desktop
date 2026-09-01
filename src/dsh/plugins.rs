@@ -267,6 +267,7 @@ pub fn scan_dsh_plugins(cfg: &crate::config::AppConfig) -> Vec<(String, String, 
 pub fn fetch_dsh_plugin_list() -> Result<Vec<(String, String)>, String> {
     let url = "https://registry.npmjs.org/@deepseek-ai%2Fdsh";
     let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
         .user_agent("dsh-desktop-plugin-fetch")
         .build()
         .map_err(|e| format!("HTTP 客户端初始化失败: {e}"))?;
@@ -314,6 +315,7 @@ pub fn download_dsh_plugin(name: &str, cache_root: &Path) -> Result<PathBuf, Str
     // registry 单包元数据 → tarball URL
     let meta_url = format!("https://registry.npmjs.org/{}", name.replace('/', "%2F"));
     let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
         .user_agent("dsh-desktop-plugin-fetch")
         .build()
         .map_err(|e| format!("HTTP 客户端初始化失败: {e}"))?;

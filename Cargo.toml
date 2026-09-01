@@ -23,7 +23,7 @@ anyhow = "1"
 thiserror = "2"
 parking_lot = "0.12"
 # tokio：只开 rt-multi-thread（Runtime::new），不编 full 全家桶
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 futures-util = "0.3"
 xitca-web = { version = "0.8", features = ["params", "json"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "rustls-native-certs", "webpki-roots", "blocking"] }
@@ -32,6 +32,8 @@ rfd = { version = "0.17.2", default-features = false }
 pulldown-cmark = "0.13"
 # 沙箱 capability SID 派生用（与官方 workspace-sid 哈希算法一致）
 sha2 = "0.10"
+# 图片附件 → vision 多模态（data URI base64）
+base64 = "0.22"
 # 对话消息内嵌图片解码（png/jpg/gif/webp → egui 纹理）
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
 # 纯 Rust Win32 restricted-token 沙箱（CreateRestrictedToken / CreateProcessAsUserW / ACL）
@@ -51,6 +53,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_Storage_FileSystem",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Storage_Xps",
 ] }
 
 [dev-dependencies]

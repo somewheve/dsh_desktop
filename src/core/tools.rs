@@ -259,6 +259,94 @@ impl ToolRegistry {
         }
         Ok(())
     }
+
+    /// workspace-write 模式下读取仍放行的路径根（用户策略：除基础命令与
+    /// DSH 自身目录外，工作区外一律不可访问——读取同样受限）：
+    /// - 系统基础路径（cmd/pwsh/系统工具与运行库所在，基础命令的执行依赖）
+    /// - 用户目录下的 `.dsh`（DSH 主目录：技能/插件/主题/配置——load_skill
+    ///   等自身机制依赖，用户明确要求不拦截）；`DSH_HOME` 环境变量优先
+    fn read_allowlist_roots() -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = [
+            r"C:\Windows",
+            r"C:\Program Files",
+            r"C:\Program Files (x86)",
+            r"C:\ProgramData",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        match std::env::var_os("DSH_HOME") {
+            Some(h) if !h.is_empty() => roots.push(PathBuf::from(h)),
+            _ => {
+                if let Some(up) = std::env::var_os("USERPROFILE") {
+                    roots.push(PathBuf::from(up).join(".dsh"));
+                }
+            }
+        }
+        roots
+    }
+
+    /// 路径是否在读取白名单根下（大小写无关，兼容正/反斜杠）。
+    /// 额外：路径本身是白名单根的**前缀**也放行——shell 命令里带空格的
+    /// 系统路径（"C:\Program Files\Google"）常因引号被拆词，提取器只能
+    /// 取到 "C:\Program"（历史缺陷：不匹配任何白名单根 → 误拦）。
+    fn path_in_read_allowlist(path: &Path) -> bool {
+        let norm = |p: &Path| -> String {
+            p.to_string_lossy().to_lowercase().replace("/", "\\")
+        };
+        let s = norm(path);
+        if Self::read_allowlist_roots().iter().any(|r| {
+            let r = norm(r);
+            s == r || s.starts_with(&format!("{r}\\"))
+        }) {
+            return true;
+        }
+        // 引号拆词残段：shell 里 "C:\\Program Files\\X" 会被
+        // whitespace 拆词成 "C:\\Program"。残段特征 = 无扩展名且为
+        // 2 段路径（盘符+一级目录）。特征命中且该目录名与某白名单根的
+        // 某级目录段前缀互含（program ↔ program files）→ 放行残段；
+        // 完整路径 token 仍走上方正常判定。
+        if !s.contains(".") {
+            let parts: Vec<&str> = s.split("\\").collect();
+            if parts.len() == 2 && parts[1].len() >= 3 {
+                let dir = parts[1];
+                return Self::read_allowlist_roots().iter().any(|r| {
+                    norm(r)
+                        .split("\\")
+                        .any(|seg| seg.len() >= 3 && (seg.starts_with(dir) || dir.starts_with(seg)))
+                });
+            }
+        }
+        false
+    }
+
+    /// 读工具的边界检查：workspace-write 下，工作区与白名单（系统基础 +
+    /// ~/.dsh）之外**读取也被拒绝**（历史缺陷：只拦写不拦读，工作区外
+    /// 文件可随意读）。read-only / danger 模式读取不受限。
+    fn check_read_allowed(&self, path: &Path) -> Result<(), String> {
+        let ww = self
+            .sandbox
+            .as_ref()
+            .map(|sb| matches!(sb.mode, crate::exec::SandboxMode::WorkspaceWrite))
+            .unwrap_or(false);
+        if !ww {
+            return Ok(());
+        }
+        let ws = match &self.workspace_root {
+            Some(w) => w.clone(),
+            None => return Ok(()),
+        };
+        if path_is_within_ws(path, &ws) || Self::path_in_read_allowlist(path) {
+            return Ok(());
+        }
+        Err(format!(
+            "工作区外路径禁止访问（仅工作区模式下读取同样受限）：{}
+工作区：{}；系统基础路径与 ~/.dsh 不受影响。
+请改用工作区内路径，或切换权限模式。",
+            path.display(),
+            ws.display()
+        ))
+    }
     pub fn tool_specs(&self) -> Vec<crate::core::llm::ToolSpec> {
         use crate::core::llm::tool_spec;
         let mut specs = vec![
@@ -299,13 +387,78 @@ impl ToolRegistry {
             ),
             tool_spec(
                 "fs_search",
-                "在目录中搜索文件名/内容（对齐 dsh-tool-fs-search）。",
-                json!({"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"}},"required":["path","pattern"]}),
+                "在目录中搜索：文件名模糊匹配（含通配符 * ?）或文件内容全文搜索（≤256KB 文本文件，返回匹配行）。先匹配文件名，不中则搜内容。",
+                json!({"type":"object","properties":{"path":{"type":"string","description":"搜索起始目录"},"pattern":{"type":"string","description":"搜索词：文件名子串（支持 * ? 通配符）或内容关键词"}},"required":["path","pattern"]}),
             ),
             tool_spec(
                 "web_search",
                 "联网搜索最新信息（DuckDuckGo，结果上限 8 条：标题/链接/摘要）。查事实、时效信息、文档时使用。",
                 json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}),
+            ),
+            tool_spec(
+                "read_url",
+                "抓取网页 URL 并返回正文文本（搜索后深入阅读、查文档时使用）。自动剥离 HTML 标签，返回纯文本（上限 32KB）。",
+                json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}),
+            ),
+            tool_spec(
+                "read_image",
+                "读取本地图片文件并返回描述（视觉分析：截图/图表/照片的内容识别）。需要 vision 模型（deepseek-v4-flash-vision-exp）。返回图片中的文字、图表数据、界面元素等信息。",
+                json!({"type":"object","properties":{"path":{"type":"string"},"question":{"type":"string","description":"想从图片中了解什么（可选，默认通用描述）"}},"required":["path"]}),
+            ),
+            tool_spec(
+                "take_screenshot",
+                "截取屏幕截图。三种模式：1) 全屏截图（不传参数）；2) 按窗口标题或进程名截图（传 target 如 \"Chrome\" / \"chrome.exe\" / \"记事本\"）；3) 列出可截图的窗口（传 list=\"true\"）。截图保存为 PNG，返回文件路径供 read_image 分析。",
+                json!({"type":"object","properties":{"target":{"type":"string","description":"窗口标题或进程名（模糊匹配）"},"list":{"type":"boolean","description":"传 true 只列出窗口不截图"}}}),
+            ),
+            tool_spec(
+                "mouse_click",
+                "点击鼠标（操作真实系统界面）。坐标为屏幕物理像素，与 take_screenshot 截图坐标一致——务必先截图定位目标再点击。button 默认 left；double=true 双击。",
+                json!({"type":"object","properties":{
+                    "x":{"type":"integer","description":"屏幕 X（物理像素，同截图坐标）"},
+                    "y":{"type":"integer","description":"屏幕 Y（物理像素，同截图坐标）"},
+                    "button":{"type":"string","enum":["left","right","middle"],"description":"默认 left"},
+                    "double":{"type":"boolean","description":"双击（默认 false）"}
+                },"required":["x","y"]}),
+            ),
+            tool_spec(
+                "mouse_move",
+                "移动鼠标到指定屏幕坐标（物理像素，同 take_screenshot 截图坐标）。常用于 hover 或为 mouse_scroll 定位。",
+                json!({"type":"object","properties":{
+                    "x":{"type":"integer"},"y":{"type":"integer"}
+                },"required":["x","y"]}),
+            ),
+            tool_spec(
+                "mouse_drag",
+                "按住鼠标从起点拖拽到终点（物理像素，同截图坐标）。用于拖动文件/滑块/选区等。button 默认 left。",
+                json!({"type":"object","properties":{
+                    "from_x":{"type":"integer"},"from_y":{"type":"integer"},
+                    "to_x":{"type":"integer"},"to_y":{"type":"integer"},
+                    "button":{"type":"string","enum":["left","right","middle"],"description":"默认 left"}
+                },"required":["from_x","from_y","to_x","to_y"]}),
+            ),
+            tool_spec(
+                "mouse_scroll",
+                "滚动滚轮。direction 默认 down；amount 为格数（默认 3）；可选 x/y 先移动鼠标到该位置（物理像素）。",
+                json!({"type":"object","properties":{
+                    "direction":{"type":"string","enum":["up","down"],"description":"默认 down"},
+                    "amount":{"type":"integer","description":"格数（默认 3，上限 30）"},
+                    "x":{"type":"integer","description":"可选：先移动到该坐标"},
+                    "y":{"type":"integer"}
+                }}),
+            ),
+            tool_spec(
+                "key_type",
+                "键入文本（逐字符 Unicode 输入，支持任意语言；\\n 转为回车）。用于向已聚焦的输入框输入内容——通常先 mouse_click 聚焦目标输入框。",
+                json!({"type":"object","properties":{
+                    "text":{"type":"string"}
+                },"required":["text"]}),
+            ),
+            tool_spec(
+                "key_press",
+                "按下按键/组合键。格式：\"ctrl+s\"、\"ctrl+shift+t\"、\"alt+f4\"、\"win+r\"，或单键 \"enter\"/\"esc\"/\"tab\"/\"backspace\"/\"delete\"/\"home\"/\"end\"/\"pgup\"/\"pgdn\"/\"up\"/\"down\"/\"left\"/\"right\"/\"space\"/\"f1\"-\"f12\"/字母/数字。",
+                json!({"type":"object","properties":{
+                    "combo":{"type":"string","description":"如 ctrl+s、alt+f4、enter"}
+                },"required":["combo"]}),
             ),
             tool_spec(
                 "ask_user",
@@ -324,7 +477,7 @@ impl ToolRegistry {
             ),
             tool_spec(
                 "exit_plan_mode",
-                "退出计划模式（计划完成，开始执行）。",
+                "退出计划模式。⚠️ 调用前必须先用 plan_write 把计划中所有剩余的 `- [ ]` 改成 `- [x]`（标记全部完成），否则计划卡片的进度不会到 N/N。如果还有未完成的步骤就不应该调用本工具。",
                 json!({"type":"object","properties":{}}),
             ),
             tool_spec(
@@ -380,6 +533,15 @@ impl ToolRegistry {
             "str_replace_editor" => self.tool_str_replace(args),
             "fs_search" => self.tool_fs_search(args),
             "web_search" => self.tool_web_search(args),
+            "take_screenshot" => self.tool_take_screenshot(args),
+            "mouse_click" => self.tool_mouse_click(args),
+            "mouse_move" => self.tool_mouse_move(args),
+            "mouse_drag" => self.tool_mouse_drag(args),
+            "mouse_scroll" => self.tool_mouse_scroll(args),
+            "key_type" => self.tool_key_type(args),
+            "key_press" => self.tool_key_press(args),
+            "read_url" => self.tool_read_url(args),
+            "read_image" => self.tool_read_image(args),
             "ask_user" => ToolOutput::ok(json!({
                 "await_user": true,
                 "note": "问题已提交给用户，回合暂停等待回答",
@@ -531,10 +693,25 @@ impl ToolRegistry {
                     .unwrap_or(false);
                 if same_drive && !p.starts_with(ws) && !p.exists() {
                     let rest: PathBuf = p.components().skip(2).collect();
+                    // 系统根目录不纠正：C:\Windows\... 等是明确的系统路径
+                    // 意图（不是打错的相对路径），纠正进工作区会让越权写
+                    // 静默绕过审批（工作区在 C 盘时曾发生）。
+                    const SYSTEM_ROOTS: &[&str] = &[
+                        "windows", "program files", "program files (x86)",
+                        "programdata", "users", "perflogs", "$recycle.bin",
+                    ];
+                    let first_is_system = rest
+                        .components()
+                        .next()
+                        .map(|c| {
+                            let f = c.as_os_str().to_string_lossy().to_lowercase();
+                            SYSTEM_ROOTS.contains(&f.as_str())
+                        })
+                        .unwrap_or(false);
                     // 深度限制：非盘符部分 ≤3 级才纠正（短路径 = AI 可能拼错；
                     // 深层路径 = 用户真实绝对路径，不该纠正）
                     let depth = rest.components().count();
-                    if !rest.as_os_str().is_empty() && depth <= 3 {
+                    if !first_is_system && !rest.as_os_str().is_empty() && depth <= 3 {
                         let corrected = ws.join(&rest);
                         if corrected.starts_with(ws) {
                             log::info!(
@@ -553,6 +730,85 @@ impl ToolRegistry {
         }
     }
 
+    /// shell 写门（workspace-write 限定）：写目标越区 → Err(拒绝文案)。
+    /// read-only 由受限令牌覆盖；danger 全通。目标提取用增强解析
+    /// （含 cd 穿越跟踪，见 extract_redirect_targets_ctx）。
+    /// .NET 直调写的标记（目标不可静态判定，消费端按越区处理）。
+    const DOTNET_WRITE_MARKER: &str = "__dotnet_write__";
+
+    fn shell_write_gate(&self, command: &str) -> Result<(), String> {
+        let ww = self
+            .sandbox
+            .as_ref()
+            .map(|sb| matches!(sb.mode, crate::exec::SandboxMode::WorkspaceWrite))
+            .unwrap_or(false);
+        if !ww {
+            return Ok(());
+        }
+        let ws = match &self.workspace_root {
+            Some(w) => w.clone(),
+            None => return Ok(()),
+        };
+        for t in extract_redirect_targets_ctx(command) {
+            if t.is_flag || t.target.is_empty() {
+                continue;
+            }
+            // .NET 直调写：目标不可判定 → 保守拒绝（fail-closed）
+            if t.target == Self::DOTNET_WRITE_MARKER {
+                return Err(format!(
+                    "仅工作区模式下拒绝 .NET 直调写（{}）：目标路径无法静态判定。\n请改用 Set-Content/Out-File 等可解析形式，或切换权限模式。",
+                    t.raw
+                ));
+            }
+            // raw 解析（不走 resolve 的同盘自动改写——历史缺陷：改写后的
+            // 区外路径被拼回工作区，gate 看到区内放行而命令实际写原路径）
+            let abs = if t.target.contains(':') || t.target.starts_with('\\') {
+                std::path::PathBuf::from(&t.target)
+            } else {
+                self.cwd.join(&t.target)
+            };
+            if !path_is_within_ws(&abs, &ws) {
+                return Err(format!(
+                    "仅工作区模式下拒绝越区写：{}（目标 {} 不在工作区 {} 内）。
+请改写工作区内路径，或切换权限模式/让用户审批。",
+                    t.raw, abs.display(), ws.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// shell 读边界（workspace-write）：命令中引用的绝对路径若在工作区与
+    /// 读白名单之外 → 拒绝执行（用户策略：除基础命令外其他盘文件不可访问）。
+    /// 与写门互补：写门拦重定向/写 cmdlet 目标，此门拦一切显式区外路径。
+    fn shell_read_gate(&self, command: &str) -> Result<(), String> {
+        let ww = self
+            .sandbox
+            .as_ref()
+            .map(|sb| matches!(sb.mode, crate::exec::SandboxMode::WorkspaceWrite))
+            .unwrap_or(false);
+        if !ww {
+            return Ok(());
+        }
+        let ws = match &self.workspace_root {
+            Some(w) => w.clone(),
+            None => return Ok(()),
+        };
+        for target in extract_absolute_paths(command) {
+            let abs = PathBuf::from(&target);
+            if path_is_within_ws(&abs, &ws) || Self::path_in_read_allowlist(&abs) {
+                continue;
+            }
+            return Err(format!(
+                "工作区外路径禁止访问（仅工作区模式）：命令引用了 {}（不在工作区 {} 内，
+也不属于系统基础路径 / ~/.dsh）。请改用工作区内路径，或切换权限模式。",
+                target,
+                ws.display()
+            ));
+        }
+        Ok(())
+    }
+
     fn tool_bash(&self, args: &Value) -> ToolOutput {
         let command = args
             .get("command")
@@ -561,6 +817,16 @@ impl ToolRegistry {
             .to_string();
         if command.is_empty() {
             return ToolOutput::err("empty command");
+        }
+        // workspace-write 应用层硬门（fail-closed）：bash/pwsh 的写目标
+        // 越出工作区 → 直接拒绝（历史缺陷：WW 模式 OS 层不强制，审批启发式
+        // 是唯一闸门，解析漏写即无审批越区写）。read-only 已由受限令牌覆盖。
+        if let Err(denied) = self.shell_write_gate(&command) {
+            return ToolOutput::err(denied);
+        }
+        // 读边界（workspace-write）：命令引用区外绝对路径 → 拒绝
+        if let Err(denied) = self.shell_read_gate(&command) {
+            return ToolOutput::err(denied);
         }
         let cwd = args
             .get("cwd")
@@ -586,6 +852,13 @@ impl ToolRegistry {
             .to_string();
         if command.is_empty() {
             return ToolOutput::err("empty command");
+        }
+        if let Err(denied) = self.shell_write_gate(&command) {
+            return ToolOutput::err(denied);
+        }
+        // 读边界（workspace-write）：命令引用区外绝对路径 → 拒绝
+        if let Err(denied) = self.shell_read_gate(&command) {
+            return ToolOutput::err(denied);
         }
         // 沙箱接线：受限模式下经 restricted-token 执行，fail-closed。
         if let Some(sb) = &self.sandbox {
@@ -615,6 +888,9 @@ impl ToolRegistry {
             Some(p) => self.resolve(p),
             None => return ToolOutput::err("missing path"),
         };
+        if let Err(denied) = self.check_read_allowed(&path) {
+            return ToolOutput::err(denied);
+        }
         // 大小上限：模型选中的路径可能是多 GB 日志——read_to_string 会把
         // 整个文件拉进内存（卡死/OOM）。超限给出可操作的错误。
         const MAX_FILE_BYTES: u64 = 8 << 20; // 8MB
@@ -669,9 +945,39 @@ impl ToolRegistry {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        // 覆盖前捕获旧内容 → 结果携带 diff（UI 渲染 diff 卡片，用户可审阅改动）
+        let old = std::fs::read_to_string(&path).ok();
         match std::fs::write(&path, content) {
             Ok(()) => {
-                ToolOutput::ok(json!({"path": path.display().to_string(), "bytes": content.len()}))
+                let mut out = json!({"path": path.display().to_string(), "bytes": content.len()});
+                match old {
+                    Some(old) => {
+                        match crate::core::diff::line_diff(&old, content) {
+                            Some(d) if !d.is_empty() => {
+                                out["diff"] = json!(d);
+                            }
+                            Some(_) => { /* 内容相同 */ }
+                            None => {
+                                // 超规模：降级为行数摘要
+                                out["diff_note"] = json!(format!(
+                                    "整文件重写：{} 行 → {} 行（过大不做逐行 diff）",
+                                    old.lines().count(),
+                                    content.lines().count()
+                                ));
+                            }
+                        }
+                    }
+                    None => {
+                        out["created"] = json!(true);
+                        // 新建：全为增行（UI diff 卡片可审阅全文）
+                        if let Some(d) = crate::core::diff::line_diff("", content) {
+                            if !d.is_empty() {
+                                out["diff"] = json!(d);
+                            }
+                        }
+                    }
+                }
+                ToolOutput::ok(out)
             }
             Err(e) => ToolOutput::err(e.to_string()),
         }
@@ -683,6 +989,9 @@ impl ToolRegistry {
             .and_then(Value::as_str)
             .map(|s| self.resolve(s))
             .unwrap_or_else(|| self.cwd.clone());
+        if let Err(denied) = self.check_read_allowed(&dir) {
+            return ToolOutput::err(denied);
+        }
         match std::fs::read_dir(&dir) {
             Ok(entries) => {
                 let mut items = Vec::new();
@@ -718,8 +1027,24 @@ impl ToolRegistry {
         };
         match command {
             "view" => {
+                // 读边界只管读：view 是纯读操作；create/str_replace 是写
+                // 操作，由审批系统与写门治理（历史缺陷：读门套在整个工具
+                // 上，用户审批通过的区外写仍被"禁止访问"拦截）
+                if let Err(denied) = self.check_read_allowed(&path) {
+                    return ToolOutput::err(denied);
+                }
                 if path.is_dir() {
                     return self.tool_list_dir(args);
+                }
+                // 大小护栏（历史缺陷：view 无上限，GB 级日志整读入内存；
+                // read_file 有 8MB 上限而 view 没有）
+                if let Ok(m) = std::fs::metadata(&path) {
+                    if m.len() > 8 * 1024 * 1024 {
+                        return ToolOutput::err(format!(
+                            "文件过大（{} MB > 8MB 上限），请用 read_file 的 offset/limit 分段读取",
+                            m.len() / 1024 / 1024
+                        ));
+                    }
                 }
                 match std::fs::read_to_string(&path) {
                     Ok(text) => {
@@ -749,7 +1074,17 @@ impl ToolRegistry {
                 }
                 match std::fs::write(&path, content) {
                     Ok(()) => {
-                        ToolOutput::ok(json!({"path": path.display().to_string(), "created": true}))
+                        // 新建文件：diff = 全部为新增行（UI diff 卡片可审阅全文）
+                        let mut out = json!({
+                            "path": path.display().to_string(),
+                            "created": true
+                        });
+                        if let Some(d) = crate::core::diff::line_diff("", content) {
+                            if !d.is_empty() {
+                                out["diff"] = json!(d);
+                            }
+                        }
+                        ToolOutput::ok(out)
                     }
                     Err(e) => ToolOutput::err(e.to_string()),
                 }
@@ -763,6 +1098,14 @@ impl ToolRegistry {
                 if let Err(e) = self.check_write_allowed(&path) {
                     return ToolOutput::err(e);
                 }
+                if let Ok(m) = std::fs::metadata(&path) {
+                    if m.len() > 8 * 1024 * 1024 {
+                        return ToolOutput::err(format!(
+                            "文件过大（{} MB > 8MB 上限），请用 read_file 分段读取后再改",
+                            m.len() / 1024 / 1024
+                        ));
+                    }
+                }
                 match std::fs::read_to_string(&path) {
                     Ok(text) => {
                         // 必须唯一匹配（对齐 DSH 语义）
@@ -775,9 +1118,21 @@ impl ToolRegistry {
                         }
                         let new_text = text.replacen(old_str, new_str, 1);
                         match std::fs::write(&path, &new_text) {
-                            Ok(()) => ToolOutput::ok(
-                                json!({"path": path.display().to_string(), "replaced": true, "old_len": old_str.len(), "new_len": new_str.len()}),
-                            ),
+                            Ok(()) => {
+                                let mut out = json!({
+                                    "path": path.display().to_string(),
+                                    "replaced": true,
+                                    "old_len": old_str.len(),
+                                    "new_len": new_str.len()
+                                });
+                                // 片段 diff（old_str → new_str）：改动可视
+                                if let Some(d) = crate::core::diff::line_diff(old_str, new_str) {
+                                    if !d.is_empty() {
+                                        out["diff"] = json!(d);
+                                    }
+                                }
+                                ToolOutput::ok(out)
+                            }
                             Err(e) => ToolOutput::err(e.to_string()),
                         }
                     }
@@ -788,18 +1143,28 @@ impl ToolRegistry {
         }
     }
 
-    /// fs_search：文件名/内容搜索。
+    /// fs_search：文件名模糊 + 文件内容全文搜索（双模式）。
+    /// pattern 含通配符(*?)时按文件名 glob 匹配；否则先匹配文件名，
+    /// 不中则读文件内容搜索（≤256KB 文本文件）。
     fn tool_fs_search(&self, args: &Value) -> ToolOutput {
         let dir = args
             .get("path")
             .and_then(Value::as_str)
             .map(|s| self.resolve(s))
             .unwrap_or_else(|| self.cwd.clone());
+        if let Err(denied) = self.check_read_allowed(&dir) {
+            return ToolOutput::err(denied);
+        }
         let pattern = args
             .get("pattern")
             .and_then(Value::as_str)
             .unwrap_or_default()
-            .to_lowercase();
+            .to_string();
+        if pattern.is_empty() {
+            return ToolOutput::err("pattern 不能为空");
+        }
+        let pattern_lower = pattern.to_lowercase();
+        let is_glob = pattern.contains('*') || pattern.contains('?');
         let mut hits = Vec::new();
         let mut stack = vec![dir.clone()];
         let mut scanned = 0usize;
@@ -810,7 +1175,12 @@ impl ToolRegistry {
             let Ok(entries) = std::fs::read_dir(&d) else {
                 continue;
             };
+            let mut dir_scanned = 0usize;
             for e in entries.flatten() {
+                dir_scanned += 1;
+                if dir_scanned > 2000 {
+                    break;
+                }
                 scanned += 1;
                 let name = e.file_name().to_string_lossy().into_owned();
                 if name.starts_with('.') || name == "target" || name == "node_modules" {
@@ -819,13 +1189,333 @@ impl ToolRegistry {
                 let p = e.path();
                 if p.is_dir() {
                     stack.push(p);
-                } else if name.to_lowercase().contains(&pattern) {
-                    hits.push(json!({"path": p.display().to_string(), "kind": "file"}));
+                    continue;
+                }
+                let name_lower = name.to_lowercase();
+                let name_match = if is_glob {
+                    glob_match(&pattern_lower, &name_lower)
+                } else {
+                    name_lower.contains(&pattern_lower)
+                };
+                if name_match {
+                    hits.push(json!({"path": p.display().to_string(), "kind": "name"}));
+                    continue;
+                }
+                // 内容搜索：非 glob 且文件名不中时，读小文本文件搜内容
+                if !is_glob && hits.len() < 50 {
+                    if let Ok(meta) = std::fs::metadata(&p) {
+                        if meta.len() <= 256 * 1024 {
+                            if let Ok(text) = std::fs::read_to_string(&p) {
+                                if text.to_lowercase().contains(&pattern_lower) {
+                                    // 找到匹配行（最多 3 行上下文）
+                                    let matching: Vec<&str> = text
+                                        .lines()
+                                        .filter(|l| l.to_lowercase().contains(&pattern_lower))
+                                        .take(3)
+                                        .collect();
+                                    hits.push(json!({
+                                        "path": p.display().to_string(),
+                                        "kind": "content",
+                                        "lines": matching,
+                                    }));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
         hits.truncate(50);
         ToolOutput::ok(json!({"hits": hits, "count": hits.len()}))
+    }
+
+    /// take_screenshot：全屏 / 按窗口截图。
+    fn tool_take_screenshot(&self, args: &Value) -> ToolOutput {
+        // 模式 3：列出窗口
+        if args.get("list").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let windows = crate::exec::capture::find_windows("");
+            let list: Vec<serde_json::Value> = windows
+                .iter()
+                .map(|w| {
+                    json!({
+                        "title": w.title,
+                        "pid": w.pid,
+                        "process": w.process_name,
+                    })
+                })
+                .collect();
+            return ToolOutput::ok(json!({
+                "windows": list,
+                "count": list.len(),
+                "note": "传 target 参数截图指定窗口",
+            }));
+        }
+
+        let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
+
+        if target.is_empty() {
+            // 模式 1：全屏
+            match crate::exec::capture::capture_screen() {
+                Ok(c) => ToolOutput::ok(json!({
+                    "path": c.path.display().to_string(),
+                    "width": c.width,
+                    "height": c.height,
+                    "source": c.source,
+                    "note": "全屏截图已保存，可用 read_image 分析内容",
+                })),
+                Err(e) => ToolOutput::err(format!("截图失败: {e}")),
+            }
+        } else {
+            // 模式 2：按标题/进程名
+            let windows = crate::exec::capture::find_windows(target);
+            if windows.is_empty() {
+                return ToolOutput::err(format!(
+                    "未找到匹配 \"{target}\" 的窗口（传 list=true 查看可用窗口列表）"
+                ));
+            }
+            // 截第一个匹配的
+            let w = &windows[0];
+            match crate::exec::capture::capture_window(w.hwnd) {
+                Ok(c) => ToolOutput::ok(json!({
+                    "path": c.path.display().to_string(),
+                    "width": c.width,
+                    "height": c.height,
+                    "source": c.source,
+                    "pid": w.pid,
+                    "process": w.process_name,
+                    "matched": windows.len(),
+                    "note": "窗口截图已保存（即使被遮挡也能截取），可用 read_image 分析",
+                })),
+                Err(e) => ToolOutput::err(format!("截图失败: {e}")),
+            }
+        }
+    }
+
+    /// GUI 输入注入（鼠标点击/移动/拖拽/滚动/键盘）的沙箱闸门：
+    /// read-only / workspace-write 模式下禁止——注入输入等效于任意系统
+    /// 操作（可绕过文件边界：点开资源管理器删任意盘文件）。全访问允许。
+    fn check_gui_input_allowed(&self) -> Result<(), String> {
+        if let Some(sb) = &self.sandbox {
+            match sb.mode {
+                crate::exec::SandboxMode::DangerFullAccess => {}
+                _ => {
+                    return Err(format!(
+                        "沙箱（{}）下禁止 GUI 输入注入——点击/键入可绕过文件边界操作系统任意内容。
+如需 GUI 自动化，请切换到 danger-full-access 权限模式。",
+                        sb.mode.as_str()
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// mouse_click：点击鼠标（坐标 = 截图物理像素）。
+    fn tool_mouse_click(&self, args: &Value) -> ToolOutput {
+        if let Err(denied) = self.check_gui_input_allowed() {
+            return ToolOutput::err(denied);
+        }
+        let (Some(x), Some(y)) = (
+            args.get("x").and_then(Value::as_i64),
+            args.get("y").and_then(Value::as_i64),
+        ) else {
+            return ToolOutput::err("需要 x, y（屏幕物理像素，与 take_screenshot 截图坐标一致）");
+        };
+        let button = args
+            .get("button")
+            .and_then(Value::as_str)
+            .and_then(crate::exec::input::MouseButton::parse)
+            .unwrap_or(crate::exec::input::MouseButton::Left);
+        let double = args.get("double").and_then(Value::as_bool).unwrap_or(false);
+        match crate::exec::input::mouse_click(x as i32, y as i32, button, double) {
+            Ok(()) => ToolOutput::ok(json!({
+                "done": true, "x": x, "y": y,
+                "button": format!("{button:?}").to_lowercase(),
+                "double": double,
+            })),
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+
+    /// mouse_move：移动鼠标。
+    fn tool_mouse_move(&self, args: &Value) -> ToolOutput {
+        if let Err(denied) = self.check_gui_input_allowed() {
+            return ToolOutput::err(denied);
+        }
+        let (Some(x), Some(y)) = (
+            args.get("x").and_then(Value::as_i64),
+            args.get("y").and_then(Value::as_i64),
+        ) else {
+            return ToolOutput::err("需要 x, y");
+        };
+        match crate::exec::input::mouse_move(x as i32, y as i32) {
+            Ok(()) => ToolOutput::ok(json!({"done": true, "x": x, "y": y})),
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+
+    /// mouse_drag：按住拖拽。
+    fn tool_mouse_drag(&self, args: &Value) -> ToolOutput {
+        if let Err(denied) = self.check_gui_input_allowed() {
+            return ToolOutput::err(denied);
+        }
+        let nums = |k: &str| args.get(k).and_then(Value::as_i64);
+        let (Some(fx), Some(fy), Some(tx), Some(ty)) = (
+            nums("from_x"),
+            nums("from_y"),
+            nums("to_x"),
+            nums("to_y"),
+        ) else {
+            return ToolOutput::err("需要 from_x, from_y, to_x, to_y（物理像素）");
+        };
+        let button = args
+            .get("button")
+            .and_then(Value::as_str)
+            .and_then(crate::exec::input::MouseButton::parse)
+            .unwrap_or(crate::exec::input::MouseButton::Left);
+        match crate::exec::input::mouse_drag(
+            (fx as i32, fy as i32),
+            (tx as i32, ty as i32),
+            button,
+        ) {
+            Ok(()) => ToolOutput::ok(json!({
+                "done": true,
+                "from": [fx, fy], "to": [tx, ty],
+            })),
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+
+    /// mouse_scroll：滚轮。
+    fn tool_mouse_scroll(&self, args: &Value) -> ToolOutput {
+        if let Err(denied) = self.check_gui_input_allowed() {
+            return ToolOutput::err(denied);
+        }
+        let up = matches!(
+            args.get("direction").and_then(Value::as_str),
+            Some("up") | Some("UP") | Some("Up")
+        );
+        let amount = args
+            .get("amount")
+            .and_then(Value::as_i64)
+            .unwrap_or(3)
+            .clamp(1, 30) as i32;
+        let x = args.get("x").and_then(Value::as_i64).map(|v| v as i32);
+        let y = args.get("y").and_then(Value::as_i64).map(|v| v as i32);
+        match crate::exec::input::mouse_scroll(x, y, amount, up) {
+            Ok(()) => ToolOutput::ok(json!({
+                "done": true,
+                "direction": if up { "up" } else { "down" },
+                "amount": amount,
+            })),
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+
+    /// key_type：键入文本（Unicode）。
+    fn tool_key_type(&self, args: &Value) -> ToolOutput {
+        if let Err(denied) = self.check_gui_input_allowed() {
+            return ToolOutput::err(denied);
+        }
+        let text = args.get("text").and_then(Value::as_str).unwrap_or_default();
+        if text.is_empty() {
+            return ToolOutput::err("text 不能为空");
+        }
+        match crate::exec::input::key_type_text(text) {
+            Ok(()) => ToolOutput::ok(json!({
+                "done": true,
+                "chars": text.chars().count(),
+            })),
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+
+    /// key_press：按键/组合键。
+    fn tool_key_press(&self, args: &Value) -> ToolOutput {
+        if let Err(denied) = self.check_gui_input_allowed() {
+            return ToolOutput::err(denied);
+        }
+        let combo = args.get("combo").and_then(Value::as_str).unwrap_or_default().trim();
+        if combo.is_empty() {
+            return ToolOutput::err("combo 不能为空（如 ctrl+s、alt+f4、enter）");
+        }
+        // 先解析校验，非法组合直接报错（不产生半执行状态）
+        if let Err(e) = crate::exec::input::parse_combo(combo) {
+            return ToolOutput::err(e);
+        }
+        match crate::exec::input::key_press_combo(combo) {
+            Ok(()) => ToolOutput::ok(json!({"done": true, "combo": combo})),
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+
+    /// read_url：抓取网页正文（搜索后深入阅读）。
+    fn tool_read_url(&self, args: &Value) -> ToolOutput {
+        let url = args.get("url").and_then(Value::as_str).unwrap_or_default().trim().to_string();
+        if url.is_empty() {
+            return ToolOutput::err("url 不能为空");
+        }
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return ToolOutput::err("url 必须以 http:// 或 https:// 开头");
+        }
+        let proxy = self.http_proxy.as_deref();
+        let body = crate::core::tools::fetch_url_text(&url, proxy);
+        match body {
+            Ok(text) => {
+                const MAX: usize = 32 * 1024;
+                let truncated = text.len() > MAX;
+                let text = if truncated { text[..MAX].to_string() } else { text };
+                ToolOutput::ok(json!({
+                    "url": url,
+                    "content": text,
+                    "truncated": truncated,
+                }))
+            }
+            Err(e) => ToolOutput::err(format!("抓取失败: {e}")),
+        }
+    }
+
+    /// read_image：视觉分析（读取本地图片 + 可选提问）。
+    /// 实现：把图片路径返回给调用方，由 vision LLM 分析——本工具
+    /// 自身不调 API，而是在结果里标记"图片已就绪"，让 agent 回合
+    /// 在下一轮把图片作为多模态消息发给 vision 模型。
+    fn tool_read_image(&self, args: &Value) -> ToolOutput {
+        let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+        if path.is_empty() {
+            return ToolOutput::err("path 不能为空");
+        }
+        let resolved = self.resolve(path);
+        if let Err(denied) = self.check_read_allowed(&resolved) {
+            return ToolOutput::err(denied);
+        }
+        // 检查文件存在 + 是图片
+        let ext = resolved
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp") {
+            return ToolOutput::err(format!(
+                "不支持的图片格式 .{ext}（支持 png/jpg/jpeg/gif/webp/bmp）"
+            ));
+        }
+        match std::fs::metadata(&resolved) {
+            Ok(m) if m.len() > 8 * 1024 * 1024 => {
+                return ToolOutput::err(format!(
+                    "图片过大（{} MB > 8MB 上限）",
+                    m.len() / 1024 / 1024
+                ));
+            }
+            Err(e) => return ToolOutput::err(format!("文件不可读: {e}")),
+            _ => {}
+        }
+        let question = args.get("question").and_then(Value::as_str).unwrap_or("");
+        ToolOutput::ok(json!({
+            "path": resolved.display().to_string(),
+            "ready": true,
+            "question": question,
+            "note": "图片已就绪。下一回合把此图片路径附加到消息中，vision 模型将分析图片内容。",
+        }))
     }
 
     /// web_search：调用 dsh-desktop 自己的搜索通道。
@@ -896,6 +1586,19 @@ fn web_search_bing(query: &str, max: usize, proxy: Option<&str>) -> Result<Vec<S
 
 /// 解析 Bing 结果页：每条为 `<li class="b_algo"><h2><a href="真实URL">标题</a></h2>`
 /// + 摘要 `<p class="b_lineclamp…">…</p>`（宽松取块内首个 <p> 文本）。
+
+/// 字节下标回退到字符边界（中文页面 5KB 截断防 panic）。
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut b = i;
+    while b > 0 && !s.is_char_boundary(b) {
+        b -= 1;
+    }
+    b
+}
+
 pub fn parse_bing_html(html: &str, max: usize) -> Vec<SearchHit> {
     let mut out = Vec::new();
     let mut rest = html;
@@ -906,12 +1609,17 @@ pub fn parse_bing_html(html: &str, max: usize) -> Vec<SearchHit> {
             break;
         };
         let block_start = li;
-        // 块结尾：下一个 b_algo" 或 5KB 截断（防异常页面死循环）
+        // 块结尾：下一个 b_algo" 或 5KB 截断（防异常页面死循环）。
+        // 字节截断必须落到字符边界（历史 panic：中文页面块 >5000 字节时
+        // 5000 不是 UTF-8 边界 → 切片 panic，web_search 固定失败）
         let seg = &rest[block_start..];
+        if seg.len() < 8 {
+            break; // 恰好以 b_algo" 结尾(极端畸形)——防 seg[8..] 越界
+        }
         let seg_end = seg[8..]
             .find("b_algo\"")
             .map(|i| 8 + i)
-            .unwrap_or(seg.len().min(5000));
+            .unwrap_or_else(|| floor_char_boundary(seg, 5000));
         let block = &seg[..seg_end];
         // 链接：h2 内首个 <a ... href="URL">
         let (url, title) = match block.find("<h2") {
@@ -1153,6 +1861,200 @@ const NODE_WRITE_MARKER: &str = "<node_called:任意代码执行>";
 /// Set-Content/Add-Content/Out-File/tee；unix 工具: sed -i/cp/mv/rm/install）。
 /// 启发式解析注定不完备——真正的强制由沙箱模式（workspace-write/read-only）
 /// 在 OS 层提供；danger 模式下这里是唯一的写闸门，宁可多问不能漏。
+/// 写目标（带解析上下文：cd 穿越后的逻辑 cwd 与原始 token）。
+#[derive(Debug)]
+pub struct WriteTarget {
+    /// 目标 token 原文（审计显示）
+    pub raw: String,
+    /// 规范化目标（绝对或相对——按逻辑 cwd 解析）
+    pub target: String,
+    /// 纯标志（/Y、-Force 等被跳过的 token 不算目标）
+    pub is_flag: bool,
+}
+
+/// 增强版写目标提取：跟踪 `cd X &&`/`Set-Location X;`/`pushd X` 改变逻辑
+/// cwd（历史缺陷：`cd C:\Windows && echo x > f` 的 f 被按工具 cwd 解析为
+/// 工作区内 → 无审批越区写），并补充常见写命令（curl -o / robocopy /
+/// Invoke-WebRequest -OutFile / .NET [IO.File]::Write* 直调等）。
+fn extract_redirect_targets_ctx(command: &str) -> Vec<WriteTarget> {
+    let mut out: Vec<WriteTarget> = Vec::new();
+    let mut cwd: Vec<String> = Vec::new(); // 逻辑 cwd 段（空 = 工具 cwd）
+    let toks: Vec<&str> = command.split_whitespace().collect();
+    let mut i = 0usize;
+    let mut prev_is_redirect = false;
+    let mut in_write = false;
+    let mut pending_outfile = false; // -OutFile/-o/-O 的下一个 token 是目标
+
+    const WRITE_CMDS: &[&str] = &[
+        "copy", "move", "del", "erase", "ren", "rename", "md", "mkdir", "rd",
+        "cp", "mv", "rm", "tee", "install", "truncate", "shred", "xcopy",
+        "robocopy", "curl", "wget", "certutil", "reg", "icacls", "expand",
+        "copy-item", "move-item", "set-content", "add-content", "out-file",
+        "new-item", "remove-item", "clear-content", "sc", "ni", "ac", "cpi",
+    ];
+
+    while i < toks.len() {
+        let t = toks[i];
+        let lower = t.to_ascii_lowercase();
+        // 逻辑 cwd 跟踪（cd /d X、Set-Location X、pushd X）
+        if lower == "cd" || lower == "set-location" || lower == "pushd" {
+            // 跳过 /d 标志
+            let mut j = i + 1;
+            if j < toks.len() && (toks[j].eq_ignore_ascii_case("/d") || toks[j].starts_with('-')) {
+                j += 1;
+            }
+            if j < toks.len() {
+                cwd = vec![toks[j].trim_matches('"').to_string()];
+                i = j + 1;
+                continue;
+            }
+        }
+        // .NET 直调写（[IO.File]::WriteAllText(...) / [System.IO.File]::...）
+        if t.starts_with('[') && t.contains("::") {
+            let l = lower;
+            if l.contains("writeall") || l.contains("writebytes")
+                || l.contains("appendall") || l.contains("delete")
+                || l.contains("move") || l.contains("copy")
+            {
+                out.push(WriteTarget {
+                    raw: t.to_string(),
+                    // .NET 直调：标记（消费端保守拒绝）
+                    target: "__dotnet_write__".to_string(),
+                    is_flag: false,
+                });
+            }
+            i += 1;
+            continue;
+        }
+        // curl -o / wget -O / -OutFile 的参数式目标
+        if pending_outfile {
+            pending_outfile = false;
+            out.push(WriteTarget {
+                raw: t.to_string(),
+                target: join_cwd(&cwd, t.trim_matches('"')),
+                is_flag: false,
+            });
+            i += 1;
+            continue;
+        }
+        if lower == "-o" || lower == "-outfile" || lower == "/o" {
+            pending_outfile = true;
+            i += 1;
+            continue;
+        }
+        if lower == "-uri" || lower == "-url" || lower == "-path" {
+            // -Path 的值也可能是目标（Set-Content -Path x）：按下一个 token 记
+            let j = i + 1;
+            if j < toks.len() && !toks[j].starts_with('-') {
+                if in_write {
+                    out.push(WriteTarget {
+                        raw: toks[j].to_string(),
+                        target: join_cwd(&cwd, toks[j].trim_matches('"')),
+                        is_flag: false,
+                    });
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        // 重定向形式（> >> 2> fd>）
+        if let Some(rest) = strip_fd_redirect(&lower) {
+            prev_is_redirect = true;
+            in_write = false;
+            if !rest.is_empty() {
+                out.push(WriteTarget {
+                    raw: t.to_string(),
+                    target: join_cwd(&cwd, rest.trim_matches('"')),
+                    is_flag: false,
+                });
+            }
+            i += 1;
+            continue;
+        }
+        if t.starts_with('>') {
+            prev_is_redirect = true;
+            in_write = false;
+            let rest = t.trim_start_matches('>').trim();
+            if !rest.is_empty() {
+                out.push(WriteTarget {
+                    raw: t.to_string(),
+                    target: join_cwd(&cwd, rest.trim_matches('"')),
+                    is_flag: false,
+                });
+            }
+            i += 1;
+            continue;
+        }
+        if prev_is_redirect {
+            prev_is_redirect = false;
+            out.push(WriteTarget {
+                raw: t.to_string(),
+                target: join_cwd(&cwd, t.trim_matches('"')),
+                is_flag: false,
+            });
+            i += 1;
+            continue;
+        }
+        // 写命令关键字
+        let base = lower
+            .trim_end_matches(',')
+            .trim_matches(|c: char| c == '(' || c == '|');
+        if WRITE_CMDS.contains(&base) {
+            in_write = true;
+            i += 1;
+            continue;
+        }
+        if in_write && !t.starts_with('/') && !t.starts_with('-') {
+            // URL 不是写目标（历史缺陷：curl 在 WRITE_CMDS 里，其 URL 参数
+            // 被当写目标 → "仅工作区模式下拒绝越区写：https://…"，
+            // 工作区内 curl 下载被误拦）。scheme 开头的 token 一律跳过。
+            let tl = t.trim_matches('"').to_ascii_lowercase();
+            if tl.starts_with("http://")
+                || tl.starts_with("https://")
+                || tl.starts_with("ftp://")
+                || tl.starts_with("file://")
+            {
+                i += 1;
+                continue;
+            }
+            out.push(WriteTarget {
+                raw: t.to_string(),
+                target: join_cwd(&cwd, t.trim_matches('"')),
+                is_flag: false,
+            });
+            // copy/mv src dst：只取最后一个非标志 token 需要两遍——简化为
+            // 全记（宁多拒不漏放：审批/门以"任一越区即拒"为准）
+            i += 1;
+            continue;
+        }
+        if in_write && (t.starts_with('/') || t.starts_with('-')) {
+            i += 1;
+            continue;
+        }
+        // 分隔符重置写上下文
+        if t == "&&" || t == ";" || t == "|" || t == "&" {
+            in_write = false;
+            prev_is_redirect = false;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// 逻辑 cwd 拼接（cwd 为空 = 相对工具 cwd；目标已绝对则原样）。
+fn join_cwd(cwd: &[String], target: &str) -> String {
+    if cwd.is_empty()
+        || target.contains(':')
+        || target.starts_with('\\')
+        || target.starts_with('/')
+    {
+        target.to_string()
+    } else {
+        let sep = std::path::MAIN_SEPARATOR;
+        format!("{}{sep}{}", cwd.join(&sep.to_string()), target)
+    }
+}
+
 fn extract_redirect_targets(command: &str) -> Vec<String> {
     let mut out = Vec::new();
     // 写命令关键字：其后的参数里取**最后一个**非参数 token 作写目标
@@ -1245,6 +2147,63 @@ fn strip_fd_redirect(tok: &str) -> Option<String> {
 }
 
 /// 路径是否落在工作区内（防御 `..` 穿越）。
+/// 提取命令字符串中的绝对路径（盘符形式 `X:\...` / `X:/...`）。
+/// 供 shell 读边界使用：命令引用了工作区外的显式路径 → 拒绝。
+/// - URL 误判防护：`https://` 的 `s:` 前一个字符是字母——要求盘符字母前
+///   是边界字符（行首/空白/引号/`=`/`(`/`,` 等）
+/// - token 向后延伸到空白/引号/命令分隔符（`;|&<>()[]{},=`）为止
+pub(crate) fn extract_absolute_paths(cmd: &str) -> Vec<String> {
+    let b: Vec<char> = cmd.chars().collect();
+    let bslash: char = char::from_u32(0x5C).unwrap(); // 反斜杠（避免转义地狱）
+    let stop = |c: char| c.is_whitespace() || "\"'`;|&<>()[]{}=,".contains(c);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 2 < b.len() {
+        let (c, next, n2) = (b[i], b[i + 1], b[i + 2]);
+        if c.is_ascii_alphabetic() && next == ':' && (n2 == '\\' || n2 == '/') {
+            let prev_ok = i == 0 || {
+                let p = b[i - 1];
+                !p.is_alphanumeric() && !"-./~_$".contains(p)
+            };
+            if prev_ok {
+                let start = i;
+                let mut j = i + 2;
+                while j < b.len() && !stop(b[j]) {
+                    j += 1;
+                }
+                let token: String = b[start..j].iter().collect();
+                if token.chars().count() > 3 {
+                    out.push(token);
+                }
+                i = j;
+                continue;
+            }
+        } else if c == bslash && i + 1 < b.len() && b[i + 1] == bslash {
+            // UNC 路径（\server\share\x）：同样按边界起步提取
+            //（历史缺陷：只认盘符，UNC 静默绕过读门）
+            let prev_ok = i == 0 || {
+                let p = b[i - 1];
+                !p.is_alphanumeric() && !"-./~_$".contains(p)
+            };
+            if prev_ok {
+                let start = i;
+                let mut j = i + 2;
+                while j < b.len() && !stop(b[j]) {
+                    j += 1;
+                }
+                let token: String = b[start..j].iter().collect();
+                if token.chars().count() > 3 {
+                    out.push(token);
+                }
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 fn path_is_within_ws(path: &Path, root: &Path) -> bool {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut cur = path.to_path_buf();
@@ -1411,6 +2370,108 @@ fn attach_tree_kill_job(_child: &std::process::Child) -> Option<()> {
     None
 }
 
+
+/// 抓取 URL 并提取正文文本（剥 HTML 标签，保留代码块内容）。
+/// 30s 超时 + 1MB 上限（防超大页面 OOM）。
+pub fn fetch_url_text(url: &str, proxy: Option<&str>) -> Result<String, String> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30));
+    if let Some(p) = proxy {
+        builder = builder.proxy(
+            reqwest::Proxy::all(p).map_err(|e| format!("无效代理: {e}"))?,
+        );
+    }
+    let client = builder.build().map_err(|e| format!("HTTP 客户端初始化失败: {e}"))?;
+    let resp = client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .send()
+        .map_err(|e| format!("请求失败: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let html = resp.text().map_err(|e| format!("读取响应失败: {e}"))?;
+    if html.len() > 1024 * 1024 {
+        return Err("页面超过 1MB 上限".into());
+    }
+    Ok(strip_html_to_text(&html))
+}
+
+/// 极简 HTML→文本：剥 script/style 块、标签、多余空白。
+fn strip_html_to_text(html: &str) -> String {
+    let mut s: String = html.to_string();
+    // 去 script/style/noscript 块
+    for tag in ["script", "style", "noscript"] {
+        loop {
+            let Some(start) = s.find(&format!("<{tag}")) else { break };
+            let Some(end_tok) = s.find(&format!("</{tag}>")) else { break };
+            if end_tok <= start { break; }
+            let after = s[end_tok + tag.len() + 3..].to_string();
+            s = format!("{}{}", &s[..start], after);
+        }
+    }
+    // 换行标签 → 
+
+    for tag in ["<br", "<BR", "<p", "<P", "<div", "<DIV", "<li", "<LI", "<tr", "<TR"] {
+        s = s.replace(tag, &format!("
+{tag}"));
+    }
+    // 去所有标签
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    // HTML 实体
+    let out = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+    // 压缩空白
+    let mut clean = String::with_capacity(out.len());
+    let mut last_nl = false;
+    for line in out.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            if !last_nl {
+                clean.push('\n');
+                last_nl = true;
+            }
+        } else {
+            clean.push_str(t);
+            clean.push('\n');
+            last_nl = false;
+        }
+    }
+    clean
+}
+
+
+/// 极简 glob 匹配（支持 * 和 ?，大小写不敏感——调用方已 to_lowercase）。
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn rec(p: &[u8], t: &[u8]) -> bool {
+        match (p.first(), t.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => {
+                // * 匹配零个或多个字符
+                rec(&p[1..], t) || (!t.is_empty() && rec(p, &t[1..]))
+            }
+            (Some(b'?'), Some(_)) => rec(&p[1..], &t[1..]),
+            (Some(&pc), Some(&tc)) if pc == tc => rec(&p[1..], &t[1..]),
+            _ => false,
+        }
+    }
+    rec(pattern.as_bytes(), text.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1484,6 +2545,246 @@ mod tests {
         ));
         let out = reg.tool_node_called(&json!({"code": "console.log(1)"}));
         assert!(!out.ok, "workspace-write 沙箱下 node_called 必须拒绝");
+    }
+
+    /// workspace-write 读边界：工作区外读取被拒；工作区内 / 系统基础 /
+    /// ~/.dsh 放行（用户策略：除基础命令与 DSH 目录外，区外一律不可访问）。
+    #[test]
+    fn workspace_write_blocks_outside_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let reg = ToolRegistry::new(ws.clone())
+            .with_workspace_root(Some(ws.clone()))
+            .with_sandbox(Some(crate::exec::acl::WindowsAclSandbox::new(
+                crate::exec::SandboxMode::WorkspaceWrite,
+                ws.clone(),
+            )));
+        assert!(
+            reg.check_read_allowed(&ws.join("a.txt")).is_ok(),
+            "工作区内读取应放行"
+        );
+        assert!(
+            reg.check_read_allowed(std::path::Path::new(
+                r"C:\Windows\System32\cmd.exe"
+            ))
+            .is_ok(),
+            "系统基础路径应放行"
+        );
+        let dsh = match std::env::var_os("DSH_HOME") {
+            Some(h) if !h.is_empty() => std::path::PathBuf::from(h),
+            _ => std::env::var_os("USERPROFILE")
+                .map(|h| std::path::PathBuf::from(h).join(".dsh"))
+                .unwrap(),
+        };
+        assert!(
+            reg.check_read_allowed(&dsh.join(r"skills\demo\skill.md")).is_ok(),
+            "~/.dsh 应放行: {}",
+            dsh.display()
+        );
+        let outside = reg.check_read_allowed(std::path::Path::new(r"D:\secret.txt"));
+        assert!(outside.is_err(), "区外读取必须被拒绝");
+        assert!(outside.unwrap_err().contains("禁止访问"));
+
+        let reg2 = ToolRegistry::new(ws.clone()).with_workspace_root(Some(ws));
+        assert!(
+            reg2.check_read_allowed(std::path::Path::new(r"D:\secret.txt")).is_ok(),
+            "全访问模式读取不受限"
+        );
+    }
+
+    /// read_file 工具级拦截：WW 模式下读区外路径直接报错（不触碰文件系统）。
+    #[test]
+    fn read_file_blocked_outside_ws() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let reg = ToolRegistry::new(ws.clone())
+            .with_workspace_root(Some(ws.clone()))
+            .with_sandbox(Some(crate::exec::acl::WindowsAclSandbox::new(
+                crate::exec::SandboxMode::WorkspaceWrite,
+                ws.clone(),
+            )));
+        let out = reg.tool_read_file(&json!({"path": r"D:\secret.txt"}));
+        assert!(!out.ok, "区外 read_file 必须被拒绝");
+        assert!(out.stderr.contains("禁止访问"), "{}", out.stderr);
+    }
+
+    /// 审批与读门不冲突：str_replace 的 create（写操作）不走读门——
+    /// 审批通过后可执行（历史缺陷：读门套在整个工具上，区外写被
+    /// "禁止访问"拦截，审批形同虚设）。view（纯读）仍被拦。
+    #[test]
+    fn str_replace_create_not_blocked_by_read_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let reg = ToolRegistry::new(ws.clone())
+            .with_workspace_root(Some(ws.clone()))
+            .with_sandbox(Some(crate::exec::acl::WindowsAclSandbox::new(
+                crate::exec::SandboxMode::WorkspaceWrite,
+                ws.clone(),
+            )));
+        // create（写）：不得因读门报"禁止访问"
+        let out = reg.tool_str_replace(&json!({
+            "command": "create",
+            "path": dir.path().join("out.txt").to_string_lossy(),
+            "file_text": "x",
+        }));
+        assert!(
+            !out.stderr.contains("禁止访问"),
+            "create 是写操作，不应被读门拦截: {}",
+            out.stderr
+        );
+        // view（纯读）区外：仍被拦
+        let outside = dir.path().join("some.txt");
+        std::fs::write(&outside, "s").unwrap();
+        let out = reg.tool_str_replace(&json!({
+            "command": "view",
+            "path": outside.to_string_lossy(),
+        }));
+        assert!(!out.ok && out.stderr.contains("禁止访问"));
+    }
+
+    /// shell 读边界：命令引用区外绝对路径 → 拒绝；URL 不误判。
+    #[test]
+    fn shell_read_gate_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let reg = ToolRegistry::new(ws.clone())
+            .with_workspace_root(Some(ws.clone()))
+            .with_sandbox(Some(crate::exec::acl::WindowsAclSandbox::new(
+                crate::exec::SandboxMode::WorkspaceWrite,
+                ws.clone(),
+            )));
+        assert!(reg.shell_read_gate("type D:\\secret.txt").is_err());
+        assert!(
+            reg.shell_read_gate(&format!(
+                "Get-Content '{}'",
+                dir.path().join("outside.txt").display()
+            ))
+            .is_err(),
+            "工作区父目录也是区外"
+        );
+        assert!(reg.shell_read_gate("Get-Process").is_ok());
+        assert!(reg.shell_read_gate("dir").is_ok());
+        assert!(reg.shell_read_gate("type C:\\Windows\\win.ini").is_ok());
+        assert!(reg.shell_read_gate("curl https://example.com/a:b").is_ok());
+
+        // UNC 同样拦截（历史缺陷：只认盘符时绕过）
+        assert!(reg.shell_read_gate("type \\\\nas\\\\data\\\\x.txt").is_err());
+        let reg2 = ToolRegistry::new(ws).with_workspace_root(None);
+        assert!(reg2.shell_read_gate("type D:\\secret.txt").is_ok());
+    }
+
+    /// 绝对路径提取：URL（https://）不得被误判为盘符路径。
+    #[test]
+    fn extract_absolute_paths_skips_urls() {
+        let got = extract_absolute_paths("curl https://example.com and http://a.b/c");
+        assert!(got.is_empty(), "URL 不应误判: {got:?}");
+        let got = extract_absolute_paths("type D:\\secret.txt");
+        assert_eq!(got, vec![r"D:\secret.txt".to_string()]);
+        let got = extract_absolute_paths("cd E:\\AI && dir C:\\Windows\\System32");
+        assert_eq!(
+            got,
+            vec![r"E:\AI".to_string(), r"C:\Windows\System32".to_string()]
+        );
+        let got = extract_absolute_paths("notepad \"D:\\notes\\a.txt\"");
+        assert_eq!(got, vec![r"D:\notes\a.txt".to_string()]);
+
+        // UNC 路径（历史缺陷：只认盘符时 UNC 静默绕过读门）
+        let got = extract_absolute_paths("type \\\\nas\\\\data\\\\x.txt");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].starts_with("\\\\nas"), "{got:?}");
+    }
+
+    /// GUI 输入注入的沙箱闸门：read-only / workspace-write 拒绝,
+    /// danger-full-access 放行(注入输入=任意系统操作,可绕过文件边界)。
+    #[test]
+    fn gui_input_gated_by_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        for mode in [
+            crate::exec::SandboxMode::ReadOnly,
+            crate::exec::SandboxMode::WorkspaceWrite,
+        ] {
+            let reg = ToolRegistry::new(ws.clone())
+                .with_workspace_root(Some(ws.clone()))
+                .with_sandbox(Some(crate::exec::acl::WindowsAclSandbox::new(
+                    mode, ws.clone(),
+                )));
+            for (name, args) in [
+                ("mouse_click", json!({"x": 1, "y": 1})),
+                ("mouse_move", json!({"x": 1, "y": 1})),
+                ("mouse_drag", json!({"from_x":1,"from_y":1,"to_x":2,"to_y":2})),
+                ("mouse_scroll", json!({"direction":"down"})),
+                ("key_type", json!({"text": "hi"})),
+                ("key_press", json!({"combo": "enter"})),
+            ] {
+                let out = reg.dispatch(name, &args);
+                assert!(
+                    !out.ok,
+                    "{name} 在 {mode:?} 沙箱下必须被拒绝"
+                );
+                assert!(out.stderr.contains("禁止 GUI"), "{name}: {}", out.stderr);
+            }
+        }
+        // 全访问:放行(移动到当前鼠标位置,零副作用)
+        let reg2 = ToolRegistry::new(ws)
+            .with_workspace_root(None);
+        let out = reg2.dispatch("mouse_move", &json!({"x": 1, "y": 1}));
+        assert!(out.ok, "全访问应放行: {}", out.stderr);
+    }
+
+    /// 回归：工作区内 curl 下载不得被写门误拦（URL 被当写目标的历史缺陷，
+    /// 真实案例：cd E:\AI\minecraft && curl -L -o vendor\x.js https://unpkg.com/...）。
+    #[test]
+    fn curl_download_in_workspace_not_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let reg = ToolRegistry::new(ws.clone())
+            .with_workspace_root(Some(ws.clone()))
+            .with_sandbox(Some(crate::exec::acl::WindowsAclSandbox::new(
+                crate::exec::SandboxMode::WorkspaceWrite,
+                ws.clone(),
+            )));
+        let cmd = format!(
+            "cd {} && mkdir vendor && curl -L -o vendor{}x.js https://unpkg.com/three@0.160.0/build/three.module.js && echo EXIT=%errorlevel%",
+            ws.display(),
+            std::path::MAIN_SEPARATOR
+        );
+        assert!(
+            reg.shell_write_gate(&cmd).is_ok(),
+            "URL 不是写目标，区内 curl 下载必须放行"
+        );
+        assert!(reg.shell_read_gate(&cmd).is_ok());
+        // 真正的区外写目标仍拦
+        assert!(reg
+            .shell_write_gate("curl -L -o D:\\evil.js https://a.b/c.js")
+            .is_err());
+    }
+
+    /// 回归：带空格的系统路径（"C:\Program Files\Google"）在 shell 命令里
+    /// 被拆词成 "C:\Program" 后不得误拦（白名单根前缀也放行）。
+    #[test]
+    fn quoted_system_path_prefix_not_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let reg = ToolRegistry::new(ws.clone())
+            .with_workspace_root(Some(ws.clone()))
+            .with_sandbox(Some(crate::exec::acl::WindowsAclSandbox::new(
+                crate::exec::SandboxMode::WorkspaceWrite,
+                ws,
+            )));
+        // 模拟 for /d %d in ("C:\Program Files\Google\...") 的拆词形态
+        assert!(
+            reg.shell_read_gate("dir C:\\Program").is_ok(),
+            "白名单根前缀（引号拆词残段）应放行"
+        );
+        assert!(reg.shell_read_gate("type D:\\secret.txt").is_err());
     }
 
     /// run_code 的写子步不得绕过越权审批（历史漏洞：顶层名匹配不到
@@ -1738,5 +3039,92 @@ mod web_search_tests {
         let hits = web_search_impl("rust programming language", 5, None).expect("live search");
         assert!(!hits.is_empty(), "应至少返回一条结果");
         assert!(hits[0].url.starts_with("http"), "URL 应可解析: {hits:?}");
+    }
+}
+
+#[cfg(test)]
+mod diff_result_tests {
+    use super::*;
+
+    /// write_file 覆盖：结果携带 diff（-旧行/+新行）；新建：created=true
+    /// 且 diff 全为新增行。通过公共 dispatch 走真实路径。
+    #[test]
+    fn write_file_result_carries_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = ToolRegistry::new(dir.path().to_path_buf());
+
+        // 新建
+        let out = reg.dispatch(
+            "write_file",
+            &json!({"path": "a.txt", "content": "line1\nline2\n"}),
+        );
+        let v: serde_json::Value = serde_json::from_str(&out.value.to_string()).unwrap();
+        assert_eq!(v["created"], json!(true));
+        let d = v["diff"].as_str().unwrap();
+        assert!(d.contains("+line1"), "新建全为增行: {d}");
+
+        // 覆盖（改动一行）
+        let out = reg.dispatch(
+            "write_file",
+            &json!({"path": "a.txt", "content": "line1\nCHANGED\n"}),
+        );
+        let v: serde_json::Value = serde_json::from_str(&out.value.to_string()).unwrap();
+        assert!(v.get("created").is_none());
+        let d = v["diff"].as_str().unwrap();
+        assert!(d.contains("-line2"));
+        assert!(d.contains("+CHANGED"));
+        let (del, add) = crate::core::diff::counts(d);
+        assert_eq!((del, add), (1, 1));
+    }
+
+    /// str_replace_editor：create / str_replace 结果携带片段 diff。
+    #[test]
+    fn str_replace_result_carries_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = ToolRegistry::new(dir.path().to_path_buf());
+        reg.dispatch(
+            "str_replace_editor",
+            &json!({"command": "create", "path": "s.txt", "file_text": "fn a() {\n    1\n}\n"}),
+        );
+        let out = reg.dispatch(
+            "str_replace_editor",
+            &json!({
+                "command": "str_replace",
+                "path": "s.txt",
+                "old_str": "    1",
+                "new_str": "    2"
+            }),
+        );
+        let v: serde_json::Value = serde_json::from_str(&out.value.to_string()).unwrap();
+        assert_eq!(v["replaced"], json!(true));
+        let d = v["diff"].as_str().unwrap();
+        assert!(d.contains("-    1"));
+        assert!(d.contains("+    2"));
+    }
+
+    /// glob 通配符匹配。
+    #[test]
+    fn glob_matching() {
+        assert!(glob_match("*.rs", "main.rs"));
+        assert!(glob_match("*.rs", "lib.rs"));
+        assert!(!glob_match("*.rs", "main.py"));
+        assert!(glob_match("test_?.rs", "test_1.rs"));
+        assert!(!glob_match("test_?.rs", "test_12.rs"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("a*c", "abc"));
+        assert!(glob_match("a*c", "ac"));
+        assert!(!glob_match("a*c", "abx"));
+        assert!(glob_match("", ""));
+    }
+
+    /// HTML 剥离。
+    #[test]
+    fn html_stripping() {
+        let html = r#"<html><head><script>evil()</script></head><body><h1>Title</h1><p>Para text</p></body></html>"#;
+        let text = strip_html_to_text(html);
+        assert!(!text.contains("evil"), "script 应被剥: {text}");
+        assert!(text.contains("Title"), "{text}");
+        assert!(text.contains("Para text"), "{text}");
+        assert!(!text.contains("<"), "标签应被剥: {text}");
     }
 }

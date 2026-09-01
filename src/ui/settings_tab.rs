@@ -5,6 +5,22 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::AppConfig;
 use crate::core::{DshEngine, SandboxMode};
+use crate::ui::i18n::{tr, Lang};
+use crate::ui::theme::{ChipTint, Theme};
+
+/// 表单行标签（右对齐风格的弱化标签，统一 12px）。
+fn form_label(text: &str) -> RichText {
+    RichText::new(text).size(12.0).color(Theme::text_dim())
+}
+
+/// 代理等单行输入（统一样式：12.5px 主题文字 + 弱化提示）。
+fn form_field<'a>(v: &'a mut String, hint: &'a str) -> TextEdit<'a> {
+    TextEdit::singleline(v)
+        .font(egui::FontId::proportional(12.5))
+        .text_color(Theme::text())
+        .hint_text(RichText::new(hint).size(11.5).color(Theme::text_faint()))
+        .desired_width(360.0)
+}
 
 pub struct SettingsTab {
     // 引擎设置
@@ -23,11 +39,13 @@ pub struct SettingsTab {
     font_size: f32,
     scrollback: usize,
     shell: String,
-    /// 界面语言（zh / en）
-    lang: String,
-    status: String,
+    /// 界面语言设置值（zh / en；展示用 Lang 在 pub lang）
+    lang_value: String,
+    pub status: String,
     /// 桥信息 (port, token)——app 启动后写入，设置页展示
     bridge_info: Option<(u16, String)>,
+    /// 界面语言（app 每帧同步）
+    pub lang: Lang,
 }
 
 impl SettingsTab {
@@ -50,249 +68,302 @@ impl SettingsTab {
             font_size: cfg.font_size,
             scrollback: cfg.scrollback,
             shell: cfg.resolved_shell(),
-            lang: cfg.lang.clone(),
+            lang_value: cfg.lang.clone(),
             status: String::new(),
             bridge_info: None,
+            lang: Lang::parse(&cfg.lang),
         }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig) {
-        ui.heading("设置");
-        ui.label(RichText::new("更改会在保存后生效；引擎设置需要重启应用后生效。").weak());
-        ui.separator();
-
-        // ===== 引擎设置（DSH 核心） =====
-        ui.label(
-            RichText::new("DeepSeek 引擎")
-                .strong()
-                .color(crate::ui::theme::Theme::accent_light()),
-        );
-        egui::Grid::new("engine_settings_grid")
-            .num_columns(2)
-            .spacing([12.0, 8.0])
+        let lang = self.lang;
+        egui::ScrollArea::vertical()
+            .id_salt("settings_scroll")
             .show(ui, |ui| {
-                ui.label("API Key:");
-                ui.add(
-                    TextEdit::singleline(&mut self.api_key)
-                        .hint_text("sk-...（也可从 ~/.dsh/.credentials.yaml 自动读取）")
-                        .desired_width(420.0),
-                );
-                ui.end_row();
-                ui.label("模型:");
-                ui.horizontal(|ui| {
-                    // 下拉：DeepSeek 官方模型表（V4 系列 + legacy），
-                    // 当前值不在表内（自定义网关模型）保留为选项
-                    let mut sel = self.model.clone();
-                    egui::ComboBox::from_id_salt("model_select")
-                        .selected_text(&self.model)
-                        .width(240.0)
-                        .show_ui(ui, |ui| {
-                            for m in crate::core::llm::DEEPSEEK_MODELS {
-                                ui.selectable_value(&mut sel, m.to_string(), *m);
-                            }
-                            if !crate::core::llm::DEEPSEEK_MODELS.contains(&self.model.as_str()) {
-                                let keep = self.model.clone();
-                                ui.selectable_value(
-                                    &mut sel,
-                                    keep.clone(),
-                                    format!("{keep}（自定义）"),
-                                );
-                            }
-                        });
-                    if sel != self.model {
-                        self.model = sel;
-                        self.status = "模型已更改（保存后生效）".into();
-                    }
-                    ui.label(
-                        RichText::new("V4 系列（flash / pro / vision-exp）+ legacy")
-                            .weak()
-                            .size(11.0),
-                    );
-                });
-                ui.end_row();
-                ui.label("Base URL:");
-                ui.add(TextEdit::singleline(&mut self.base_url).desired_width(420.0));
-                ui.end_row();
-                ui.label("默认 Agent 模式:");
-                ui.horizontal(|ui| {
-                    use crate::core::preset::AgentPreset;
-                    let current = AgentPreset::parse(&self.default_preset).unwrap_or_default();
-                    for p in AgentPreset::all() {
-                        let selected = p == current;
-                        let label = if selected {
-                            RichText::new(format!("● {}", p.name()))
-                                .color(crate::ui::theme::Theme::accent_light())
-                        } else {
-                            RichText::new(p.name()).color(crate::ui::theme::Theme::text_dim())
-                        };
-                        if ui.selectable_label(selected, label).clicked() && !selected {
-                            self.default_preset = p.id().to_string();
-                        }
-                    }
-                    ui.label(
-                        RichText::new("新建会话使用（标准/PTC/极简/创造）")
-                            .weak()
-                            .size(11.0),
-                    );
-                });
-                ui.end_row();
-            });
-
-        // ===== 沙箱模式（实时生效，无需重启）=====
-        ui.label(
-            RichText::new("沙箱模式")
-                .strong()
-                .color(crate::ui::theme::Theme::accent_light()),
-        );
-        ui.horizontal(|ui| {
-            for m in [
-                SandboxMode::DangerFullAccess,
-                SandboxMode::WorkspaceWrite,
-                SandboxMode::ReadOnly,
-            ] {
-                let selected = self.sandbox_mode == m;
-                let label = if selected {
-                    RichText::new(format!("● {}", m.as_str()))
-                        .color(crate::ui::theme::Theme::accent_light())
-                } else {
-                    RichText::new(m.as_str()).color(crate::ui::theme::Theme::text_dim())
-                };
-                if ui.selectable_label(selected, label).clicked() && !selected {
-                    self.sandbox_mode = m;
-                    // 实时生效
-                    if let Ok(mut e) = self.engine.lock() {
-                        e.set_sandbox_mode(m);
-                    }
-                    self.status = format!("沙箱已切换至 {}", m.as_str());
-                }
-            }
+            ui.label(Theme::page_title(tr(lang, "设置", "Settings")));
+            ui.add_space(3.0);
             ui.label(
-                RichText::new("bash/pwsh 受限执行（工作区可写 / 只读），现在生效")
-                    .weak()
-                    .size(11.0),
+                RichText::new(tr(lang, "更改会在保存后生效；引擎设置需要重启应用后生效。", "Changes apply on save; engine settings take effect after restart."))
+                    .size(11.0)
+                    .color(Theme::text_dim()),
             );
-        });
-        ui.add_space(4.0);
-        ui.separator();
+            ui.add_space(10.0);
 
-        egui::Grid::new("settings_grid")
-            .num_columns(2)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("HTTP 代理:");
-                ui.add(
-                    TextEdit::singleline(&mut self.http_proxy)
-                        .hint_text("http://127.0.0.1:7890（留空清除）")
-                        .desired_width(360.0),
-                );
-                ui.end_row();
-
-                ui.label("HTTPS 代理:");
-                ui.add(
-                    TextEdit::singleline(&mut self.https_proxy)
-                        .hint_text("http://127.0.0.1:7890（留空清除）")
-                        .desired_width(360.0),
-                );
-                ui.end_row();
-
-                ui.label("NO_PROXY:");
-                ui.add(
-                    TextEdit::singleline(&mut self.no_proxy)
-                        .hint_text("localhost,127.0.0.1,::1（逗号分隔）")
-                        .desired_width(360.0),
-                );
-                ui.end_row();
-
-                ui.label("终端字体大小:");
-                ui.add(egui::Slider::new(&mut self.font_size, 10.0..=28.0).text("px"));
-                ui.end_row();
-
-                ui.label("回滚行数:");
-                ui.add(egui::Slider::new(&mut self.scrollback, 500..=20000).step_by(500.0));
-                ui.end_row();
-
-                ui.label("默认 Shell:");
-                ui.add(TextEdit::singleline(&mut self.shell).desired_width(360.0));
-                ui.end_row();
-
-                // 界面语言（中英双语切换，立即生效）
-                ui.label("界面语言 / Language:");
-                ui.horizontal(|ui| {
-                    let mut lang = crate::ui::i18n::Lang::parse(&self.lang);
-                    let mut changed = false;
-                    for candidate in [crate::ui::i18n::Lang::Zh, crate::ui::i18n::Lang::En] {
-                        if ui
-                            .selectable_label(lang == candidate, candidate.name())
-                            .clicked()
-                            && lang != candidate
-                        {
-                            lang = candidate;
-                            changed = true;
-                        }
-                    }
-                    if changed {
-                        self.lang = lang.as_str().to_string();
-                        cfg.lang = self.lang.clone();
-                        let _ = cfg.save();
-                        self.status = if lang == crate::ui::i18n::Lang::En {
-                            "Language switched to English ✓".into()
-                        } else {
-                            "已切换到简体中文 ✓".into()
-                        };
-                    }
-                });
-                ui.end_row();
-
-                // 主题（调色盘切换，立即生效）：内置 + $DSH_HOME/themes + 插件主题
-                ui.label("主题 / Theme:");
-                ui.horizontal(|ui| {
-                    let mut files: Vec<std::path::PathBuf> = Vec::new();
-                    let themes_dir = cfg.dsh_home.join("themes");
-                    if let Ok(entries) = std::fs::read_dir(&themes_dir) {
-                        for e in entries.flatten() {
-                            let p = e.path();
-                            if p.extension().map(|x| x == "json").unwrap_or(false) {
-                                files.push(p);
+            // ===== 引擎设置（DSH 核心） =====
+            Theme::card().show(ui, |ui| {
+                ui.label(Theme::card_section_title(tr(lang, "DeepSeek 引擎", "DeepSeek Engine")));
+                ui.add_space(6.0);
+                egui::Grid::new("engine_settings_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label(form_label(&tr(lang, "API Key:", "API Key:")));
+                        ui.add(
+                            TextEdit::singleline(&mut self.api_key)
+                                .font(egui::FontId::proportional(12.5))
+                                .text_color(Theme::text())
+                                .hint_text(RichText::new(
+                                    "sk-...（也可从 ~/.dsh/.credentials.yaml 自动读取）",
+                                )
+                                .size(11.5)
+                                .color(Theme::text_faint()))
+                                .desired_width(420.0),
+                        );
+                        ui.end_row();
+                        ui.label(form_label(&tr(lang, "模型:", "Model:")));
+                        ui.horizontal(|ui| {
+                            // 下拉：DeepSeek 官方模型表（V4 系列 + legacy），
+                            // 当前值不在表内（自定义网关模型）保留为选项
+                            let mut sel = self.model.clone();
+                            egui::ComboBox::from_id_salt("model_select")
+                                .selected_text(
+                                    RichText::new(&self.model)
+                                        .size(12.5)
+                                        .color(Theme::text()),
+                                )
+                                .width(240.0)
+                                .show_ui(ui, |ui| {
+                                    for m in crate::core::llm::DEEPSEEK_MODELS {
+                                        ui.selectable_value(&mut sel, m.to_string(), *m);
+                                    }
+                                    if !crate::core::llm::DEEPSEEK_MODELS.contains(&self.model.as_str()) {
+                                        let keep = self.model.clone();
+                                        ui.selectable_value(
+                                            &mut sel,
+                                            keep.clone(),
+                                            format!("{keep}（自定义）"),
+                                        );
+                                    }
+                                });
+                            if sel != self.model {
+                                self.model = sel;
+                                self.status = tr(lang, "模型已更改（保存后生效）", "Model changed (applies on save)").into();
                             }
-                        }
-                    }
-                    if let Ok(engine) = self.engine.lock() {
-                        files.extend(engine.plugin_theme_files());
-                    }
-                    let mgr = crate::ui::theme::ThemeManager::discover(&files);
-                    let names = mgr.names();
-                    let current = cfg.theme.clone();
-                    let mut selected = current.clone();
-                    egui::ComboBox::from_id_salt("theme_select")
-                        .selected_text(&current)
-                        .width(200.0)
-                        .show_ui(ui, |ui| {
-                            for n in &names {
-                                ui.selectable_value(&mut selected, n.clone(), n);
-                            }
+                            ui.label(
+                                RichText::new(tr(lang, "V4 系列（flash / pro / vision-exp）+ legacy", "V4 series (flash / pro / vision-exp) + legacy"))
+                                    .color(Theme::text_faint())
+                                    .size(11.0),
+                            );
                         });
-                    if selected != current {
-                        if let Some(p) = mgr.get(&selected).cloned() {
-                            crate::ui::theme::Theme::set_palette(&p);
-                            crate::ui::theme::Theme::apply(ui.ctx());
-                            cfg.theme = selected.clone();
-                            let _ = cfg.save();
-                            self.status = format!("主题已切换：{selected} ✓");
+                        ui.end_row();
+                        ui.label(form_label(&tr(lang, "Base URL:", "Base URL:")));
+                        ui.add(
+                            TextEdit::singleline(&mut self.base_url)
+                                .font(egui::FontId::proportional(12.5))
+                                .text_color(Theme::text())
+                                .desired_width(420.0),
+                        );
+                        ui.end_row();
+                        ui.label(form_label(&tr(lang, "默认 Agent 模式:", "Default agent preset:")));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                            use crate::core::preset::AgentPreset;
+                            let current = AgentPreset::parse(&self.default_preset).unwrap_or_default();
+                            for p in AgentPreset::all() {
+                                if Theme::segment_tab(ui, p.name(), p == current).clicked()
+                                    && p != current
+                                {
+                                    self.default_preset = p.id().to_string();
+                                }
+                            }
+                            ui.label(
+                                RichText::new(tr(lang, "新建会话使用（标准/自主规划）", "Used by new sessions (standard / auto-plan)"))
+                                    .color(Theme::text_faint())
+                                    .size(11.0),
+                            );
+                        });
+                        ui.end_row();
+                    });
+            });
+            ui.add_space(8.0);
+
+            // ===== 沙箱模式（实时生效，无需重启）=====
+            Theme::card().show(ui, |ui| {
+                ui.label(Theme::card_section_title(tr(lang, "沙箱模式", "Sandbox mode")));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                    for m in [
+                        SandboxMode::DangerFullAccess,
+                        SandboxMode::WorkspaceWrite,
+                        SandboxMode::ReadOnly,
+                    ] {
+                        if Theme::segment_tab(ui, m.as_str(), self.sandbox_mode == m).clicked()
+                            && self.sandbox_mode != m
+                        {
+                            self.sandbox_mode = m;
+                            // 实时生效
+                            if let Ok(mut e) = self.engine.lock() {
+                                e.set_sandbox_mode(m);
+                            }
+                            self.status = tr(lang, &format!("沙箱已切换至 {}", m.as_str()), &format!("Sandbox switched to {}", m.as_str()));
                         }
                     }
                     ui.label(
-                        RichText::new("内置 + $DSH_HOME/themes/*.json + 插件主题，立即生效")
-                            .weak()
+                        RichText::new(tr(lang, "仅工作区=区外读写均拦截（系统基础与 ~/.dsh 除外）；只读=全局可读不可写", "Workspace-only blocks reads AND writes outside (system basics & ~/.dsh exempt); read-only = global read, no writes"))
+                            .color(Theme::text_faint())
                             .size(11.0),
                     );
                 });
-                ui.end_row();
             });
+            ui.add_space(8.0);
 
-        ui.separator();
+            // ===== 网络与界面 =====
+            Theme::card().show(ui, |ui| {
+                ui.label(Theme::card_section_title(tr(lang, "网络与界面", "Network & UI")));
+                ui.add_space(6.0);
+                egui::Grid::new("settings_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label(form_label(&tr(lang, "HTTP 代理:", "HTTP proxy:")));
+                        ui.add(form_field(&mut self.http_proxy, "http://127.0.0.1:7890（留空清除）"));
+                        ui.end_row();
 
-        ui.horizontal(|ui| {
-            if ui.button("保存设置").clicked() {
+                        ui.label(form_label(&tr(lang, "HTTPS 代理:", "HTTPS proxy:")));
+                        ui.add(form_field(&mut self.https_proxy, "http://127.0.0.1:7890（留空清除）"));
+                        ui.end_row();
+
+                        ui.label(form_label(&tr(lang, "NO_PROXY:", "NO_PROXY:")));
+                        ui.add(form_field(&mut self.no_proxy, "localhost,127.0.0.1,::1（逗号分隔）"));
+                        ui.end_row();
+
+                        ui.label(form_label(&tr(lang, "界面字体大小:", "UI font size:")));
+                        let before = self.font_size;
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                            if Theme::mini_button(ui, "−", ChipTint::Neutral).clicked() {
+                                self.font_size = (self.font_size.round() - 1.0).max(12.0);
+                            }
+                            ui.label(
+                                RichText::new(format!("{} px", self.font_size.round() as i32))
+                                    .size(12.5)
+                                    .color(Theme::text()),
+                            );
+                            if Theme::mini_button(ui, "+", ChipTint::Neutral).clicked() {
+                                self.font_size = (self.font_size.round() + 1.0).min(24.0);
+                            }
+                            ui.label(
+                                RichText::new(tr(lang, "（16=默认）", "(16 = default)"))
+                                    .size(11.0)
+                                    .color(Theme::text_faint()),
+                            );
+                        });
+                        if (self.font_size - before).abs() > f32::EPSILON {
+                            // 即时生效（egui 全局缩放；保存后重启仍保留）
+                            ui.ctx()
+                                .set_zoom_factor(crate::config::ui_zoom(self.font_size));
+                        }
+                        ui.end_row();
+
+                        ui.label(form_label(&tr(lang, "回滚行数:", "Scrollback lines:")));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                            if Theme::mini_button(ui, "−", ChipTint::Neutral).clicked() {
+                                self.scrollback = self.scrollback.saturating_sub(500).max(500);
+                            }
+                            ui.label(
+                                RichText::new(format!("{} {l}", self.scrollback, l = tr(lang, "行", "lines")))
+                                    .size(12.5)
+                                    .color(Theme::text()),
+                            );
+                            if Theme::mini_button(ui, "+", ChipTint::Neutral).clicked() {
+                                self.scrollback = (self.scrollback + 500).min(20000);
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label(form_label(&tr(lang, "默认 Shell:", "Default shell:")));
+                        ui.add(
+                            TextEdit::singleline(&mut self.shell)
+                                .font(egui::FontId::proportional(12.5))
+                                .text_color(Theme::text())
+                                .desired_width(360.0),
+                        );
+                        ui.end_row();
+
+                        // 界面语言（中英双语切换，立即生效）
+                        ui.label(form_label(&tr(lang, "界面语言 / Language:", "Language:")));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                            let mut lang = crate::ui::i18n::Lang::parse(&self.lang_value);
+                            let mut changed = false;
+                            for candidate in [crate::ui::i18n::Lang::Zh, crate::ui::i18n::Lang::En] {
+                                if Theme::segment_tab(ui, candidate.name(), lang == candidate)
+                                    .clicked()
+                                    && lang != candidate
+                                {
+                                    lang = candidate;
+                                    changed = true;
+                                }
+                            }
+                            if changed {
+                                self.lang_value = lang.as_str().to_string();
+                                cfg.lang = self.lang_value.clone();
+                                let _ = cfg.save();
+                                self.status = if lang == crate::ui::i18n::Lang::En {
+                                    "Language switched to English ✓".into()
+                                } else {
+                                    tr(lang, "已切换到简体中文 ✓", "已切换到简体中文 ✓").into()
+                                };
+                            }
+                        });
+                        ui.end_row();
+
+                        // 主题（调色盘切换，立即生效）：内置 + $DSH_HOME/themes + 插件主题
+                        ui.label(form_label(&tr(lang, "主题 / Theme:", "Theme:")));
+                        ui.horizontal(|ui| {
+                            let mut files: Vec<std::path::PathBuf> = Vec::new();
+                            let themes_dir = cfg.dsh_home.join("themes");
+                            if let Ok(entries) = std::fs::read_dir(&themes_dir) {
+                                for e in entries.flatten() {
+                                    let p = e.path();
+                                    if p.extension().map(|x| x == "json").unwrap_or(false) {
+                                        files.push(p);
+                                    }
+                                }
+                            }
+                            if let Ok(engine) = self.engine.lock() {
+                                files.extend(engine.plugin_theme_files());
+                            }
+                            let mgr = crate::ui::theme::ThemeManager::discover(&files);
+                            let names = mgr.names();
+                            let current = cfg.theme.clone();
+                            let mut selected = current.clone();
+                            egui::ComboBox::from_id_salt("theme_select")
+                                .selected_text(
+                                    RichText::new(&current).size(12.5).color(Theme::text()),
+                                )
+                                .width(200.0)
+                                .show_ui(ui, |ui| {
+                                    for n in &names {
+                                        ui.selectable_value(&mut selected, n.clone(), n);
+                                    }
+                                });
+                            if selected != current {
+                                if let Some(p) = mgr.get(&selected).cloned() {
+                                    crate::ui::theme::Theme::set_palette(&p);
+                                    crate::ui::theme::Theme::apply(ui.ctx());
+                                    cfg.theme = selected.clone();
+                                    let _ = cfg.save();
+                                    self.status = tr(lang, &format!("主题已切换：{selected} ✓"), &format!("Theme switched: {selected} ✓"));
+                                }
+                            }
+                            ui.label(
+                                RichText::new(tr(lang, "内置 + $DSH_HOME/themes/*.json + 插件主题，立即生效", "Built-in + $DSH_HOME/themes/*.json + plugin themes, instant"))
+                                    .color(Theme::text_faint())
+                                    .size(11.0),
+                            );
+                        });
+                        ui.end_row();
+                    });
+            });
+            ui.add_space(10.0);
+
+            // ===== 操作行（主按钮 + 次级 chips + 状态） =====
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                if Theme::primary_button(ui, &tr(lang, "保存设置", "Save settings"), true).clicked() {
                 // 应用设置
                 cfg.http_proxy = opt(&self.http_proxy);
                 cfg.https_proxy = opt(&self.https_proxy);
@@ -348,12 +419,12 @@ impl SettingsTab {
                         Ok(())
                     });
                 match (cfg.save(), engine_result) {
-                    (Ok(()), Ok(())) => self.status = "设置已保存 ✓（引擎设置立即生效）".into(),
-                    (Err(e), _) => self.status = format!("保存失败: {e:#}"),
-                    (_, Err(e)) => self.status = format!("引擎设置保存失败: {e:#}"),
+                    (Ok(()), Ok(())) => self.status = tr(lang, "设置已保存 ✓（引擎设置立即生效）", "Saved ✓ (engine settings applied immediately)").into(),
+                    (Err(e), _) => self.status = tr(lang, &format!("保存失败: {e:#}"), &format!("Save failed: {e:#}")),
+                    (_, Err(e)) => self.status = tr(lang, &format!("引擎设置保存失败: {e:#}"), &format!("Engine settings save failed: {e:#}")),
                 }
             }
-            if ui.button("清除 Key").clicked() {
+            if Theme::mini_button(ui, &tr(lang, "清除 Key", "Clear key"), ChipTint::Danger).clicked() {
                 // 显式清除（绕过空输入保留逻辑）
                 let keep = self.engine.lock().ok().map(|e| {
                     let s = e.settings();
@@ -371,25 +442,32 @@ impl SettingsTab {
                         .map(|mut e| e.update_settings_from_ui(None, url, model, proxy, preset));
                 }
                 self.api_key.clear();
-                self.status = "API Key 已清除 ✓".into();
+                self.status = tr(lang, "API Key 已清除 ✓", "API key cleared ✓").into();
             }
-            if ui.button("恢复默认代理").clicked() {
+            if Theme::mini_button(ui, &tr(lang, "恢复默认代理", "Reset proxies"), ChipTint::Neutral).clicked() {
                 self.http_proxy.clear();
                 self.https_proxy.clear();
                 self.no_proxy.clear();
-                self.status = "代理已清空（保存后生效）".into();
+                self.status = tr(lang, "代理已清空（保存后生效）", "Proxies cleared (applies on save)").into();
             }
-            ui.label(RichText::new(&self.status).weak());
+            if !self.status.is_empty() {
+                ui.label(Theme::dim(&self.status));
+            }
         });
 
-        ui.separator();
-        ui.label(RichText::new("提示：代理注入到 dsh plugin / dsh web / 终端 shell 的 HTTP_PROXY、HTTPS_PROXY、NO_PROXY 环境变量。").size(11.0).weak());
+        ui.add_space(8.0);
         ui.label(
-            RichText::new("保存后重启终端会话（顶部“重启会话”）让 shell 继承新代理。")
+            RichText::new(tr(lang, "提示：代理注入到 dsh plugin / dsh web / 终端 shell 的 HTTP_PROXY、HTTPS_PROXY、NO_PROXY 环境变量。", "Note: proxies are injected as HTTP_PROXY/HTTPS_PROXY/NO_PROXY for dsh plugin / dsh web / shells."))
                 .size(11.0)
-                .weak(),
+                .color(Theme::text_faint()),
         );
-        self.ui_bridge_info(ui);
+        ui.label(
+            RichText::new(tr(lang, "保存后重启终端会话（顶部“重启会话”）让 shell 继承新代理。", "Restart the terminal session after saving so shells inherit the new proxy."))
+                .size(11.0)
+                .color(Theme::text_faint()),
+        );
+        self.ui_bridge_info(ui, lang);
+        });
     }
 
     /// 桥访问信息（端口 + 鉴权 token，供程序化调用者）。
@@ -401,26 +479,25 @@ impl SettingsTab {
         };
     }
 
-    fn ui_bridge_info(&self, ui: &mut egui::Ui) {
+    fn ui_bridge_info(&self, ui: &mut egui::Ui, lang: Lang) {
         if let Some((port, token)) = &self.bridge_info {
-            ui.separator();
-            ui.label(
-                RichText::new("本地桥 API")
-                    .strong()
-                    .color(crate::ui::theme::Theme::accent_light()),
-            );
-            ui.label(
-                RichText::new(format!(
-                    "http://127.0.0.1:{port}/api/sessions · 鉴权 X-DSH-Token: {token}"
-                ))
-                .size(11.0)
-                .weak(),
-            );
-            ui.label(
-                RichText::new("token 每次启动随机生成（本机任意进程可读端口，故必须携带）")
-                    .size(10.5)
-                    .weak(),
-            );
+            ui.add_space(8.0);
+            Theme::card().show(ui, |ui| {
+                ui.label(Theme::card_section_title(tr(lang, "本地桥 API", "Local bridge API")));
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(format!(
+                        "http://127.0.0.1:{port}/api/sessions · 鉴权 X-DSH-Token: {token}"
+                    ))
+                    .size(11.0)
+                    .color(Theme::text_dim()),
+                );
+                ui.label(
+                    RichText::new(tr(lang, "token 每次启动随机生成（本机任意进程可读端口，故必须携带）", "Token is random per launch (the port is readable by any local process, so it is required)"))
+                        .size(10.5)
+                        .color(Theme::text_faint()),
+                );
+            });
         }
     }
 }

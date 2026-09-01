@@ -2,7 +2,7 @@
 //!
 //! 布局（人类阅读习惯）
 //! ┌──────────────────────────────────────
-//!  🎯 弹幕区（AI 思考过程从右向左飘过）   danmaku layer
+//!  🎯 弹幕区（AI 工具调用信息从右向左飘过）  danmaku layer
 //! ├──────────────────────────────────────
 //!  💬 对话消息（气泡）                   ScrollArea
 //!                                     
@@ -24,7 +24,7 @@ use crate::core::{DshEngine, EngineEvent, Message, SandboxMode, Session, Session
 use super::danmaku::DanmakuLayer;
 use super::i18n::{tr, Lang};
 use super::markdown::ViewerState;
-use super::theme::Theme;
+use super::theme::{ChipTint, Theme};
 
 pub struct ChatTab {
     /// 界面语言（app 每帧同步
@@ -47,7 +47,7 @@ pub struct ChatTab {
     send_mode: SendMode,
     /// 会话搜索输入
     session_search: String,
-    /// 弹幕层（AI 思考过程）
+    /// 弹幕层（AI 工具调用信息）
     danmaku: DanmakuLayer,
     /// markdown 解析结果缓存（key=消息内容；弹幕动画期间整窗 30fps 重绘，
     /// 无缓存时所有 markdown 消息每帧重新 parse，是性能热点）
@@ -87,7 +87,7 @@ pub struct ChatTab {
     /// 待确认删除的会话 id（第一次点🗑 进入确认态，再点执行
     pending_delete: Option<String>,
     /// 标题行卡片（单选：同一时间只开一张）
-    pub card: CardKind,
+    pub panel_expanded: PanelKind,
     /// 计划模式状态（fold plan/mode 事件
     plan_mode: crate::engine::plan::PlanMode,
     /// 最近计划内容（plan_write 写入
@@ -98,11 +98,24 @@ pub struct ChatTab {
     subs: std::collections::HashMap<String, crate::engine::subagent::SubagentDescriptor>,
     /// 目标卡片的新目标输入
     goal_input: String,
-    status: String,
+    /// 复制成功的内联反馈（消息 id + 点击时刻；按钮旁短暂显示"已复制 ✓"）
+    copy_flash: Option<(String, std::time::Instant)>,
+    /// 状态方块按钮行上一帧实测宽（两遍测宽：右缘对齐用）
+    chips_row_w: f32,
+    /// 展开面板上一帧实测宽（下标 = PanelKind 判别值；内容自适应宽）
+    panel_widths: [f32; 5],
+    pub(crate) status: String,
     /// 顶部错误提示（app 侧也可写入，web 启动失败
     pub error: Option<String>,
     /// 工作区路径输
     ws_input: String,
+    /// 跨页打开文件请求（diff 卡标题点击 → app 消费切到代码浏览器）
+    pub open_file_req: Option<std::path::PathBuf>,
+    /// 全文搜索结果缓存 (查询, 时间, 结果)——防抖用
+    search_hits: Option<(String, std::time::Instant, Vec<(SessionSummary, String)>)>,
+    /// 定时任务表单（Jobs 卡片）
+    sched_name: String,
+    sched_interval: String,
     /// 当前工作区（规范化路径显示）
     ws_current: Option<String>,
     /// 消息内嵌图片纹理缓存（路径/URL → 纹理）
@@ -150,15 +163,22 @@ impl ChatTab {
             user_scroll_pending: false,
             pending_question: None,
             pending_delete: None,
-            card: CardKind::None,
+            panel_expanded: PanelKind::None,
             plan_mode: crate::engine::plan::PlanMode::Inactive,
             plan_content: String::new(),
             goals: crate::engine::goal::GoalManager::default(),
             subs: std::collections::HashMap::new(),
             goal_input: String::new(),
+            copy_flash: None,
+            chips_row_w: 0.0,
+            panel_widths: [0.0; 5],
             status: String::new(),
             error: None,
             ws_input: ws_current.clone().unwrap_or_default(),
+            open_file_req: None,
+            search_hits: None,
+            sched_name: String::new(),
+            sched_interval: String::from("30"),
             ws_current,
             img_cache: std::collections::HashMap::new(),
             viewer: None,
@@ -169,12 +189,12 @@ impl ChatTab {
     }
 
     pub fn refresh_sessions(&mut self) {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
         self.sessions = engine.list_sessions();
     }
 
     pub fn open(&mut self, session_id: &str) {
-        let mut engine = self.engine.lock().unwrap();
+        let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
         match engine.open_session(session_id) {
             Ok(s) => {
                 self.current = Some(session_id.to_string());
@@ -258,51 +278,55 @@ impl ChatTab {
                             event.r#type, cur_match, self.current, msg_count
                         );
                     }
+                    // ask_user：AI 提问 渲染选择卡片（等待用户回答）
+                    if event.r#type == types::USER_QUESTION {
+                        if let Some(data) = &event.data {
+                            let question = data
+                                .get("question")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let options = data
+                                .get("options")
+                                .and_then(|v| v.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|x| x.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let header = data
+                                .get("header")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            // 记录提问所属会话（回答必须发回该会话）
+                            self.pending_question = Some(PendingQuestion {
+                                session_id: session_id.clone(),
+                                question,
+                                options,
+                                header,
+                            });
+                            info!(
+                                "ask_user question received: {:?}",
+                                self.pending_question
+                                    .as_ref()
+                                    .map(|q| (&q.question, q.options.len()))
+                            );
+                        }
+                        self.refresh_sessions();
+                        continue;
+                    }
                     if self.current.as_deref() == Some(session_id.as_str()) {
                         log::debug!(
                             "chat pump: event for current session {} ({})",
                             session_id,
                             event.r#type
                         );
-                        // ask_user：AI 提问 渲染选择卡片（等待用户回答）
-                        if event.r#type == types::USER_QUESTION {
-                            if let Some(data) = &event.data {
-                                let question = data
-                                    .get("question")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string();
-                                let options = data
-                                    .get("options")
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| {
-                                        a.iter()
-                                            .filter_map(|x| x.as_str().map(String::from))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                let header = data
-                                    .get("header")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from);
-                                // 记录提问所属会话（回答必须发回该会话）
-                                self.pending_question = Some(PendingQuestion {
-                                    session_id: session_id.clone(),
-                                    question,
-                                    options,
-                                    header,
-                                });
-                                info!(
-                                    "ask_user question received: {:?}",
-                                    self.pending_question
-                                        .as_ref()
-                                        .map(|q| (&q.question, q.options.len()))
-                                );
-                            }
+                        // 自动命名 / 重命名：刷新侧栏会话列表标题
+                        if event.r#type == types::SESSION_TITLE {
                             self.refresh_sessions();
-                            continue;
                         }
-                        // 计划事件（plan_write / exit_plan_mode）：更新计划卡片状
+// 计划事件（plan_write / exit_plan_mode）：更新计划卡片状
                         if event.r#type == types::PLAN_MODE {
                             let (mode, content) =
                                 crate::engine::plan::fold_plan_state(&[event.clone()]);
@@ -349,15 +373,10 @@ impl ChatTab {
                             if let Some(data) = &event.data {
                                 if let Some(c) = data.get("content").and_then(|v| v.as_str()) {
                                     if is_reasoning {
-                                        // 思考增弹幕（分句发射，避免一条过长）
-                                        for segment in split_danmaku(c) {
-                                            let seg = segment.clone();
-                                            self.danmaku.fire(
-                                                super::danmaku::DanmakuKind::Thinking,
-                                                seg,
-                                                segment,
-                                            );
-                                        }
+                                        // 思考增量不再上弹幕（用户要求：弹幕只
+                                        // 显示工具调用信息）；直接丢弃即可，思考
+                                        // 全文已随 assistant/message 事件持久化，
+                                        // 消息区折叠面板仍可回看
                                     } else {
                                         let buf =
                                             self.stream_buf.entry(session_id.clone()).or_default();
@@ -446,8 +465,14 @@ impl ChatTab {
                     self.error = Some(message);
                 }
                 EngineEvent::ScheduledTaskDue { id, name } => {
-                    // 定时任务到期（后台线程驱动）：状态栏提示（调度面板 M 后续）
+                    // 到期即重绘（闲置窗口无输入时不重绘 → 事件滞留通道，
+                    // 用户动鼠标才 fire 的历史缺陷）
+                    ui_ctx.request_repaint();
+                    // 定时任务到期：把 prompt 发到绑定会话发起回合
                     info!("scheduled task due in UI: {id} ({name})");
+                    if let Ok(mut e) = self.engine.lock() {
+                        e.fire_scheduled(&id);
+                    }
                     self.status = format!("⏰ {name}");
                 }
             }
@@ -462,63 +487,106 @@ impl ChatTab {
     /// （点击打开、双击重命名、✕ 两级删除确认）/ 运行中 ⚡ 标记。
     /// 从 Chat 中央区抽出——中央区全宽给消息区，列表收纳进左侧导航。
     /// 会话列表（文件树风格，渲染在主侧栏"会话"导航下）：
-    /// 紧凑行（26px）、整行点击、hover 整行浅底、选中左侧 2px 强调条、
+    /// 紧凑行（26px）、整行点击、hover 整行半透明浅底、
+    /// 选中 = accent 淡底 + 亮字（无强调条，靠底色区分）、
     /// 删除 ✕ 常驻但极淡（hover 变亮；两级确认）、双击重命名、
-    /// 运行中 ⚡ 右缘标记；＋ 新建在列表尾部（树追加语义）。
+    /// 运行中 ⚡ 与相对时间在右缘；＋ 新建在列表尾部（树追加语义）。
     pub fn ui_session_list(
         &mut self,
         ui: &mut egui::Ui,
         max_height: Option<f32>,
     ) -> Option<String> {
         const ROW_H: f32 = 26.0;
+        /// 右缘相对时间占位（"3分" / "2时" / "8/12"）
+        const TIME_W: f32 = 34.0;
         let lang = self.lang;
-        // 搜索框（有会话时才显示）
+        // 搜索框（有会话时才显示）：深底圆角胶囊，与输入框 chips 同族
         if self.sessions.len() > 3 {
             ui.add(
                 egui::TextEdit::singleline(&mut self.session_search)
                     .hint_text(
-                        egui::RichText::new(tr(lang, "搜索会话…", "Search…"))
+                        egui::RichText::new(tr(lang, "🔍 搜索会话…", "🔍 Search…"))
                             .size(10.5)
                             .color(Theme::text_faint()),
                     )
                     .desired_width(ui.available_width().max(60.0))
-                    .font(egui::FontId::proportional(10.5)),
+                    .font(egui::FontId::proportional(10.5))
+                    .text_color(Theme::text_dim())
+                    .frame(
+                        egui::Frame::default()
+                            .fill(Theme::bg())
+                            .stroke(egui::Stroke::new(1.0, Theme::border()))
+                            .corner_radius(egui::CornerRadius::same(7))
+                            .inner_margin(egui::Margin::symmetric(8, 4)),
+                    ),
             );
-            ui.add_space(4.0);
+            ui.add_space(5.0);
         }
-        // 搜索过滤（标题/ID 子串匹配；空 = 全部）
-        let search_lower = self.session_search.to_lowercase();
-        let sessions: Vec<_> = self
-            .sessions
-            .iter()
-            .filter(|s| {
-                search_lower.is_empty()
-                    || s.title.to_lowercase().contains(&search_lower)
-                    || s.session_id.contains(&search_lower)
-            })
-            .cloned()
-            .collect();
+        // 搜索过滤：空 = 全部；非空 = 跨会话全文搜索（防抖 400ms——
+        // 历史缺陷：每帧全盘重放所有会话 JSONL，鼠标划过侧栏即连续磁盘
+        // 全扫且持引擎锁阻塞回合线程）
+        let search_lower = self.session_search.trim().to_lowercase();
+        let sessions: Vec<(SessionSummary, String)> = if search_lower.is_empty() {
+            self.search_hits = None;
+            self.sessions
+                .iter()
+                .cloned()
+                .map(|s| (s, String::new()))
+                .collect()
+        } else {
+            let now = std::time::Instant::now();
+            let cached = self
+                .search_hits
+                .as_ref()
+                .map(|(q, t, _)| q == &search_lower && now.duration_since(*t) < std::time::Duration::from_millis(600))
+                .unwrap_or(false);
+            if cached {
+                // 固定 TTL（历史缺陷:命中刷新时间戳 = 滑动窗口,持续重绘
+                // 下同一查询永不过期,侧栏搜索结果无限陈旧）
+                self.search_hits
+                    .as_ref()
+                    .map(|(_, _, v)| v.clone())
+                    .unwrap_or_default()
+            } else if search_lower.chars().count() < 2 {
+                // 少于 2 字符不做全盘扫（避免每敲一键重放全部会话）
+                Vec::new()
+            } else {
+                let hits = match self.engine.lock() {
+                    Ok(e) => e.search_sessions(&search_lower, 30),
+                    Err(_) => Vec::new(),
+                };
+                self.search_hits = Some((search_lower.clone(), now, hits.clone()));
+                hits
+            }
+        };
         // 本帧被点击打开/新建的会话（返回给侧栏：非 Chat 页时切回 Chat 页）
         let mut opened: Option<String> = None;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or_default();
         let mut sa = ScrollArea::vertical().id_salt("session_list_scroll");
         if let Some(h) = max_height {
             sa = sa.max_height(h);
         }
         sa.show(ui, |ui| {
+            // 紧凑行距（默认 8px 显得松散，列表应是连续条目）
+            ui.spacing_mut().item_spacing.y = 2.0;
             let mut to_delete: Option<String> = None;
             let mut to_open: Option<String> = None;
             let full_w = ui.available_width().max(60.0);
-            for s in &sessions {
+            for (s, snip) in &sessions {
                 ui.horizontal(|ui| {
+                    let row_h = if snip.is_empty() { ROW_H } else { ROW_H + 14.0 };
                     let selected = self.current.as_deref() == Some(s.session_id.as_str());
                     let row_w = full_w - 8.0; // 两侧留 4px（树缩进感）
                                               // 占位推进布局；交互响应用 interact（allocate 响应的
                                               // widget_info 在 accessibility 树中不上报，interact 稳定）
                     let (alloc, _) =
-                        ui.allocate_exact_size(egui::vec2(full_w, ROW_H), egui::Sense::hover());
+                        ui.allocate_exact_size(egui::vec2(full_w, row_h), egui::Sense::hover());
                     let row = egui::Rect::from_min_size(
                         egui::pos2(alloc.left() + 4.0, alloc.top()),
-                        egui::vec2(row_w, ROW_H),
+                        egui::vec2(row_w, row_h),
                     );
                     let row_resp = ui.interact(
                         row,
@@ -535,19 +603,28 @@ impl ChatTab {
                         egui::Sense::click(),
                     );
                     let is_confirm = self.pending_delete.as_deref() == Some(s.session_id.as_str());
-                    let row_lit = row_resp.hovered() || selected || is_confirm;
+                    let hovered = row_resp.hovered() || del_resp.hovered();
 
-                    // 整行底色：hover / 选中
-                    if row_lit {
-                        ui.painter().rect_filled(row, 6.0, Theme::bg_hover());
-                    }
-                    // 选中：左侧 2px 强调条（与主导航一致）
-                    if selected {
-                        let bar = egui::Rect::from_min_max(
-                            egui::pos2(row.left() + 2.0, row.top() + 5.0),
-                            egui::pos2(row.left() + 4.0, row.bottom() - 5.0),
+                    // 整行底色三态：确认删除（危险色）> 选中（accent 淡底）> hover（半透明）。
+                    // 无左侧强调条；选中靠 accent 淡底 + 亮字表达。
+                    if is_confirm {
+                        ui.painter().rect_filled(
+                            row,
+                            6.0,
+                            Theme::err().gamma_multiply(0.12),
                         );
-                        ui.painter().rect_filled(bar, 1.0, Theme::accent());
+                    } else if selected {
+                        ui.painter().rect_filled(
+                            row,
+                            6.0,
+                            Theme::accent().gamma_multiply(0.16),
+                        );
+                    } else if hovered {
+                        ui.painter().rect_filled(
+                            row,
+                            6.0,
+                            Theme::bg_hover().gamma_multiply(0.5),
+                        );
                     }
 
                     // 双击重命名
@@ -581,7 +658,7 @@ impl ChatTab {
                             let name = self.rename_input.trim().to_string();
                             self.renaming = None;
                             if submitted && !name.is_empty() {
-                                let mut engine = self.engine.lock().unwrap();
+                                let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
                                 match engine.rename_session(&id, &name) {
                                     Ok(()) => {
                                         drop(engine);
@@ -592,26 +669,55 @@ impl ChatTab {
                             }
                         }
                     } else {
-                        // 标题（截断到可用宽；右侧预留 ⚡ 与 ✕ 位）
-                        let text_w = row_w - ROW_H - 46.0 - if s.running { 16.0 } else { 0.0 };
+                        // 标题（截断到可用宽；右侧预留 时间 / ⚡ / ✕ 位）
+                        let text_w = row_w
+                            - ROW_H
+                            - TIME_W
+                            - 8.0
+                            - if s.running { 16.0 } else { 0.0 };
                         let text = truncate_to_width(
                             ui,
                             &s.title,
                             text_w.max(30.0),
                             &egui::FontId::proportional(11.5),
                         );
+                        // 层次：选中 = 亮字；空白会话（未发过消息）= 极弱；一般 = 弱
                         let text_color = if selected {
                             Theme::text()
+                        } else if s.blank {
+                            Theme::text_faint()
                         } else {
                             Theme::text_dim()
                         };
+                        let title_y = if snip.is_empty() {
+                            row.center().y
+                        } else {
+                            row.top() + 11.0
+                        };
                         ui.painter().text(
-                            egui::pos2(row.left() + 30.0, row.center().y),
+                            egui::pos2(row.left() + 20.0, title_y),
                             egui::Align2::LEFT_CENTER,
                             text.clone(),
                             egui::FontId::proportional(11.5),
                             text_color,
                         );
+                        // 命中片段（全文搜索结果第二行，弱化灰）
+                        if !snip.is_empty() {
+                            let snip_w = row_w - 44.0 - TIME_W;
+                            let short = truncate_to_width(
+                                ui,
+                                snip,
+                                snip_w.max(40.0),
+                                &egui::FontId::proportional(10.0),
+                            );
+                            ui.painter().text(
+                                egui::pos2(row.left() + 20.0, row.top() + 24.0),
+                                egui::Align2::LEFT_CENTER,
+                                short,
+                                egui::FontId::proportional(10.0),
+                                Theme::text_faint().gamma_multiply(0.8),
+                            );
+                        }
                         row_resp.widget_info(|| {
                             egui::WidgetInfo::labeled(
                                 egui::WidgetType::Button,
@@ -619,6 +725,23 @@ impl ChatTab {
                                 format!("{text}{}", if s.running { " \u{26a1}" } else { "" }),
                             )
                         });
+                        // 相对时间（右缘、✕/⚡ 左侧；极弱，选中时略亮）
+                        if s.updated_at > 0.0 {
+                            let rel = relative_time(now - s.updated_at, lang);
+                            let time_x =
+                                del_rect.left() - if s.running { 18.0 } else { 6.0 };
+                            ui.painter().text(
+                                egui::pos2(time_x, row.center().y),
+                                egui::Align2::RIGHT_CENTER,
+                                rel,
+                                egui::FontId::proportional(9.5),
+                                if selected {
+                                    Theme::text_faint()
+                                } else {
+                                    Theme::text_faint().gamma_multiply(0.7)
+                                },
+                            );
+                        }
                         // 运行中 ⚡（右缘、✕ 左侧）
                         if s.running {
                             ui.painter().text(
@@ -670,10 +793,24 @@ impl ChatTab {
                     }
                 });
             }
+            // 空列表 / 搜索无结果
+            if sessions.is_empty() {
+                ui.add_space(10.0);
+                let hint = if self.sessions.is_empty() {
+                    tr(lang, "暂无会话 · 点 ＋ 新建", "No sessions · press ＋")
+                } else {
+                    tr(lang, "无匹配会话", "No matching sessions")
+                };
+                ui.label(
+                    egui::RichText::new(hint)
+                        .size(10.5)
+                        .color(Theme::text_faint()),
+                );
+            }
             // 删除执行 + 当前会话切换
             if let Some(id) = to_delete {
                 self.pending_delete = None;
-                let mut engine = self.engine.lock().unwrap();
+                let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
                 match engine.delete_session(&id) {
                     Ok(()) => {
                         drop(engine);
@@ -843,6 +980,40 @@ impl ChatTab {
                 if session.running {
                     ui.spinner();
                 }
+                // token 用量 + 上下文占用估算（引擎 usage 累计；弱化呈现，
+                // 用户在意时可见）。上下文按字节/4 粗估，仅作参考。
+                let (usage, ctx, model) = {
+                    match self.engine.lock() {
+                        Ok(e) => (
+                            e.token_usage(&session.id),
+                            e.context_estimate(&session.id),
+                            e.effective_model(&session.id),
+                        ),
+                        Err(_) => (Default::default(), 0, String::new()),
+                    }
+                };
+                if usage.total() > 0 {
+                    let ctx_cap = crate::core::llm::context_window(&model);
+                    let pct = if ctx_cap > 0 {
+                        (ctx as f64 / ctx_cap as f64 * 100.0).clamp(0.0, 999.0)
+                    } else {
+                        0.0
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "⚡ {:.1}k tok · {} ≈{pct:.0}%",
+                            usage.total() as f64 / 1000.0,
+                            tr(self.lang, "上下文", "ctx"),
+                        ))
+                        .size(10.0)
+                        .color(Theme::text_faint()),
+                    )
+                    .on_hover_text(tr(
+                        self.lang,
+                        "本会话累计 token 消耗（输入+输出）与当前上下文占用估算",
+                        "Session token usage (in+out) and estimated context occupancy",
+                    ));
+                }
             });
         }
         // 右区：卡片按钮（right_to_left 只作用于子 ui，不污染父布局）
@@ -857,294 +1028,426 @@ impl ChatTab {
             right_ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
             right_ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
             right_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // 计划按钮（中文保留"📋 计划 ▸"，历史测试依赖）
-                let lang = self.lang;
-                let plan_active = self.plan_mode == crate::engine::plan::PlanMode::Active;
-                let label = if self.card == CardKind::Plan {
-                    if lang == Lang::En {
-                        "📋 Plan ▾"
-                    } else {
-                        "📋 计划 ▾"
+                // 会话分支（最右）：复制当前进度到新会话——探索性改动的安全副本
+                {
+                    let lang = self.lang;
+                    if Theme::mini_button(ui, "⑂", ChipTint::Neutral)
+                        .on_hover_text(tr(
+                            lang,
+                            "从当前进度分叉出新会话（原会话保留不动）",
+                            "Fork a new session from here (original kept intact)",
+                        ))
+                        .clicked()
+                    {
+                        let sid = session.id.clone();
+                        // map_err 立即丢弃 PoisonError（其持有 guard，会让
+                        // 引擎锁的借用活到 match 末尾，与后续 &mut self 冲突）
+                        let forked = self
+                            .engine
+                            .lock()
+                            .map(|mut e| e.fork_session(&sid))
+                            .map_err(|_| "engine lock poisoned");
+                        match forked {
+                            Ok(Ok(new_id)) => {
+                                self.refresh_sessions();
+                                self.open(&new_id);
+                                self.status = tr(lang, "已分叉到新会话", "Forked to new session").into();
+                            }
+                            Ok(Err(e)) => {
+                                self.error = Some(format!("分叉失败：{e:#}"));
+                            }
+                            Err(e) => {
+                                self.error = Some(e.to_string());
+                            }
+                        }
                     }
-                } else if lang == Lang::En {
-                    "📋 Plan ▸"
-                } else {
-                    "📋 计划 ▸"
-                };
-                let btn = ui
-                    .add(
-                        egui::Button::new(RichText::new(label).size(12.0).color(if plan_active {
-                            Theme::accent_light()
-                        } else {
-                            Theme::text_dim()
-                        }))
-                        .fill(if plan_active || self.card == CardKind::Plan {
-                            Theme::bg_hover()
-                        } else {
-                            egui::Color32::TRANSPARENT
-                        })
-                        .corner_radius(8.0),
-                    )
-                    .on_hover_text(if self.card == CardKind::Plan {
-                        tr(lang, "点击关闭计划卡片", "Close plan card")
-                    } else {
-                        tr(lang, "点击查看计划卡片", "Show plan card")
-                    });
-                if btn.clicked() {
-                    self.card = if self.card == CardKind::Plan {
-                        CardKind::None
-                    } else {
-                        CardKind::Plan
-                    };
                 }
-                // 其余卡片按钮（任务 / 子代理 / 目标）
-                self.card_button(ui, CardKind::Jobs, &tr(self.lang, "⏳ 任务", "⏳ Tasks"));
-                self.card_button(
-                    ui,
-                    CardKind::Subagents,
-                    &tr(self.lang, "🤖 子代理", "🤖 Subagents"),
-                );
-                self.card_button(ui, CardKind::Goals, &tr(self.lang, "🎯 目标", "🎯 Goals"));
+                // 导出 Markdown（最右第二）：当前会话存为 .md（归档/分享）
+                {
+                    let lang = self.lang;
+                    if Theme::mini_button(ui, "⬇", ChipTint::Neutral)
+                        .on_hover_text(tr(
+                            lang,
+                            "导出当前会话为 Markdown 文件",
+                            "Export this session as Markdown",
+                        ))
+                        .clicked()
+                    {
+                        let sid = session.id.clone();
+                        let md = self
+                            .engine
+                            .lock()
+                            .ok()
+                            .and_then(|e| e.export_session_markdown(&sid).ok());
+                        match md {
+                            Some(text) => {
+                                let safe: String = session
+                                    .title
+                                    .chars()
+                                    .filter(|c| c.is_alphanumeric() || "._- ".contains(*c))
+                                    .take(40)
+                                    .collect();
+                                let name = if safe.trim().is_empty() {
+                                    format!("{}.md", session.id)
+                                } else {
+                                    format!("{safe}.md")
+                                };
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .set_file_name(&name)
+                                    .set_title(tr(lang, "导出会话", "Export session"))
+                                    .save_file()
+                                {
+                                    match std::fs::write(&path, &text) {
+                                        Ok(()) => {
+                                            self.status = format!(
+                                                "{} {}",
+                                                tr(lang, "已导出", "Exported"),
+                                                path.display()
+                                            );
+                                        }
+                                        Err(e) => {
+                                            self.error =
+                                                Some(format!("{}: {e}", tr(lang, "导出失败", "Export failed")));
+                                        }
+                                    }
+                                }
+                            }
+                            None => {
+                                self.error =
+                                    Some(tr(lang, "导出失败（会话读取错误）", "Export failed").into());
+                            }
+                        }
+                    }
+                }
             });
         }
         ui.add_space(2.0);
 
-        // ===== 标题行卡片：浮动层（egui::Window）=====
-        // 不挤占消息区布局（旧实现内联渲染，展开后把消息/输入往下推），
-        // 吸附在按钮行下方右侧；再次点击按钮或点窗口 ✕ 关闭。
-        if self.card != CardKind::None {
-            let lang = self.lang;
-            let (title, w) = match self.card {
-                CardKind::Plan => (tr(lang, "📋 计划", "📋 Plan"), 460.0),
-                CardKind::Goals => (tr(lang, "🎯 目标", "🎯 Goals"), 420.0),
-                CardKind::Subagents => (tr(lang, "🤖 子代理", "🤖 Subagents"), 440.0),
-                CardKind::Jobs => (tr(lang, "⏳ 任务", "⏳ Tasks"), 440.0),
-                CardKind::None => unreachable!(),
-            };
-            let anchor = egui::pos2(
-                (row_rect.right() - w).max(row_rect.left()),
-                row_rect.bottom() + 6.0,
-            );
-            let mut open = true;
-            egui::Window::new(title)
-                .id(egui::Id::new("floating_card"))
-                .fixed_pos(anchor)
-                .default_size([w, 320.0])
-                .resizable(true)
-                .collapsible(false)
-                .open(&mut open)
-                .show(ui.ctx(), |ui| match self.card {
-                    CardKind::Plan => self.render_plan_card(ui),
-                    CardKind::Goals => self.render_goals_card(ui, session),
-                    CardKind::Subagents => self.render_subagents_card(ui),
-                    CardKind::Jobs => self.render_jobs_card(ui),
-                    CardKind::None => {}
-                });
-            if !open {
-                self.card = CardKind::None;
-            }
-        }
-
-        // 模式选择 / 工作区栏 / 弹幕/ 消息+ 输入
+        // 模式选择 / 工作区栏 / 弹幕 / 状态方块 / 消息 + 输入
         self.render_body_bottom(ui, session);
     }
 
-    /// 标题行卡片切换按钮（单选：打开一张自动关掉其他）
-    fn card_button(&mut self, ui: &mut egui::Ui, kind: CardKind, label: &str) {
-        let open = self.card == kind;
-        let text = if open {
-            format!("{label} ▾")
-        } else {
-            format!("{label} ▸")
-        };
-        let btn = ui
-            .add(
-                egui::Button::new(RichText::new(text).size(12.0).color(if open {
-                    Theme::accent_light()
-                } else {
-                    Theme::text_dim()
-                }))
-                .fill(if open {
-                    Theme::bg_hover()
-                } else {
-                    egui::Color32::TRANSPARENT
-                })
-                .corner_radius(8.0),
-            )
-            .on_hover_text(if open {
-                tr(
-                    self.lang,
-                    &format!("点击关闭{label}卡片"),
-                    &format!("Close {label}"),
-                )
-            } else {
-                tr(
-                    self.lang,
-                    &format!("点击查看{label}卡片"),
-                    &format!("Show {label}"),
-                )
-            });
-        if btn.clicked() {
-            self.card = if open { CardKind::None } else { kind };
-        }
-    }
-
-    /// 富文本渲染（markdown）：供卡片正文复用 chat 消息的渲染引擎。
-    /// 无 markdown 特征走纯文本；有则缓存解析并按块渲染（含代码块/列表/粗体等）。
-    /// 这样 plan/goals/subagents 卡片内容更新时下一帧实时重渲染。
-    fn render_rich(&mut self, ui: &mut egui::Ui, content: &str, salt: u64, text_color: Color32) {
-        if content.trim().is_empty() {
-            return;
-        }
-        if !looks_like_markdown(content) {
-            ui.label(RichText::new(content).color(text_color));
-            return;
-        }
-        let blocks = self
-            .md_parse_cache
-            .get(content)
-            .cloned()
-            .unwrap_or_else(|| {
-                let parsed = std::sync::Arc::new(crate::ui::markdown::parse_markdown(content));
-                if self.md_parse_cache.len() > 512 {
-                    self.md_parse_cache.clear();
+    /// ZCode 式状态方块按钮（弹幕区下方右缘，悬浮吸附）：每个非空域一个
+    /// 紧凑方块（📋 计划 n/m、🤖 子代理、🎯 目标、⏳ 任务）；域处于活动
+    /// 态（计划进行中 / 子代理运行 / 任务运行 / 目标进行中）或已展开时
+    /// 按钮用强调色，点击展开/收起对应清单（单选）。
+    /// 悬浮 Area（Order::Middle）不占布局流——消息区/输入框完全不受影响
+    /// （历史缺陷：右上浮层卡压住 📂浏览/切换 按钮；布局流版本会挤压
+    /// 消息区）。行宽与展开面板宽均两遍测宽：右缘对齐、随内容自适应。
+    #[allow(clippy::too_many_lines)]
+    fn render_status_chips(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: &RenderSession,
+        anchor_top: f32,
+        right_edge: f32,
+    ) {
+        let lang = self.lang;
+        // ---- 数据收集（计划条目 / 子代理 / 目标 / 运行中任务）----
+        let plan_active = self.plan_mode == crate::engine::plan::PlanMode::Active;
+        let plan_items: Vec<(Option<bool>, String)> = self
+            .plan_content
+            .lines()
+            .map(|l| {
+                match crate::ui::markdown::checkbox_state(
+                    l.trim_start_matches(['-', '*', '+', ' ']),
+                ) {
+                    Some((done, rest)) => (Some(done), rest.trim().to_string()),
+                    None => (None, l.trim().to_string()),
                 }
-                self.md_parse_cache
-                    .insert(content.to_string(), parsed.clone());
-                parsed
+            })
+            .filter(|(_, t)| !t.is_empty())
+            .collect();
+        let (plan_total, plan_done) = plan_items
+            .iter()
+            .filter(|(d, _)| d.is_some())
+            .fold((0usize, 0usize), |(t, c), (d, _)| {
+                (t + 1, c + d.unwrap_or(false) as usize)
             });
-        let max_w = ui.available_width().max(60.0);
-        let img_cache = &mut self.img_cache;
-        let viewer = &mut self.viewer;
-        let http_imgs = &mut self.http_imgs;
-        crate::ui::markdown::render_blocks(
-            ui, &blocks, salt, text_color,
-            None, // 卡片无会话 cwd 基准（不解析相对图片路径）
-            img_cache, viewer, http_imgs, max_w,
-        );
-    }
+        let subs_total = self.subs.len();
+        let subs_running = self
+            .subs
+            .values()
+            .filter(|d| d.status == "running")
+            .count();
+        let goals_list = self.goals.list();
+        let goals_active = goals_list
+            .iter()
+            .filter(|g| matches!(g.phase, crate::engine::goal::GoalPhase::Active))
+            .count();
+        let jobs_live = self
+            .engine
+            .lock()
+            .map(|e| {
+                e.jobs_snapshot()
+                    .into_iter()
+                    .filter(|j| {
+                        matches!(
+                            j.status,
+                            crate::engine::jobs::JobStatus::Running
+                                | crate::engine::jobs::JobStatus::Pending
+                        )
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
 
-    /// 计划卡片（可滚动）
-    fn render_plan_card(&mut self, ui: &mut egui::Ui) {
-        let card_h = 130.0;
-        let (card_rect, _) =
-            ui.allocate_exact_size(vec2(ui.available_width(), card_h), egui::Sense::hover());
-        let card_painter = ui.painter_at(card_rect);
-        card_painter.rect_filled(card_rect, 10.0, Theme::bg_elevated());
-        card_painter.rect_stroke(
-            card_rect,
-            10.0,
-            egui::Stroke::new(1.0, Theme::border()),
-            egui::StrokeKind::Inside,
-        );
-        let mut card_ui =
-            ui.new_child(egui::UiBuilder::new().max_rect(card_rect.shrink2(egui::vec2(10.0, 8.0))));
-        card_ui.set_clip_rect(card_rect);
-        {
-            let lang = self.lang;
-            card_ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(tr(lang, "🗺 计划", "🗺 Plan"))
-                        .color(Theme::accent_light())
-                        .strong(),
-                );
-                let (state_zh, state_en) =
-                    if self.plan_mode == crate::engine::plan::PlanMode::Active {
-                        ("进行中", "active")
-                    } else {
-                        ("未启用", "inactive")
-                    };
-                let color = if self.plan_mode == crate::engine::plan::PlanMode::Active {
-                    Theme::ok()
-                } else {
-                    Theme::text_dim()
-                };
-                ui.label(
-                    RichText::new(format!("（{}）", tr(lang, state_zh, state_en)))
-                        .size(11.0)
-                        .color(color),
-                );
-            });
-            card_ui.add_space(4.0);
-            ScrollArea::vertical()
-                .max_height(card_h - 44.0)
-                .id_salt("plan_card_scroll")
-                .show(&mut card_ui, |ui| {
-                    if self.plan_content.trim().is_empty() {
-                        ui.label(
-                            RichText::new(tr(
-                                lang,
-                                "暂无计划内容。告诉 AI 进入计划模式（它会先产出计划再执行），\
-                                 或等 AI 调用 plan_write 后计划会显示在这里。",
-                                "No plan yet. Ask the AI to enter plan mode (it plans before \
-                                 acting), or wait for plan_write output to appear here.",
-                            ))
-                            .color(Theme::text_faint()),
-                        );
-                    } else {
-                        let content = self.plan_content.clone();
-                        self.render_rich(ui, &content, 7001u64, Theme::text());
+        // ---- 方块按钮行 ----
+        let mut chips: Vec<(PanelKind, String, bool, String)> = Vec::new();
+        if !self.plan_content.trim().is_empty() {
+            let label = if plan_total > 0 {
+                format!("📋 {plan_done}/{plan_total}")
+            } else {
+                "📋".to_string()
+            };
+            let tip = if plan_active {
+                tr(lang, "计划 · 进行中", "Plan · active")
+            } else {
+                tr(lang, "计划 · 已完成", "Plan · finished")
+            };
+            chips.push((PanelKind::Plan, label, plan_active, tip.to_string()));
+        }
+        if subs_total > 0 {
+            let label = if subs_running > 0 {
+                format!("🤖 {subs_running}/{subs_total}")
+            } else {
+                format!("🤖 {subs_total}")
+            };
+            chips.push((
+                PanelKind::Subagents,
+                label,
+                subs_running > 0,
+                tr(lang, "子代理", "Subagents").to_string(),
+            ));
+        }
+        if !goals_list.is_empty() {
+            chips.push((
+                PanelKind::Goals,
+                format!("🎯 {goals_active}/{}", goals_list.len()),
+                goals_active > 0,
+                tr(lang, "目标", "Goals").to_string(),
+            ));
+        }
+        if jobs_live > 0 {
+            chips.push((
+                PanelKind::Jobs,
+                format!("⏳ {jobs_live}"),
+                true,
+                tr(lang, "运行中任务", "Running jobs").to_string(),
+            ));
+        }
+        if chips.is_empty() {
+            return;
+        }
+        // 行宽两遍测：上一帧实测宽（首帧按标签估宽），右缘对齐 right_edge
+        let est: f32 = chips
+            .iter()
+            .map(|(_, label, _, _)| {
+                ui.ctx().fonts_mut(|f| {
+                    f.layout_no_wrap(
+                        format!("{label} ▸"),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::WHITE,
+                    )
+                    .size()
+                    .x
+                        + 34.0
+                })
+            })
+            .sum::<f32>()
+            + 6.0 * chips.len().max(1) as f32;
+        // 行宽两遍测：首帧用标签估宽，之后**只用实测宽**——历史缺陷：
+        // max(实测, 估宽) 且估宽系统性偏大（每按钮多算 ~34px），锚点被
+        // 整体左推，按钮离右缘 100+px。实测宽下一帧即精确贴住 right_edge
+        //（内容变宽时首帧略溢出一帧，随后自动修正）。
+        let row_w = if self.chips_row_w > 0.0 {
+            self.chips_row_w
+        } else {
+            est
+        };
+        let row_resp = egui::Area::new(egui::Id::new("status_chips"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::pos2(right_edge - row_w, anchor_top))
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                    for (kind, label, working, tip) in &chips {
+                        let expanded = self.panel_expanded == *kind;
+                        let tint = if *working || expanded {
+                            ChipTint::Accent
+                        } else {
+                            ChipTint::Neutral
+                        };
+                        let arrow = if expanded { "▾" } else { "▸" };
+                        let resp = Theme::mini_button(ui, format!("{label} {arrow}"), tint)
+                            .on_hover_text(tip.as_str());
+                        if resp.clicked() {
+                            self.panel_expanded =
+                                if expanded { PanelKind::None } else { *kind };
+                        }
                     }
                 });
+            });
+        self.chips_row_w = row_resp.response.rect.width().max(0.0);
+        // ---- 展开面板（单选；右缘对齐、按钮行下方；宽自适应内容）----
+        let kind = self.panel_expanded;
+        if kind != PanelKind::None {
+            let pw = {
+                let est_w = self.panel_widths[kind as usize];
+                if est_w > 0.0 { est_w } else { 380.0 }
+            };
+            let presp = egui::Area::new(egui::Id::new(("status_panel_exp", kind as u8)))
+                .order(egui::Order::Middle)
+                .fixed_pos(egui::pos2(
+                    right_edge - pw,
+                    row_resp.response.rect.bottom() + 6.0,
+                ))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::default()
+                        .fill(Theme::bg_elevated())
+                        .stroke(egui::Stroke::new(1.0, Theme::border()))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .shadow(egui::Shadow {
+                            blur: 12,
+                            spread: 0,
+                            offset: [0, 4],
+                            color: egui::Color32::from_black_alpha(120),
+                        })
+                        .show(ui, |ui| {
+                            // 悬浮 Area 高度无限：内部 ScrollArea 的
+                            // auto_shrink(false) 会取 available 高度导致
+                            // 面板撑满/空白——必须给定高度上限。
+                            ui.set_max_width(560.0);
+                            ui.set_max_height(460.0);
+                            match kind {
+                                PanelKind::Plan => self.render_plan_items(ui, &plan_items),
+                                PanelKind::Subagents => self.render_subagents_card(ui),
+                                PanelKind::Goals => self.render_goals_card(ui, session),
+                                PanelKind::Jobs => self.render_jobs_card(ui, &session.id),
+                                PanelKind::None => {}
+                            }
+                        });
+                });
+            self.panel_widths[kind as usize] = presp.response.rect.width().max(0.0);
         }
-        ui.add_space(4.0);
+    }
+
+    /// 计划清单条目（状态面板展开时渲染）：只显示待办项
+    /// （已完成的收进头部进度 n/m，不占清单空间）；全部完成时给一行确认。
+    /// 计划清单（状态面板展开时渲染）：显示**全部条目**（含已完成历史——
+    /// 历史缺陷：只显示待办，计划完成后整卡只剩"全部完成"看不到做过什么）。
+    /// 排版对阅读友好：进度头 + 逐条清单（待办 ☐ 高亮 / 已完成 ✓ 灰色删除线 /
+    /// 说明行弱化），标签换行不截断。
+    fn render_plan_items(&mut self, ui: &mut egui::Ui, items: &[(Option<bool>, String)]) {
+        let lang = self.lang;
+        let total = items.iter().filter(|(d, _)| d.is_some()).count();
+        let done = items
+            .iter()
+            .filter(|(d, _)| d == &Some(true))
+            .count();
+        let todo = total - done;
+        // ---- 进度头：n/m + 状态（一眼看总量与剩余）----
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+            ui.label(
+                RichText::new(format!("📋 {done}/{total}"))
+                    .size(12.0)
+                    .strong()
+                    .color(Theme::text()),
+            );
+            if total > 0 && todo == 0 {
+                ui.label(RichText::new(tr(lang, "✓ 全部完成", "✓ all done")).size(11.0).color(Theme::ok()));
+            } else {
+                ui.label(
+                    RichText::new(format!("· {} {}", todo, tr(lang, "项待办", "todo")))
+                        .size(11.0)
+                        .color(Theme::accent_light()),
+                );
+            }
+        });
+        ui.add_space(5.0);
+        // ---- 清单：全部条目按原顺序（时间序）----
+        egui::ScrollArea::vertical()
+            .max_height(280.0)
+            .id_salt("plan_panel_scroll")
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 5.0);
+                for (state, text) in items {
+                    match state {
+                        Some(false) => {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("☐")
+                                        .size(13.0)
+                                        .color(Theme::accent_light()),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(text.clone())
+                                            .size(12.0)
+                                            .color(Theme::text()),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        }
+                        Some(true) => {
+                            // 已完成：保留历史但弱化（灰色 + 删除线）
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("✓").size(12.0).color(Theme::ok()));
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(text.clone())
+                                            .size(11.5)
+                                            .strikethrough()
+                                            .color(Theme::text_faint()),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        }
+                        None => {
+                            // 说明/标题行（非清单项）
+                            ui.label(
+                                RichText::new(text.clone())
+                                    .size(11.0)
+                                    .color(Theme::text_dim()),
+                            );
+                        }
+                    }
+                }
+            });
     }
 
     /// 目标卡片：fold goal/change 事件；操作经 engine.goal_op 持久化
     fn render_goals_card(&mut self, ui: &mut egui::Ui, session: &RenderSession) {
-        let card_h = 170.0;
-        let (card_rect, _) =
-            ui.allocate_exact_size(vec2(ui.available_width(), card_h), egui::Sense::hover());
-        let painter = ui.painter_at(card_rect);
-        painter.rect_filled(card_rect, 10.0, Theme::bg_elevated());
-        painter.rect_stroke(
-            card_rect,
-            10.0,
-            egui::Stroke::new(1.0, Theme::border()),
-            egui::StrokeKind::Inside,
-        );
-        let mut card_ui =
-            ui.new_child(egui::UiBuilder::new().max_rect(card_rect.shrink2(egui::vec2(10.0, 8.0))));
-        card_ui.set_clip_rect(card_rect);
-        card_ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(tr(self.lang, "🎯 目标", "🎯 Goals"))
-                    .color(Theme::accent_light())
-                    .strong(),
-            );
-            let active = self.goals.active_count();
-            ui.label(
-                RichText::new(if self.lang == Lang::En {
-                    format!("({active} active)")
-                } else {
-                    format!("（{active} 进行中）")
-                })
-                .size(11.0)
-                .color(if active > 0 {
-                    Theme::ok()
-                } else {
-                    Theme::text_dim()
-                }),
-            );
-        });
+        // 直接在状态卡内渲染（外层 status_panel 提供卡片边框与自适应宽度），
+        // 列表限高防撑爆——不写死卡片高度。
         // 新建目标输入
         let mut create_obj: Option<String> = None;
         let lang = self.lang;
-        card_ui.horizontal(|ui| {
-            let w = (ui.available_width() - 64.0).max(40.0);
-            let resp = ui.add(
-                TextEdit::singleline(&mut self.goal_input)
-                    .hint_text(
-                        RichText::new(tr(lang, "新目标描述：", "New goal: "))
-                            .color(Theme::text_faint()),
-                    )
-                    .desired_width(w)
-                    .text_color(Theme::text()),
-            );
-            let clicked = ui
-                .add(egui::Button::new(
-                    RichText::new(tr(lang, "创建", "Create")).color(Theme::accent_light()),
-                ))
+        ui.horizontal(|ui| {
+            // 胶囊输入框：与 mini_button 等高（24px）同圆角/配色风格
+            //（历史缺陷：默认 TextEdit 与创建按钮不等高、风格突兀）
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+            let edit = TextEdit::singleline(&mut self.goal_input)
+                .hint_text(
+                    RichText::new(tr(lang, "新目标描述…", "New goal…"))
+                        .size(11.5)
+                        .color(Theme::text_faint()),
+                )
+                .font(egui::FontId::proportional(11.5))
+                .text_color(Theme::text())
+                .frame(
+                    egui::Frame::default()
+                        .fill(Theme::bg_elevated())
+                        .stroke(egui::Stroke::new(1.0, Theme::border()))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(10, 3)),
+                );
+            let resp = ui.add_sized([220.0, 24.0], edit);
+            let clicked = Theme::mini_button(ui, tr(lang, "创建", "Create"), ChipTint::Accent)
                 .clicked()
                 || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if clicked && !self.goal_input.trim().is_empty() {
@@ -1152,49 +1455,64 @@ impl ChatTab {
                 self.goal_input.clear();
             }
         });
-        card_ui.add_space(2.0);
+        ui.add_space(2.0);
         let goals: Vec<crate::engine::goal::Goal> =
             self.goals.list().iter().map(|g| (*g).clone()).collect();
         let mut ops: Vec<(String, crate::engine::goal::GoalOp)> = Vec::new();
         ScrollArea::vertical()
-            .max_height(card_h - 64.0)
+            .max_height(260.0)
             .id_salt("goals_card_scroll")
-            .show(&mut card_ui, |ui| {
+            .show(ui, |ui| {
+                use crate::engine::goal::{GoalOp, GoalPhase};
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
                 for g in &goals {
-                    let color = match g.phase {
-                        crate::engine::goal::GoalPhase::Active => Theme::ok(),
-                        crate::engine::goal::GoalPhase::Paused => Theme::warn(),
-                        crate::engine::goal::GoalPhase::Blocked => Theme::err(),
-                        crate::engine::goal::GoalPhase::Complete => Theme::text_faint(),
+                    let (color, done) = match g.phase {
+                        GoalPhase::Active => (Theme::ok(), false),
+                        GoalPhase::Paused => (Theme::warn(), false),
+                        GoalPhase::Blocked => (Theme::err(), false),
+                        GoalPhase::Complete => (Theme::text_faint(), true),
                     };
+                    // 目标文字独立成块（换行）——历史缺陷：与状态/按钮同一
+                    // horizontal 且不 wrap，长目标把 active/完成/暂停/阻塞
+                    // 挤得重叠错乱。
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("● {}", g.objective)).color(color));
+                        ui.label(RichText::new("●").size(12.0).color(color));
+                        let text = RichText::new(g.objective.clone()).size(12.0).color(color);
+                        let text = if done { text.strikethrough() } else { text };
+                        ui.add(egui::Label::new(text).wrap());
+                    });
+                    // 状态 + 操作按钮独立一行（左状态、右按钮，不再挤压文字）
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(g.phase.as_str())
+                                .size(10.5)
+                                .color(Theme::text_faint()),
+                        );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(Theme::dim(g.phase.as_str()));
-                            use crate::engine::goal::{GoalOp, GoalPhase};
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
                             if g.phase != GoalPhase::Complete
-                                && ui.small_button(tr(lang, "完成", "Complete")).clicked()
+                                && Theme::mini_button(ui, &tr(lang, "完成", "Complete"), ChipTint::Accent).clicked()
                             {
                                 ops.push((g.id.clone(), GoalOp::Complete));
                             }
                             if g.phase == GoalPhase::Active
-                                && ui.small_button(tr(lang, "暂停", "Pause")).clicked()
+                                && Theme::mini_button(ui, &tr(lang, "暂停", "Pause"), ChipTint::Neutral).clicked()
                             {
                                 ops.push((g.id.clone(), GoalOp::Pause));
                             }
                             if g.phase == GoalPhase::Paused
-                                && ui.small_button(tr(lang, "恢复", "Resume")).clicked()
+                                && Theme::mini_button(ui, &tr(lang, "恢复", "Resume"), ChipTint::Accent).clicked()
                             {
                                 ops.push((g.id.clone(), GoalOp::Resume));
                             }
                             if g.phase == GoalPhase::Active
-                                && ui.small_button(tr(lang, "阻塞", "Block")).clicked()
+                                && Theme::mini_button(ui, &tr(lang, "阻塞", "Block"), ChipTint::Danger).clicked()
                             {
                                 ops.push((g.id.clone(), GoalOp::Block));
                             }
                         });
                     });
-                    ui.add_space(2.0);
+                    ui.add_space(4.0);
                 }
                 if goals.is_empty() {
                     ui.label(Theme::dim(&tr(
@@ -1207,7 +1525,7 @@ impl ChatTab {
         // 执行操作（引goal_op goal/change 事件持久+ 通知，pump 回灌 fold
         if let Some(obj) = create_obj {
             let gid = format!("g-{}", crate::util::simple_id());
-            let mut engine = self.engine.lock().unwrap();
+            let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
             let _ = engine.goal_op(
                 &session.id,
                 crate::engine::goal::GoalOp::Create,
@@ -1216,7 +1534,7 @@ impl ChatTab {
             );
         }
         for (gid, op) in ops {
-            let mut engine = self.engine.lock().unwrap();
+            let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
             let _ = engine.goal_op(&session.id, op, &gid, None);
         }
         ui.add_space(4.0);
@@ -1224,39 +1542,16 @@ impl ChatTab {
 
     /// 子代理卡片：fold subagent/descriptor 事件（持久化，重放可恢复）
     fn render_subagents_card(&mut self, ui: &mut egui::Ui) {
-        let card_h = 150.0;
-        let (card_rect, _) =
-            ui.allocate_exact_size(vec2(ui.available_width(), card_h), egui::Sense::hover());
-        let painter = ui.painter_at(card_rect);
-        painter.rect_filled(card_rect, 10.0, Theme::bg_elevated());
-        painter.rect_stroke(
-            card_rect,
-            10.0,
-            egui::Stroke::new(1.0, Theme::border()),
-            egui::StrokeKind::Inside,
-        );
-        let mut card_ui =
-            ui.new_child(egui::UiBuilder::new().max_rect(card_rect.shrink2(egui::vec2(10.0, 8.0))));
-        card_ui.set_clip_rect(card_rect);
-        card_ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(tr(self.lang, "🤖 子代理", "🤖 Subagents"))
-                    .color(Theme::accent_light())
-                    .strong(),
-            );
-            ui.label(Theme::dim(&format!(
-                "（{} {}）",
-                self.subs.len(),
-                tr(self.lang, "个", "active")
-            )));
-        });
-        card_ui.add_space(4.0);
+        // 直接在状态卡内渲染（外层 status_panel 已有卡片边框/自适应宽度），
+        // 列表 ScrollArea 限高防撑爆，展开行内容随行自然增高——不再写死
+        // 卡片高度（历史缺陷：固定 180px + clip，展开详情被裁掉）。
         let mut subs: Vec<_> = self.subs.values().cloned().collect();
         subs.sort_by(|a, b| b.subagent_id.cmp(&a.subagent_id));
+        let lang = self.lang;
         ScrollArea::vertical()
-            .max_height(card_h - 40.0)
-            .id_salt("subs_card_scroll")
-            .show(&mut card_ui, |ui| {
+            .max_height(320.0)
+            .id_salt("subs_panel_scroll")
+            .show(ui, |ui| {
                 for d in &subs {
                     let color = match d.status.as_str() {
                         "done" => Theme::ok(),
@@ -1270,75 +1565,146 @@ impl ChatTab {
                         "failed" => "❌",
                         _ => "🕐",
                     };
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("{icon} {}", d.subagent_id))
+                    // 可展开行：标题（状态 + id + 摘要），展开看完整任务/输出
+                    //（descriptor 携带 task/result，事件持久化重放可恢复）
+                    let has_detail = d.task.as_deref().map_or(false, |t| !t.is_empty())
+                        || d.result.as_deref().map_or(false, |r| !r.is_empty());
+                    if has_detail {
+                        let header = format!(
+                            "{icon} {}  {}",
+                            d.subagent_id,
+                            d.summary
+                                .as_deref()
+                                .map(|s| truncate(s, 60))
+                                .unwrap_or_default()
+                        );
+                        egui::CollapsingHeader::new(
+                            RichText::new(header)
                                 .monospace()
-                                .color(color),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(Theme::dim(&d.status));
-                        });
-                    });
-                    if let Some(sum) = &d.summary {
-                        ui.label(
-                            RichText::new(truncate(sum, 200))
                                 .size(11.0)
-                                .color(Theme::text_dim()),
-                        );
+                                .color(color),
+                        )
+                        .id_salt(egui::Id::new(&d.subagent_id))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            egui::Frame::default()
+                                .fill(Theme::bg())
+                                .corner_radius(egui::CornerRadius::same(6))
+                                .inner_margin(egui::Margin::symmetric(8, 6))
+                                .show(ui, |ui| {
+                                    ui.set_max_width(ui.available_width().max(60.0));
+                                    if let Some(task) =
+                                        d.task.as_deref().filter(|t| !t.is_empty())
+                                    {
+                                        ui.label(
+                                            RichText::new(tr(
+                                                lang,
+                                                "任务：",
+                                                "Task:",
+                                            ))
+                                            .size(10.5)
+                                            .strong()
+                                            .color(Theme::accent_light()),
+                                        );
+                                        ui.label(
+                                            RichText::new(task)
+                                                .size(10.5)
+                                                .color(Theme::text_dim()),
+                                        );
+                                        ui.add_space(3.0);
+                                    }
+                                    if let Some(res) =
+                                        d.result.as_deref().filter(|r| !r.is_empty())
+                                    {
+                                        ui.label(
+                                            RichText::new(tr(
+                                                lang,
+                                                "完整输出：",
+                                                "Full output:",
+                                            ))
+                                            .size(10.5)
+                                            .strong()
+                                            .color(Theme::accent_light()),
+                                        );
+                                        ScrollArea::vertical()
+                                            .id_salt(ui.id().with("sub_res"))
+                                            .max_height(220.0)
+                                            .show(ui, |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(res)
+                                                            .size(10.5)
+                                                            .color(Theme::text_dim()),
+                                                    )
+                                                    .wrap(),
+                                                );
+                                            });
+                                    }
+                                });
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{icon} {}", d.subagent_id))
+                                    .monospace()
+                                    .color(color),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(Theme::dim(&d.status));
+                                },
+                            );
+                        });
+                        if let Some(sum) = &d.summary {
+                            ui.label(
+                                RichText::new(truncate(sum, 200))
+                                    .size(11.0)
+                                    .color(Theme::text_dim()),
+                            );
+                        }
                     }
                     ui.add_space(3.0);
                 }
                 if subs.is_empty() {
                     ui.label(Theme::dim(&tr(
-                        self.lang,
+                        lang,
                         "暂无子代理。AI 调用 subagent_fork 工具后显示在这里。",
                         "No subagents yet. They appear here when the AI calls subagent_fork.",
                     )));
                 }
             });
-        ui.add_space(4.0);
     }
 
     /// 任务卡片：实时读取引JobManager（回/ 子代理自动创建任务）
-    fn render_jobs_card(&mut self, ui: &mut egui::Ui) {
-        let card_h = 160.0;
-        let (card_rect, _) =
-            ui.allocate_exact_size(vec2(ui.available_width(), card_h), egui::Sense::hover());
-        let painter = ui.painter_at(card_rect);
-        painter.rect_filled(card_rect, 10.0, Theme::bg_elevated());
-        painter.rect_stroke(
-            card_rect,
-            10.0,
-            egui::Stroke::new(1.0, Theme::border()),
-            egui::StrokeKind::Inside,
-        );
-        let mut card_ui =
-            ui.new_child(egui::UiBuilder::new().max_rect(card_rect.shrink2(egui::vec2(10.0, 8.0))));
-        card_ui.set_clip_rect(card_rect);
+    /// 底部含 ⏱ 定时任务管理（到期把提示词发到绑定会话发起 AI 回合）。
+    fn render_jobs_card(&mut self, ui: &mut egui::Ui, session_id: &str) {
+        // 直接在状态卡内渲染（外层 status_panel 提供边框与自适应宽度）。
+        // 整卡包一层限高滚动（历史缺陷：固定 240px + clip，定时任务区被裁）。
         let mut remove: Option<String> = None;
         let lang = self.lang;
-        card_ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(tr(lang, "⏳ 任务", "⏳ Jobs"))
-                    .color(Theme::accent_light())
-                    .strong(),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button(tr(lang, "清空已完成", "Clear finished"))
-                    .clicked()
-                {
-                    self.engine.lock().unwrap().job_clear_finished();
-                }
-            });
-        });
-        card_ui.add_space(4.0);
-        let jobs = self.engine.lock().unwrap().jobs_snapshot();
         ScrollArea::vertical()
-            .max_height(card_h - 44.0)
-            .id_salt("jobs_card_scroll")
-            .show(&mut card_ui, |ui| {
+            .max_height(400.0)
+            .id_salt("jobs_panel_scroll")
+            .show(ui, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if Theme::mini_button(
+                        ui,
+                        &tr(lang, "清空已完成", "Clear finished"),
+                        ChipTint::Neutral,
+                    )
+                    .clicked()
+                    {
+                        self.engine
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .job_clear_finished();
+                    }
+                });
+                ui.add_space(4.0);
+                let jobs =
+                    self.engine.lock().unwrap_or_else(|p| p.into_inner()).jobs_snapshot();
+                {
                 for job in &jobs {
                     let color = match job.status {
                         crate::engine::jobs::JobStatus::Running => Theme::cyan(),
@@ -1352,26 +1718,35 @@ impl ChatTab {
                         crate::engine::jobs::JobStatus::Failed => "❌",
                         crate::engine::jobs::JobStatus::Pending => "🕐",
                     };
+                    // ZCode 式紧凑行：icon + 名称（detail 并入行内）+ 状态右对齐
+                    let title = match &job.detail {
+                        Some(d) => format!("{icon} {} · {}", job.name, truncate(d, 40)),
+                        None => format!("{icon} {}", job.name),
+                    };
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{icon} {}", job.name)).color(color));
+                        ui.label(RichText::new(title).size(11.5).color(color));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(Theme::dim(job.status.as_str()));
-                            if ui.small_button(tr(lang, "移除", "Remove")).clicked() {
+                            if Theme::mini_button(
+                                ui,
+                                &tr(lang, "✕", "✕"),
+                                ChipTint::Danger,
+                            )
+                            .on_hover_text(tr(lang, "移除记录", "Remove entry"))
+                            .clicked()
+                            {
                                 remove = Some(job.id.clone());
                             }
+                            ui.label(Theme::dim(job.status.as_str()));
                         });
                     });
-                    if let Some(d) = &job.detail {
-                        ui.label(Theme::dim(d));
-                    }
                     if let Some(r) = &job.result {
                         ui.label(
-                            RichText::new(truncate(r, 140))
-                                .size(11.0)
-                                .color(Theme::text_dim()),
+                            RichText::new(format!("  {}", truncate(r, 100)))
+                                .size(10.5)
+                                .color(Theme::text_faint()),
                         );
                     }
-                    ui.add_space(3.0);
+                    ui.add_space(2.0);
                 }
                 if jobs.is_empty() {
                     ui.label(Theme::dim(&tr(
@@ -1380,11 +1755,126 @@ impl ChatTab {
                         "No jobs. Agent turns and subagents create jobs automatically.",
                     )));
                 }
-            });
-        if let Some(id) = remove {
-            self.engine.lock().unwrap().job_remove(&id);
+                }
+                if let Some(id) = remove {
+                    self.engine.lock().unwrap_or_else(|p| p.into_inner()).job_remove(&id);
+                }
+                ui.add_space(4.0);
+        // ===== ⏱ 定时任务（到期把提示词发到绑定会话，AI 自动执行）=====
+        let mut sched_remove: Option<String> = None;
+        let mut sched_toggle: Option<(String, bool)> = None;
+        ui.separator();
+        ui.label(Theme::card_section_title(&format!(
+            "⏱ {}",
+            tr(lang, "定时任务（当前会话）", "Scheduled (this session)")
+        )));
+        let tasks = self.engine.lock().map(|e| e.schedule_list()).unwrap_or_default();
+        let session_tasks: Vec<_> = tasks
+            .iter()
+            .filter(|t| t.session_id == session_id)
+            .cloned()
+            .collect();
+        if session_tasks.is_empty() {
+            ui.label(Theme::dim(&tr(
+                lang,
+                "无定时任务。例如：每 30 分钟「检查构建并汇报」。",
+                "No scheduled tasks. E.g. every 30m: \"check the build\".",
+            )));
         }
-        ui.add_space(4.0);
+        for t in &session_tasks {
+            ui.horizontal(|ui| {
+                let mins = t.interval_secs / 60;
+                let state = if t.enabled { "●" } else { "○" };
+                ui.label(
+                    RichText::new(format!("{state} {}", t.name))
+                        .size(11.5)
+                        .color(if t.enabled {
+                            Theme::text()
+                        } else {
+                            Theme::text_faint()
+                        }),
+                )
+                .on_hover_text(&t.prompt);
+                ui.label(
+                    RichText::new(if mins >= 1 {
+                        format!("每 {mins} 分")
+                    } else {
+                        format!("每 {} 秒", t.interval_secs)
+                    })
+                    .size(10.5)
+                    .color(Theme::text_faint()),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if Theme::mini_button(ui, "✕", ChipTint::Danger)
+                        .on_hover_text(tr(lang, "删除定时任务", "Delete task"))
+                        .clicked()
+                    {
+                        sched_remove = Some(t.id.clone());
+                    }
+                    let (label, to) = if t.enabled {
+                        (tr(lang, "暂停", "pause"), false)
+                    } else {
+                        (tr(lang, "启用", "enable"), true)
+                    };
+                    if Theme::mini_button(ui, &label, ChipTint::Neutral)
+                        .on_hover_text(tr(lang, "启停定时任务", "Toggle task"))
+                        .clicked()
+                    {
+                        sched_toggle = Some((t.id.clone(), to));
+                    }
+                });
+            });
+        }
+        // 新建表单：名称（即提示词） + 间隔分钟
+        ui.horizontal(|ui| {
+            ui.add(
+                TextEdit::singleline(&mut self.sched_name)
+                    .hint_text(
+                        RichText::new(tr(lang, "任务提示词，如：检查构建并汇报", "Prompt, e.g. check the build"))
+                            .size(10.5)
+                            .color(Theme::text_faint()),
+                    )
+                    .desired_width(170.0)
+                    .font(FontId::proportional(10.5)),
+            );
+            ui.add(
+                TextEdit::singleline(&mut self.sched_interval)
+                    .hint_text(RichText::new(tr(lang, "分钟", "min")).size(10.5).color(Theme::text_faint()))
+                    .desired_width(40.0)
+                    .font(FontId::proportional(10.5)),
+            );
+            if Theme::mini_button(ui, &tr(lang, "添加", "Add"), ChipTint::Accent)
+                .on_hover_text(tr(
+                    lang,
+                    "按间隔把提示词发到当前会话（AI 自动执行；可暂停/删除）",
+                    "Send the prompt to this session on an interval (auto-run; pausable)",
+                ))
+                .clicked()
+            {
+                let name = self.sched_name.trim().to_string();
+                let mins: u64 = self.sched_interval.trim().parse().unwrap_or(0);
+                if name.is_empty() || mins == 0 {
+                    self.status = tr(lang, "请填写提示词与间隔（分钟）", "Need a prompt and interval (min)").into();
+                } else {
+                    if let Ok(mut e) = self.engine.lock() {
+                        e.schedule_add(&name, &name, mins * 60, session_id);
+                    }
+                    self.sched_name.clear();
+                    self.status = tr(lang, "定时任务已添加", "Scheduled task added").into();
+                }
+            }
+        });
+        if let Some(id) = sched_remove {
+            if let Ok(mut e) = self.engine.lock() {
+                e.schedule_remove(&id);
+            }
+        }
+        if let Some((id, on)) = sched_toggle {
+            if let Ok(mut e) = self.engine.lock() {
+                e.schedule_toggle(&id, on);
+            }
+        }
+            });
     }
 
     /// 标题行下方其余区域：模式选择 / 工作区栏 / 弹幕/ 消息+ 输入区
@@ -1402,20 +1892,26 @@ impl ChatTab {
             ws_ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("📁").size(13.0));
                 // 留足按钮/状态宽度，避免差几像素换行2 行（挤占消息区）
-                let w = (ui.available_width() - 190.0).max(40.0);
+                let w = (ui.available_width() - 210.0).max(40.0);
                 let resp = ui.add(
                     TextEdit::singleline(&mut self.ws_input)
                         .hint_text(
                             RichText::new(tr(lang, "打开工作区目录：", "Open workspace dir: "))
+                                .size(11.5)
                                 .color(Theme::text_faint()),
                         )
                         .desired_width(w)
-                        .text_color(Theme::text()),
+                        .font(FontId::proportional(11.5))
+                        .text_color(Theme::text_dim())
+                        .frame(
+                            egui::Frame::default()
+                                .fill(Theme::bg())
+                                .stroke(egui::Stroke::new(1.0, Theme::border()))
+                                .corner_radius(egui::CornerRadius::same(7))
+                                .inner_margin(egui::Margin::symmetric(8, 4)),
+                        ),
                 );
-                let browse = ui
-                    .add(egui::Button::new(
-                        RichText::new(tr(lang, "📂 浏览…", "📂 Browse…")).color(Theme::text_dim()),
-                    ))
+                let browse = Theme::mini_button(ui, &tr(lang, "📂 浏览", "📂 Browse"), ChipTint::Neutral)
                     .on_hover_text(tr(lang, "打开系统目录选择器", "Open system folder picker"));
                 if browse.clicked() {
                     if let Some(dir) = rfd::FileDialog::new()
@@ -1424,7 +1920,7 @@ impl ChatTab {
                     {
                         let path = dir.to_string_lossy().into_owned();
                         self.ws_input = path.clone();
-                        let mut engine = self.engine.lock().unwrap();
+                        let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
                         // 设置当前会话的独立工作区（AI 下一回合立即生效
                         match engine.set_session_workspace(&session.id, std::path::Path::new(&path))
                         {
@@ -1437,10 +1933,7 @@ impl ChatTab {
                         }
                     }
                 }
-                let opened = ui
-                    .add(egui::Button::new(
-                        RichText::new(tr(lang, "打开", "Open")).color(Theme::accent_light()),
-                    ))
+                let opened = Theme::mini_button(ui, &tr(lang, "切换", "Switch"), ChipTint::Accent)
                     .on_hover_text(tr(
                         lang,
                         "规范化目录并作为本会话工作区（AI 回合 / 工具立即生效）",
@@ -1450,7 +1943,7 @@ impl ChatTab {
                     || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                 if opened && !self.ws_input.trim().is_empty() {
                     let path = self.ws_input.trim().to_string();
-                    let mut engine = self.engine.lock().unwrap();
+                    let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
                     match engine.set_session_workspace(&session.id, std::path::Path::new(&path)) {
                         Ok(root) => {
                             log::info!("workspace opened from chat: {root}");
@@ -1474,7 +1967,7 @@ impl ChatTab {
         ui.separator();
         ui.add_space(4.0);
 
-        // ===== 弹幕区（AI 思考过程；窗口矮时动态压缩，避免输入框被挤出面板====
+        // ===== 弹幕区（AI 工具调用信息；窗口矮时动态压缩，避免输入框被挤出面板====
         // 阈值提高：小窗口（<550px 可用高）隐藏弹幕区，把空间让给消息区
         // （消息区是主要阅读区域；弹幕是装饰——历史回归："看不到历史消息"）。
         let avail_before_dm = ui.available_size();
@@ -1487,6 +1980,8 @@ impl ChatTab {
         };
         let avail = ui.available_size();
         let dm_w = avail.x.max(60.0);
+        // dm_height 含 22px 标题条；轨道计算需排除（历史缺陷：60px 档
+        // 第二轨底部超出裁剪矩形，文字半截）
         let (dm_rect, _) = ui.allocate_exact_size(vec2(dm_w, dm_height), egui::Sense::hover());
         // 背景：半透明深色 + 顶部边框
         let painter = ui.painter_at(dm_rect);
@@ -1506,7 +2001,7 @@ impl ChatTab {
         painter2.text(
             egui::pos2(dm_rect.left() + 10.0, dm_rect.top() + 4.0),
             egui::Align2::LEFT_TOP,
-            tr(self.lang, "🎯 AI 思考", "🎯 AI thinking"),
+            tr(self.lang, "🎯 工具调用", "🎯 Tool activity"),
             FontId::proportional(11.0),
             Theme::text_faint(),
         );
@@ -1514,8 +2009,8 @@ impl ChatTab {
         if dm_height > 0.0 && self.danmaku.is_empty() {
             let hint = tr(
                 self.lang,
-                "思考过程将在这里飘过…",
-                "Thinking will float by here…",
+                "AI 调用工具的过程将在这里飘过…",
+                "Tool calls will float by here…",
             );
             painter2.text(
                 egui::pos2(dm_rect.left() + 90.0, dm_rect.top() + 4.0),
@@ -1529,7 +2024,7 @@ impl ChatTab {
         // 推进 + 测量 + 绘制弹幕
         let dt = ui.input(|i| i.stable_dt.min(0.05));
         let font = FontId::monospace(15.0);
-        self.danmaku.set_height(dm_height);
+        self.danmaku.set_height((dm_height - 22.0).max(0.0));
         self.danmaku.measure(ui, &font);
         self.danmaku.advance(dt, dm_rect.width() - 10.0);
         self.danmaku.draw(
@@ -1551,6 +2046,17 @@ impl ChatTab {
             ui.separator();
             ui.add_space(4.0);
         }
+
+        // ===== 状态方块按钮（弹幕下方右缘，悬浮吸附；点击展开清单）=====
+        // 分割线占 ~17px（space4 + line + space4）：锚点放到线下，
+        // 全屏/小窗下按钮都不与分割线重合（历史缺陷：+10 压线）
+        let chips_top = if dm_height > 0.0 {
+            dm_rect.bottom() + 24.0
+        } else {
+            ui.cursor().top() + 2.0
+        };
+        let chips_right = ui.max_rect().right() - 6.0;
+        self.render_status_chips(ui, session, chips_top, chips_right);
 
         // ===== 消息+ 输入区：手动矩形分配 =====
         // 输入框矩形锚定面板底部（任何窗口高度都完整可见），消息区在其上方占剩
@@ -1629,13 +2135,136 @@ impl ChatTab {
                     // 重绘，几百条消息每帧克隆 = 大量堆分配）。历史消息直接借用
                     // 迭代，流式缓冲单独作为一条追加渲染。
                     let has_stream = !stream.is_empty() && session.running;
+                    // 空态引导：无任何消息且不在运行时，展示能力示例
+                    // （点击填入输入框，不直接发送——用户可改可换）。
+                    if session.messages.is_empty() && !has_stream {
+                        let avail = ui.available_size();
+                        let block_h = (avail.y - 24.0).clamp(120.0, 260.0);
+                        let (rect, _) = ui.allocate_exact_size(
+                            vec2(avail.x.max(80.0), block_h),
+                            egui::Sense::hover(),
+                        );
+                        let c = rect.center();
+                        ui.painter().text(
+                            c - egui::vec2(0.0, block_h * 0.28),
+                            egui::Align2::CENTER_CENTER,
+                            tr(self.lang, "描述任务开始，或试试：", "Describe a task, or try:"),
+                            egui::FontId::proportional(12.5),
+                            Theme::text_faint(),
+                        );
+                        let examples: [(&str, String); 3] = [
+                            (
+                                "🔍",
+                                tr(
+                                    self.lang,
+                                    "阅读这个项目的代码，总结架构与风险",
+                                    "Read this project and summarize architecture & risks",
+                                ),
+                            ),
+                            (
+                                "🛠",
+                                tr(
+                                    self.lang,
+                                    "帮我实现一个功能并写测试",
+                                    "Implement a feature for me with tests",
+                                ),
+                            ),
+                            (
+                                "🐞",
+                                tr(
+                                    self.lang,
+                                    "分析这个 bug 的根因并修复",
+                                    "Analyze and fix this bug",
+                                ),
+                            ),
+                        ];
+                        let chip_h = 30.0;
+                        let gap = 8.0;
+                        let widths: Vec<f32> = examples
+                            .iter()
+                            .map(|(icon, t)| {
+                                ui.fonts_mut(|f| {
+                                    f.layout_no_wrap(
+                                        format!("{icon}  {t}"),
+                                        egui::FontId::proportional(11.5),
+                                        Theme::text_dim(),
+                                    )
+                                    .size()
+                                    .x
+                                        + 24.0
+                                })
+                            })
+                            .collect();
+                        let total: f32 =
+                            widths.iter().sum::<f32>() + gap * (examples.len() - 1) as f32;
+                        let mut x = c.x - total / 2.0;
+                        for ((icon, t), w) in examples.iter().zip(&widths) {
+                            let chip = egui::Rect::from_min_size(
+                                egui::pos2(x, c.y + block_h * 0.06),
+                                vec2(*w, chip_h),
+                            );
+                            let resp = ui.interact(
+                                chip,
+                                ui.id().with(("example", t.as_str())),
+                                egui::Sense::click(),
+                            );
+                            let bg = if resp.hovered() {
+                                Theme::bg_hover()
+                            } else {
+                                Theme::bg_elevated()
+                            };
+                            ui.painter().rect(
+                                chip,
+                                15.0,
+                                bg,
+                                egui::Stroke::new(1.0, Theme::border()),
+                                egui::StrokeKind::Inside,
+                            );
+                            let galley = ui.fonts_mut(|f| {
+                                f.layout_no_wrap(
+                                    format!("{icon}  {t}"),
+                                    egui::FontId::proportional(11.5),
+                                    if resp.hovered() {
+                                        Theme::text()
+                                    } else {
+                                        Theme::text_dim()
+                                    },
+                                )
+                            });
+                            ui.painter().galley(
+                                egui::pos2(
+                                    chip.center().x - galley.size().x / 2.0,
+                                    chip.center().y - galley.size().y / 2.0,
+                                ),
+                                galley,
+                                egui::Color32::WHITE,
+                            );
+                            resp.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    format!("{icon} {t}"),
+                                )
+                            });
+                            if resp.clicked() {
+                                self.input = t.clone();
+                            }
+                            x += w + gap;
+                        }
+                    }
                     let mut last_resp: Option<egui::Response> = None;
                     self.last_user_msg_rect = None;
                     for (idx, msg) in session.messages.iter().enumerate() {
+                        // 消息首行顶（含附件时首行是正文气泡，render_message
+                        // 返回的 resp 是最末行——直接用会把气泡定位到视口外）
+                        let msg_top = ui.cursor().top();
                         let resp = self.render_message(ui, msg, idx as u64, false);
                         last_resp = Some(resp.clone());
                         if matches!(msg, Message::User { .. }) {
-                            self.last_user_msg_rect = Some(resp.rect);
+                            self.last_user_msg_rect = Some(egui::Rect::from_min_max(
+                                egui::pos2(resp.rect.left(), msg_top),
+                                resp.rect.right_bottom(),
+                            ));
                         }
                     }
                     // 流式缓冲：只在回合运行中显示（中断/失败 ASSISTANT_MESSAGE
@@ -1645,6 +2274,7 @@ impl ChatTab {
                         let msg = Message::Assistant {
                             content: stream,
                             tool_calls: Vec::new(),
+                            reasoning: None,
                         };
                         let resp = self.render_message(ui, &msg, idx as u64, true);
                         last_resp = Some(resp);
@@ -1653,13 +2283,16 @@ impl ChatTab {
                     // 队列来自引擎审批注册表快照——跨会话的审批也可见
                     // （旧实现只在"恰好当前会话收到事件"时渲染，切走后卡片
                     // 丢失、引擎侧死等 300s 超时）
-                    let pending_approvals: Vec<
+                    let mut pending_approvals: Vec<
                         crate::engine::approval::ApprovalRequest,
                     > = self
                         .engine
                         .lock()
                         .map(|e| e.pending_approvals())
                         .unwrap_or_default();
+                    // 稳定排序（HashMap 无序 → 帧间跳变，读到的与点击
+                    // resolve 的可能不是同一张；按注册序 = id 递增）
+                    pending_approvals.sort_by(|a, b| a.id.cmp(&b.id));
                     if let Some(a) = pending_approvals.first() {
                         ui.add_space(6.0);
                         let card = egui::Frame::default()
@@ -1865,7 +2498,7 @@ impl ChatTab {
                 let qid = self.pending_question.as_ref().map(|q| q.session_id.clone());
                 self.pending_question = None;
                 if let Some(id) = qid {
-                    let mut engine = self.engine.lock().unwrap();
+                    let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
                     match engine.send_message(&id, &ans) {
                         Ok(()) => {
                             info!("question answered: {ans} -> {id}");
@@ -1877,7 +2510,7 @@ impl ChatTab {
             // 处理权限审批动作（用户点了 A/B/C → 回传引擎注册表）
             if let Some((aid, decision)) = approval_action {
                 let engine = self.engine.clone();
-                let resolved = engine.lock().unwrap().resolve_approval(&aid, decision);
+                let resolved = engine.lock().unwrap_or_else(|p| p.into_inner()).resolve_approval(&aid, decision);
                 info!("approval {aid} resolved={resolved} {:?}", decision);
             }
         }
@@ -1898,54 +2531,56 @@ impl ChatTab {
         let inner = input_rect.shrink2(vec2(12.0, if compact { 6.0 } else { 10.0 }));
         let bar_h = if compact { 24.0 } else { 30.0 };
         let chip_h = if compact { 22.0 } else { 26.0 };
-        // 附件条（有附件时占据编辑区顶部一行）
-        let attach_h = if self.attachments.is_empty() {
-            0.0
-        } else {
-            26.0
-        };
+        // 附件条：吸附在输入框上方（悬浮 overlay，不占编辑区——历史缺陷：
+        // 附件行占编辑区顶部 26px，输入框被挤下去、光标位置跳变）
+        if !self.attachments.is_empty() {
+            egui::Area::new(egui::Id::new("attach_strip"))
+                .order(egui::Order::Middle)
+                .fixed_pos(egui::pos2(inner.left(), input_rect.top() - 32.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::default()
+                        .fill(Theme::bg_elevated())
+                        .stroke(egui::Stroke::new(1.0, Theme::border()))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(8, 3))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                            ui.horizontal(|ui| {
+                                let mut remove: Option<usize> = None;
+                                for (i, path) in self.attachments.iter().enumerate() {
+                                    let name = path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_default();
+                                    let short: String = name.chars().take(18).collect();
+                                    let text = egui::RichText::new(format!("📎 {short} ✕"))
+                                        .size(10.5)
+                                        .color(Theme::text_dim());
+                                    if ui
+                                        .add(
+                                            egui::Button::new(text)
+                                                .fill(egui::Color32::TRANSPARENT)
+                                                .stroke(egui::Stroke::NONE)
+                                                .corner_radius(8.0)
+                                                .min_size(egui::vec2(0.0, 18.0)),
+                                        )
+                                        .on_hover_text(path.display().to_string())
+                                        .clicked()
+                                    {
+                                        remove = Some(i);
+                                    }
+                                }
+                                if let Some(i) = remove {
+                                    self.attachments.remove(i);
+                                }
+                            });
+                        });
+                });
+        }
         let edit_rect = egui::Rect::from_min_max(
-            egui::pos2(inner.left(), inner.top() + attach_h),
+            inner.min,
             egui::pos2(inner.right(), inner.bottom() - bar_h - 6.0),
         );
-        if attach_h > 0.0 {
-            let att_rect = egui::Rect::from_min_max(
-                inner.min,
-                egui::pos2(inner.right(), inner.top() + attach_h),
-            );
-            let mut att_ui = ui.new_child(egui::UiBuilder::new().max_rect(att_rect));
-            att_ui.set_clip_rect(att_rect);
-            att_ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
-            att_ui.horizontal(|ui| {
-                let mut remove: Option<usize> = None;
-                for (i, path) in self.attachments.iter().enumerate() {
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let short: String = name.chars().take(18).collect();
-                    let text = egui::RichText::new(format!("\u{1F4CE} {short} \u{2715}"))
-                        .size(10.5)
-                        .color(Theme::text_dim());
-                    if ui
-                        .add(
-                            egui::Button::new(text)
-                                .fill(egui::Color32::TRANSPARENT)
-                                .stroke(egui::Stroke::NONE)
-                                .corner_radius(8.0)
-                                .min_size(egui::vec2(0.0, 20.0)),
-                        )
-                        .on_hover_text(path.display().to_string())
-                        .clicked()
-                    {
-                        remove = Some(i);
-                    }
-                }
-                if let Some(i) = remove {
-                    self.attachments.remove(i);
-                }
-            });
-        }
         let bar_rect = egui::Rect::from_min_max(
             egui::pos2(inner.left(), inner.bottom() - bar_h),
             inner.right_bottom(),
@@ -1990,9 +2625,9 @@ impl ChatTab {
             {
                 let n_att = self.attachments.len();
                 let label = if n_att > 0 {
-                    format!("\u{1F4CE} {n_att}")
+                    format!("+{n_att}")
                 } else {
-                    "\u{1F4CE}".to_string()
+                    "+".to_string()
                 };
                 if chip_button(
                     ui,
@@ -2062,7 +2697,7 @@ impl ChatTab {
             }
             let mut model_cur = None;
             if ui.available_width() > 150.0 {
-                let current = self.engine.lock().unwrap().effective_model(&session.id);
+                let current = self.engine.lock().unwrap_or_else(|p| p.into_inner()).effective_model(&session.id);
                 let short = current
                     .strip_prefix("deepseek-")
                     .unwrap_or(&current)
@@ -2095,7 +2730,7 @@ impl ChatTab {
             // 思考深度
             let mut effort_cur = None;
             if ui.available_width() > 110.0 {
-                let current = self.engine.lock().unwrap().effective_effort(&session.id);
+                let current = self.engine.lock().unwrap_or_else(|p| p.into_inner()).effective_effort(&session.id);
                 let label_of = |e: &str| -> String {
                     match e {
                         "none" => "\u{2726} 关".into(),
@@ -2146,7 +2781,7 @@ impl ChatTab {
                 let name_of = |m: SandboxMode| -> String {
                     match m {
                         SandboxMode::DangerFullAccess => "全访问".into(),
-                        SandboxMode::WorkspaceWrite => "工作区可写".into(),
+                        SandboxMode::WorkspaceWrite => "仅工作区".into(),
                         SandboxMode::ReadOnly => "只读".into(),
                     }
                 };
@@ -2172,7 +2807,7 @@ impl ChatTab {
                     "\u{1F6E1}",
                     &short_of(current),
                     &opt_refs,
-                    "权限/沙箱：bash/pwsh 与写操作的执行边界",
+                    "权限/沙箱：仅工作区=区外读写均拦截（系统基础与 ~/.dsh 除外）",
                     chip_h,
                 ) {
                     if let Some(m) = SandboxMode::parse(&v) {
@@ -2213,7 +2848,7 @@ impl ChatTab {
             }
             if let Some(p) = preset_cur {
                 let id = session.id.clone();
-                let mut engine = self.engine.lock().unwrap();
+                let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
                 match engine.set_session_preset(&id, p) {
                     Ok(()) => {
                         drop(engine);
@@ -2232,11 +2867,15 @@ impl ChatTab {
             // 的子 ui 继承父 max_rect，胶囊会被推到容器右缘之外被裁
             // （实机：发送按钮半截悬在输入框外）。
             let rem = ui.available_size();
+            // 宽度钳制：极窄窗口下 chips 行可能已把 cursor 推过 bar 右缘，
+            // 直接 intersect 会得到负宽（egui placer panic）。收缩到剩余宽度，
+            // 绝不为负；空间为零时只占位不渲染内容（胶囊被裁是可接受的降级）。
+            let bar_rem = (bar_rect.right() - ui.cursor().min.x).max(0.0);
+            let right_w = rem.x.max(70.0).min(bar_rem);
             let right_rect = egui::Rect::from_min_size(
                 ui.cursor().min,
-                egui::vec2(rem.x.max(70.0), bar_rect.height()),
-            )
-            .intersect(bar_rect);
+                egui::vec2(right_w, bar_rect.height()),
+            );
             let (alloc_rect, _) = ui.allocate_exact_size(right_rect.size(), egui::Sense::hover());
             let mut right_ui = ui.new_child(
                 egui::UiBuilder::new()
@@ -2271,7 +2910,7 @@ impl ChatTab {
                         ));
                     if stop.clicked() {
                         let id = session.id.clone();
-                        let mut engine = self.engine.lock().unwrap();
+                        let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
                         engine.cancel(&id);
                         self.status = tr(lang, "已请求停止", "Stop requested").into();
                     }
@@ -2303,24 +2942,98 @@ impl ChatTab {
         });
 
         // ===== 发送 =====
-        if (send_clicked || entered)
+        // 斜杠命令：Enter 时展开为完整提示词；前缀未完整时补全（不发送
+        // "/xxx" 原文）；未知命令提示可用命令。
+        let mut proceed_send = true;
+        if (send_clicked || entered) && self.input.trim().starts_with('/') {
+            match parse_slash(&self.input.trim(), lang) {
+                SlashParse::Expanded(text) => {
+                    self.input = text; // 展开后的正文走下方正常发送
+                }
+                SlashParse::Complete(name) => {
+                    self.input = format!("{name} ");
+                    self.status = tr(
+                        lang,
+                        "已补全命令，输入参数后回车发送",
+                        "Command completed; type args and press Enter",
+                    )
+                    .into();
+                    proceed_send = false;
+                }
+                SlashParse::Unknown(t) => {
+                    self.status = tr(
+                        lang,
+                        &format!("未知命令 {t}（可用：/plan /review /fix /test /continue）"),
+                        &format!("Unknown command {t} (try /plan /review /fix /test /continue)"),
+                    );
+                    proceed_send = false;
+                }
+                SlashParse::NotSlash => {}
+            }
+        }
+        if proceed_send
+            && (send_clicked || entered)
             && (!self.input.trim().is_empty() || !self.attachments.is_empty())
         {
-            // 附件内容注入消息文本（持久化/重放天然包含，零引擎改动）
+            // 附件分流：文本注入消息体；图片走 vision 多模态（路径随消息）。
+            // 非 vision 模型带图发送：提示用户切换（API 会忽略图片）。
             let base = self.input.trim().to_string();
-            let content = compose_message_with_attachments(&base, &self.attachments);
-            if content.is_empty() {
+            let (text_files, images): (Vec<_>, Vec<_>) = self
+                .attachments
+                .iter()
+                .cloned()
+                .partition(|p| !is_image_path(p));
+            let images: Vec<String> = images
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            // 图片预检：超限（>8MB）的剔除并提示——否则发送时被静默跳过，
+            // 且附件条已清空无法重试（历史链路 bug）。
+            let mut images = images;
+            let mut kept = Vec::new();
+            for img in images.drain(..) {
+                let over = std::fs::metadata(&img)
+                    .map(|m| m.len() > 8 * 1024 * 1024)
+                    .unwrap_or(true);
+                if over {
+                    let name = std::path::Path::new(&img)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| img.clone());
+                    self.status = tr(
+                        lang,
+                        &format!("已跳过 {name}（超过 8MB 或不可读）"),
+                        &format!("Skipped {name} (over 8MB or unreadable)"),
+                    );
+                } else {
+                    kept.push(img);
+                }
+            }
+            let images = kept;
+            let content = compose_message_with_attachments(&base, &text_files);
+            if content.is_empty() && images.is_empty() {
                 self.status = tr(lang, "消息为空", "Empty message").into();
             } else {
                 let id = session.id.clone();
-                let mut engine = self.engine.lock().unwrap();
+                let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+                if !images.is_empty() {
+                    let model = engine.effective_model(&id);
+                    if !model.contains("vision") {
+                        self.status = tr(
+                            lang,
+                            "当前模型不支持图片（已随消息保留，切换 vision 模型后生效）",
+                            "Current model can't see images (kept; switch to a vision model)",
+                        )
+                        .into();
+                    }
+                }
                 // 排队模式 + 回合运行中 → 入队不打断（回合结束由 pump 逐条发出）
                 let running = {
                     let shared = engine.shared_sessions();
                     shared.get(id.as_str()).map(|x| x.running).unwrap_or(false)
                 };
                 if running && self.send_mode == SendMode::Queue {
-                    let pos = engine.enqueue_message(&id, &content);
+                    let pos = engine.enqueue_message(&id, &content, images.clone());
                     self.input.clear();
                     self.attachments.clear();
                     self.status = tr(
@@ -2329,7 +3042,7 @@ impl ChatTab {
                         &format!("Queued (#{pos}, runs after current turn)"),
                     );
                 } else {
-                    match engine.send_message(&id, &content) {
+                    match engine.send_message_with_images(&id, &content, images) {
                         Ok(()) => {
                             // 发送成功才清空（失败保留草稿与附件）。不要乐观追加
                             // 用户消息——send_message 已推事件，双写 = 显示两遍。
@@ -2340,6 +3053,85 @@ impl ChatTab {
                         Err(e) => self.error = Some(format!("{e:#}")),
                     }
                 }
+            }
+        }
+
+        // 斜杠命令浮层：输入 / 时在输入框上方列出匹配命令（点击补全；
+        // 展开发生在发送时——见 parse_slash）。
+        if self.input.starts_with('/') && !self.input.contains(' ') {
+            let token = self.input.trim();
+            let all = slash_commands(lang);
+            let matches: Vec<&SlashCmd> =
+                all.iter().filter(|c| c.name.starts_with(token)).collect();
+            if !matches.is_empty() {
+                let ctx = ui.ctx().clone();
+                let row_h = 22.0;
+                let h = matches.len() as f32 * row_h + 8.0;
+                let pos = egui::pos2(input_rect.left() + 4.0, input_rect.top() - h - 6.0);
+                egui::Area::new(ui.id().with("slash_popup"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(pos)
+                    .show(&ctx, |ui| {
+                        egui::Frame::default()
+                            .fill(Theme::bg_elevated())
+                            .stroke(egui::Stroke::new(1.0, Theme::border()))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::symmetric(8, 4))
+                            .show(ui, |ui| {
+                                ui.set_width((input_rect.width() * 0.7).min(440.0).max(260.0));
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                for c in &matches {
+                                    let (rect, resp) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), row_h),
+                                        egui::Sense::click(),
+                                    );
+                                    if resp.hovered() {
+                                        ui.painter()
+                                            .rect_filled(rect, 4.0, Theme::bg_hover());
+                                    }
+                                    let name_galley = ui.fonts_mut(|f| {
+                                        f.layout_no_wrap(
+                                            c.name.to_string(),
+                                            egui::FontId::proportional(11.5),
+                                            Theme::accent_light(),
+                                        )
+                                    });
+                                    let desc_galley = ui.fonts_mut(|f| {
+                                        f.layout_no_wrap(
+                                            c.desc.clone(),
+                                            egui::FontId::proportional(10.5),
+                                            Theme::text_faint(),
+                                        )
+                                    });
+                                    ui.painter().galley(
+                                        egui::pos2(
+                                            rect.left() + 6.0,
+                                            rect.center().y - name_galley.size().y / 2.0,
+                                        ),
+                                        name_galley,
+                                        Color32::WHITE,
+                                    );
+                                    ui.painter().galley(
+                                        egui::pos2(
+                                            rect.left() + 78.0,
+                                            rect.center().y - desc_galley.size().y / 2.0,
+                                        ),
+                                        desc_galley,
+                                        Color32::WHITE,
+                                    );
+                                    resp.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::Button,
+                                            true,
+                                            format!("{} {}", c.name, c.desc),
+                                        )
+                                    });
+                                    if resp.clicked() {
+                                        self.input = format!("{} ", c.name);
+                                    }
+                                }
+                            });
+                    });
             }
         }
 
@@ -2366,7 +3158,7 @@ impl ChatTab {
     ) -> egui::Response {
         ui.add_space(6.0);
         let resp = match msg {
-            Message::User { content } => {
+            Message::User { content, images } => {
                 // 右对齐：气泡贴右缘。宽度基准 = **clip_rect 宽（视口宽）**——
                 // 不能用 available_width()/max_rect().width()：ScrollArea 内容若被
                 // 超宽元素（长代码行/大 JSON）撑宽，两者都会变成 3000+，
@@ -2376,6 +3168,11 @@ impl ChatTab {
                 let avail_w = ui.clip_rect().width().max(60.0);
                 // 长消息限宽 65% 换行（气泡内 label wrap 到该宽度）
                 let max_bubble = ((avail_w - 32.0) * 0.65).max(80.0).min(avail_w - 32.0);
+                // 附件折叠显示：附件块（--- + 【附件】头 + 全文围栏）
+                // 在气泡里只显示附件名芯片行——全文仍随消息发给 AI
+                // （compose 时注入），但气泡不再滚屏展示整个文件
+                // （历史缺陷：上传 24KB 脚本，聊天窗被全文刷屏）。
+                let (display, attach_names) = collapse_attachment_blocks(content);
                 // 真实文本宽度：layout_no_wrap 对多行返回最长行宽。
                 // 缓存按内容（弹幕动画期间整窗高频重绘，避免每帧重新排版）。
                 let text_w = self
@@ -2385,7 +3182,7 @@ impl ChatTab {
                     .unwrap_or_else(|| {
                         let w = ui.fonts_mut(|f| {
                             f.layout_no_wrap(
-                                content.to_string(),
+                                display.clone(),
                                 FontId::proportional(12.0),
                                 Color32::WHITE,
                             )
@@ -2399,26 +3196,140 @@ impl ChatTab {
                         w
                     });
                 let bubble_w = text_w.min(max_bubble).max(30.0);
-                // horizontal + add_space：left_space 基于固定视口宽，
-                // 不会撑宽父布局（left_space + 气泡宽 ≤ avail_w）
-                ui.horizontal(|ui| {
-                    let left_space = (avail_w - bubble_w - 24.0 - 8.0).max(4.0);
-                    ui.add_space(left_space);
-                    let frame = egui::Frame::default()
-                        .fill(Theme::user_bubble())
-                        .corner_radius(egui::CornerRadius::same(10))
-                        .inner_margin(egui::Margin::symmetric(12, 8));
-                    frame.show(ui, |ui| {
-                        ui.set_max_width(bubble_w);
-                        ui.label(RichText::new(content).size(12.0).color(bubble_text_color()));
+                // 正文气泡：附件芯片不再挤在气泡内——气泡宽度与文件名长度
+                // 彻底解耦（历史缺陷：芯片被气泡宽度裁切，".sh" 等文件名
+                // 尾段看不到）。纯附件（无正文）不渲染空气泡。
+                // 消息响应 inner：纯附件（无正文、无芯片）时为 0 尺寸占位
+                let mut inner = ui.allocate_response(egui::vec2(0.0, 0.0), egui::Sense::hover());
+                if !display.trim().is_empty() {
+                    // horizontal + add_space：left_space 基于固定视口宽，
+                    // 不会撑宽父布局（left_space + 气泡宽 ≤ avail_w）
+                    inner = ui.horizontal(|ui| {
+                        let left_space = (avail_w - bubble_w - 24.0 - 8.0).max(4.0);
+                        ui.add_space(left_space);
+                        let frame = egui::Frame::default()
+                            .fill(Theme::user_bubble())
+                            .corner_radius(egui::CornerRadius::same(10))
+                            .inner_margin(egui::Margin::symmetric(12, 8));
+                        frame.show(ui, |ui| {
+                            ui.set_max_width(bubble_w);
+                            ui.label(
+                                RichText::new(display).size(12.0).color(bubble_text_color()),
+                            );
+                        });
+                    })
+                    .response;
+                }
+                // 附件芯片：独立于气泡的"第二条消息"——一条附件一行，
+                // 右对齐且与气泡右缘对齐；宽度不受气泡约束，整名可见，
+                // 完整路径悬浮查看
+                let chip_fill = if Theme::is_light() {
+                    egui::Color32::from_black_alpha(14)
+                } else {
+                    egui::Color32::from_white_alpha(16)
+                };
+                let chip_stroke =
+                    egui::Stroke::new(1.0, Theme::accent_light().gamma_multiply(0.35));
+                let chip_font = egui::FontId::proportional(10.5);
+                for (name, path) in &attach_names {
+                    let mut short: String = name.chars().take(40).collect();
+                    if name.chars().count() > 40 {
+                        short.push('\u{2026}');
+                    }
+                    let mut label = format!("📎 {short}");
+                    let mut galley = ui.painter().layout_no_wrap(
+                        label.clone(),
+                        chip_font.clone(),
+                        Theme::accent_light(),
+                    );
+                    // 极窄窗口兜底：芯片右对齐后若超出视口右缘，动态收短
+                    // （完整文件名悬浮可见），8 字符为下限
+                    while galley.size().x + 12.0 > avail_w - 8.0
+                        && short.chars().count() > 8
+                    {
+                        let n = short.chars().count();
+                        short = short.chars().take(n - 1).collect();
+                        label = format!("📎 {short}\u{2026}");
+                        galley = ui.painter().layout_no_wrap(
+                            label.clone(),
+                            chip_font.clone(),
+                            Theme::accent_light(),
+                        );
+                    }
+                    let chip_w = galley.size().x + 12.0;
+                    inner = ui.horizontal(|ui| {
+                        // 芯片行没有气泡那 24px 内边距——右缘对齐气泡右缘（avail_w-8）
+                        let left_space = (avail_w - chip_w - 8.0).max(4.0);
+                        ui.add_space(left_space);
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(chip_w, 18.0),
+                            egui::Sense::hover(),
+                        );
+                        let resp = resp.on_hover_text(path);
+                        resp.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Label,
+                                true,
+                                label.clone(),
+                            )
+                        });
+                        ui.painter().rect_filled(rect, 9.0, chip_fill);
+                        ui.painter()
+                            .rect_stroke(rect, 9.0, chip_stroke, egui::StrokeKind::Middle);
+                        let pos = egui::pos2(
+                            rect.center().x - galley.size().x / 2.0,
+                            rect.center().y - galley.size().y / 2.0,
+                        );
+                        ui.painter().galley(pos, galley, Theme::accent_light());
+                    })
+                    .response;
+                }
+                // 附带图片：气泡下方右对齐缩略图行（点击放大复用查看器；
+                // 复用 markdown 图片基建：本地路径 + http 均可）
+                let resp = if let Some(imgs) = images.as_ref().filter(|v| !v.is_empty()) {
+                    // 图片缓存上限（历史泄漏：无界增长）
+                    if self.img_cache.len() > 256 {
+                        self.img_cache.clear();
+                    }
+                    let img_cache = &mut self.img_cache;
+                    let viewer = &mut self.viewer;
+                    let http_imgs = &mut self.http_imgs;
+                    let base_dir = self.current_session.as_ref().and_then(|s| s.cwd.clone());
+                    ui.horizontal(|ui| {
+                        // 右缘与气泡/附件芯片对齐（avail_w - 8）
+                        let row_w =
+                            (imgs.len() as f32 * 150.0).min(avail_w - 12.0);
+                        let left_space = (avail_w - row_w - 8.0).max(4.0);
+                        ui.add_space(left_space);
+                        for (i, src) in imgs.iter().enumerate() {
+                            crate::ui::markdown::render_image(
+                                ui,
+                                src,
+                                "",
+                                base_dir.as_deref(),
+                                img_cache,
+                                viewer,
+                                http_imgs,
+                                salt,
+                                i,
+                                140.0,
+                            );
+                        }
                     });
-                })
-                .response
+                    inner
+                } else {
+                    inner
+                };
+                resp
             }
-            Message::Assistant { content, .. } => {
+            Message::Assistant {
+                content,
+                reasoning,
+                ..
+            } => {
                 // 纯工具调用消息（content 为空）：不渲染空气泡（历史视觉缺陷：
-                // 空白框 + 头像孤零零占一行）
-                if content.trim().is_empty() {
+                // 空白框 + 头像孤零零占一行）。但思考过程仍可回看（时间线）。
+                if content.trim().is_empty() && reasoning.as_deref().map_or(true, |r| r.trim().is_empty()) {
                     return ui.allocate_response(egui::vec2(0.0, 0.0), egui::Sense::hover());
                 }
                 let avail_w = ui.available_width();
@@ -2430,6 +3341,10 @@ impl ChatTab {
                     .corner_radius(egui::CornerRadius::same(10))
                     .inner_margin(egui::Margin::symmetric(12, 8));
                 // 图片渲染状态（&mut self 字段在闭包外取出，避免借用冲突
+                // 缓存上限（历史泄漏：无界增长 + 跨会话只增不减）
+                if self.img_cache.len() > 256 {
+                    self.img_cache.clear();
+                }
                 let img_cache = &mut self.img_cache;
                 let viewer = &mut self.viewer;
                 let http_imgs = &mut self.http_imgs;
@@ -2477,23 +3392,206 @@ impl ChatTab {
                                 max_bubble,
                             );
                         }
+                        // 思考时间线：弹幕划过后仍可回看（折叠，默认收起；
+                        // id 按内容哈希——egui 记住开合状态，不占 self 字段）
+                        if let Some(rs) =
+                            reasoning.as_ref().filter(|r| !r.trim().is_empty())
+                        {
+                            ui.add_space(3.0);
+                            let lang = self.lang;
+                            egui::CollapsingHeader::new(
+                                RichText::new(format!(
+                                    "💭 {}（{} 字）",
+                                    tr(lang, "思考过程", "Thinking"),
+                                    rs.chars().count()
+                                ))
+                                .size(10.5)
+                                .color(Theme::text_faint()),
+                            )
+                            .id_salt(egui::Id::new(rs))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                egui::Frame::default()
+                                    .fill(Theme::bg())
+                                    .corner_radius(egui::CornerRadius::same(6))
+                                    .inner_margin(egui::Margin::symmetric(8, 6))
+                                    .show(ui, |ui| {
+                                        ui.set_max_width(max_bubble.max(60.0));
+                                        ui.label(
+                                            RichText::new(rs)
+                                                .size(10.5)
+                                                .color(Theme::text_dim()),
+                                        );
+                                    });
+                            });
+                        }
+                        // 消息反馈（👍/👎）：极弱图标常驻，点击高亮；记录到
+                        // feedback registry + feedback/record 事件（JSONL 持久化）
+                        if !streaming && !content.trim().is_empty() {
+                            ui.add_space(3.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+                                let mid = feedback_message_id(content);
+                                let current = self
+                                    .engine
+                                    .lock()
+                                    .ok()
+                                    .and_then(|e| e.message_feedback(&mid));
+                                let lang = self.lang;
+                                // 复制整条消息（最高频需求之一）：30x20 命中区
+                                //（历史缺陷 26x16 太小难点中）+ 复制后按钮旁
+                                // 内联"已复制 ✓"（只写右下角状态太不显眼，
+                                // 用户以为没生效）
+                                {
+                                    let content_owned = content.clone();
+                                    let resp = ui.add_sized(
+                                        [30.0, 20.0],
+                                        egui::Label::new(
+                                            RichText::new("⧉")
+                                                .size(11.5)
+                                                .color(Theme::text_faint()),
+                                        ),
+                                    )
+                                    .interact(egui::Sense::click());
+                                    let resp = resp.on_hover_text(tr(
+                                        lang,
+                                        "复制这条消息",
+                                        "Copy this message",
+                                    ));
+                                    if resp.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    if resp.clicked() {
+                                        ui.ctx().copy_text(content_owned);
+                                        self.status = tr(lang, "已复制", "Copied").into();
+                                        self.copy_flash =
+                                            Some((mid.clone(), std::time::Instant::now()));
+                                    }
+                                }
+                                for (label, kind) in [
+                                    ("👍", crate::engine::FeedbackKind::Upvote),
+                                    ("👎", crate::engine::FeedbackKind::Downvote),
+                                ] {
+                                    let active = current == Some(kind);
+                                    let color = if active {
+                                        match kind {
+                                            crate::engine::FeedbackKind::Upvote => Theme::ok(),
+                                            crate::engine::FeedbackKind::Downvote => Theme::err(),
+                                        }
+                                    } else {
+                                        Theme::text_faint()
+                                    };
+                                    let resp = ui.add_sized(
+                                        [22.0, 16.0],
+                                        egui::Label::new(
+                                            RichText::new(label).size(10.5).color(color),
+                                        ),
+                                    );
+                                    let resp = resp.interact(egui::Sense::click());
+                                    if resp.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    if resp.clicked() && !active {
+                                        if let Some(sid) = self.current.clone() {
+                                            if let Ok(mut e) = self.engine.lock() {
+                                                let _ = e
+                                                    .record_message_feedback(&sid, &mid, kind);
+                                            }
+                                            self.status = tr(
+                                                lang,
+                                                "感谢反馈",
+                                                "Thanks for the feedback",
+                                            )
+                                            .into();
+                                        }
+                                    }
+                                }
+                                // 复制成功的内联反馈：1.5s 内在按钮旁显示
+                                // "已复制 ✓"（绿色），明确告知已生效
+                                if let Some((fid, t)) = &self.copy_flash {
+                                    if fid == &mid && t.elapsed().as_secs_f32() < 1.5 {
+                                        ui.label(
+                                            RichText::new(tr(lang, "已复制 ✓", "Copied ✓"))
+                                                .size(10.5)
+                                                .color(Theme::ok()),
+                                        );
+                                    }
+                                }
+                            });
+                        }
                     })
                     .response
             }
             Message::Tool { content, .. } => {
                 // 直接 frame.show（左对齐）：不用 with_layout(left_to_right)——
                 // 它会推进父布局 x cursor，污染后续消息的对齐。
+                // 文件改动工具（write_file / str_replace_editor）：结果携带
+                // diff → 渲染 diff 卡片（-红/+绿），用户可审阅 AI 改了什么。
+                if let Some(card) = parse_diff_card(content) {
+                    let mut req = self.open_file_req.take();
+                    let resp = render_diff_card(ui, &card, &mut req);
+                    self.open_file_req = req;
+                    return resp;
+                }
                 // 摘要提取 stdout/content 等主字段（复用弹幕摘要逻辑），
                 // 不展示原始 JSON 转义串；全量内容悬浮可看。
+                // 结果带 path（read_file/list_dir/str_replace view…）→
+                // 标题为可点击路径，点击在代码浏览器打开（ZCode 式跳转）。
+                let path_hint: Option<String> =
+                    serde_json::from_str::<serde_json::Value>(content)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("path")
+                                .and_then(|p| p.as_str())
+                                .map(String::from)
+                        });
                 let (brief, full) = summarize_tool_result(true, content);
                 let frame = egui::Frame::default()
                     .fill(Theme::bg_hover())
                     .stroke(egui::Stroke::new(1.0, Theme::border()))
                     .corner_radius(egui::CornerRadius::same(8))
                     .inner_margin(egui::Margin::symmetric(10, 6));
+                let lang = self.lang;
+                let mut path_clicked: Option<String> = None;
                 let resp = frame
                     .show(ui, |ui| {
                         ui.set_max_width((ui.available_width() * 0.92).max(80.0));
+                        if let Some(path) = &path_hint {
+                            let galley = ui.fonts_mut(|f| {
+                                f.layout_no_wrap(
+                                    format!("📄 {path}"),
+                                    egui::FontId::proportional(11.0),
+                                    Theme::accent_light(),
+                                )
+                            });
+                            let (rect, t_resp) = ui.allocate_exact_size(
+                                egui::vec2(galley.size().x + 8.0, 17.0),
+                                egui::Sense::click(),
+                            );
+                            if t_resp.hovered() {
+                                ui.painter()
+                                    .rect_filled(rect, 4.0, Theme::bg_hover());
+                                ui.ctx()
+                                    .set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            ui.painter().galley(
+                                egui::pos2(
+                                    rect.left() + 4.0,
+                                    rect.center().y - galley.size().y / 2.0,
+                                ),
+                                galley,
+                                Color32::WHITE,
+                            );
+                            let _ = t_resp.clone().on_hover_text(tr(
+                                lang,
+                                "点击在代码浏览器打开此文件",
+                                "Click to open this file in the code browser",
+                            ));
+                            if t_resp.clicked() {
+                                path_clicked = Some(path.clone());
+                            }
+                            ui.add_space(2.0);
+                        }
                         ui.label(
                             RichText::new(truncate(&brief, 160))
                                 .color(Theme::text_dim())
@@ -2501,11 +3599,249 @@ impl ChatTab {
                         )
                     })
                     .response;
+                if let Some(path) = path_clicked {
+                    self.open_file_req = Some(std::path::PathBuf::from(path));
+                }
                 resp.on_hover_text(full)
             }
         };
         resp
     }
+}
+
+/// 内置斜杠命令（高频任务的提示词模板）。`{args}` 为用户参数占位。
+struct SlashCmd {
+    name: &'static str,
+    /// 参数缺省文案（None = 参数必填）
+    default_args: Option<&'static str>,
+    desc: String,
+    template: String,
+}
+
+fn slash_commands(lang: Lang) -> Vec<SlashCmd> {
+    vec![
+        SlashCmd {
+            name: "/plan",
+            default_args: None,
+            desc: tr(lang, "先制定分步计划再执行", "Plan first, then execute"),
+            template: tr(lang,
+                "请先为以下任务制定分步计划（用 plan_write 写入计划卡片，每完成一步就更新勾选状态），然后逐步执行并汇报进度：
+{args}",
+                "First write a step-by-step plan for the following task (use plan_write; tick off steps as you complete them), then execute it step by step and report progress:
+{args}"),
+        },
+        SlashCmd {
+            name: "/review",
+            default_args: Some("当前项目"),
+            desc: tr(lang, "代码审查（正确性/安全/可维护性）", "Code review"),
+            template: tr(lang,
+                "请审查 {args} 的代码：先读 AGENTS.md（若有）了解项目约定，重点检查正确性、安全问题与可维护性；输出按严重度排序的问题清单与具体修复建议。不要直接修改文件。",
+                "Review the code of {args}: read AGENTS.md first if present; focus on correctness, security and maintainability; output a severity-ordered issue list with concrete fix suggestions. Do not modify files directly."),
+        },
+        SlashCmd {
+            name: "/fix",
+            default_args: None,
+            desc: tr(lang, "定位根因并修复", "Locate root cause and fix"),
+            template: tr(lang,
+                "请分析并修复这个问题：{args}
+先读相关代码定位根因并简述；然后用最小改动修复（str_replace_editor / write_file），最后运行相关测试验证。",
+                "Analyze and fix this issue: {args}
+Read the relevant code first, explain the root cause briefly; then fix it with a minimal change (str_replace_editor / write_file); finally run the relevant tests to verify."),
+        },
+        SlashCmd {
+            name: "/test",
+            default_args: Some("本次改动"),
+            desc: tr(lang, "补齐/运行测试", "Add or run tests"),
+            template: tr(lang,
+                "请为 {args} 补充或运行测试：先了解现有测试结构，补齐关键路径用例，然后运行验证并汇报结果。",
+                "Add or run tests for {args}: study the existing test layout, cover the key paths, then run them and report."),
+        },
+        SlashCmd {
+            name: "/continue",
+            default_args: Some(""),
+            desc: tr(lang, "从上次中断处继续", "Continue from where it stopped"),
+            template: tr(lang,
+                "继续当前任务，从上次中断处推进，直到完成或需要我决策。",
+                "Continue the current task from where it stopped, until done or a decision from me is needed."),
+        },
+    ]
+}
+
+/// 斜杠输入的解析结果。
+enum SlashParse {
+    NotSlash,
+    /// 展开为完整提示词（可直接发送）
+    Expanded(String),
+    /// 前缀匹配未完整：补全到该命令（等用户补参数）
+    Complete(String),
+    /// 无匹配
+    Unknown(String),
+}
+
+fn parse_slash(input: &str, lang: Lang) -> SlashParse {
+    if !input.starts_with('/') {
+        return SlashParse::NotSlash;
+    }
+    let token = input.split_whitespace().next().unwrap_or("/");
+    let rest = input[token.len()..].trim().to_string();
+    let cmds = slash_commands(lang);
+    if let Some(c) = cmds.iter().find(|c| c.name == token) {
+        let args = if rest.is_empty() {
+            match c.default_args {
+                Some(d) => d.to_string(),
+                // 必填参数缺失：展开为用法提示（模型会友好回应）
+                None => format!("（未提供任务描述。用法：{} <任务描述>）", c.name),
+            }
+        } else {
+            rest
+        };
+        return SlashParse::Expanded(c.template.replace("{args}", &args));
+    }
+    let matches: Vec<&SlashCmd> = cmds.iter().filter(|c| c.name.starts_with(token)).collect();
+    if let Some(first) = matches.first() {
+        return SlashParse::Complete(first.name.to_string());
+    }
+    SlashParse::Unknown(token.to_string())
+}
+
+/// 反馈用消息标识：内容哈希（跨重启稳定；同内容去重可接受）。
+fn feedback_message_id(content: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut h);
+    format!("m{:016x}", h.finish())
+}
+
+/// diff 卡片数据（从工具结果 JSON 提取）。
+struct DiffCard {
+    path: String,
+    /// `-old/+new` 行流（None = 超规模降级，用 note 摘要）
+    diff: Option<String>,
+    note: Option<String>,
+    created: bool,
+}
+
+/// 工具结果是否为"文件改动"：带 diff / diff_note / created 字段。
+fn parse_diff_card(content: &str) -> Option<DiffCard> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    let path = v.get("path").and_then(|p| p.as_str())?.to_string();
+    let diff = v
+        .get("diff")
+        .and_then(|d| d.as_str())
+        .filter(|d| !d.is_empty())
+        .map(String::from);
+    let note = v
+        .get("diff_note")
+        .and_then(|d| d.as_str())
+        .map(String::from);
+    let created = v.get("created").and_then(|c| c.as_bool()).unwrap_or(false);
+    if diff.is_none() && note.is_none() && !created {
+        return None;
+    }
+    Some(DiffCard {
+        path,
+        diff,
+        note,
+        created,
+    })
+}
+
+/// diff 卡片：✎ path (+a −b) 标题 + 红/绿等宽行（滚动限高，悬停看全文）。
+fn render_diff_card(
+    ui: &mut egui::Ui,
+    card: &DiffCard,
+    open_req: &mut Option<std::path::PathBuf>,
+) -> egui::Response {
+    let mut title_clicked = false;
+    let frame = egui::Frame::default()
+        .fill(Theme::bg_elevated())
+        .stroke(egui::Stroke::new(1.0, Theme::border()))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(10, 6));
+    let resp = frame
+        .show(ui, |ui| {
+            ui.set_max_width((ui.available_width() * 0.92).max(80.0));
+            // 标题：✎ path (+a −b) / 新建 —— 可点击：在内置代码浏览器
+            // 打开该文件（AI 改完即可点路径直达源码）
+            let title = if let Some(diff) = &card.diff {
+                let (del, add) = crate::core::diff::counts(diff);
+                format!("✎ {}  (+{add} −{del})", card.path)
+            } else if card.created {
+                format!("✎ {}  (新建)", card.path)
+            } else {
+                format!("✎ {}", card.path)
+            };
+            let galley = ui.fonts_mut(|f| {
+                f.layout_no_wrap(
+                    title.clone(),
+                    egui::FontId::proportional(11.0),
+                    Theme::accent_light(),
+                )
+            });
+            let (t_rect, t_resp) = ui.allocate_exact_size(
+                egui::vec2(galley.size().x + 8.0, 18.0),
+                egui::Sense::click(),
+            );
+            if t_resp.hovered() {
+                ui.painter()
+                    .rect_filled(t_rect, 4.0, Theme::bg_hover());
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            ui.painter().galley(
+                egui::pos2(
+                    t_rect.left() + 4.0,
+                    t_rect.center().y - galley.size().y / 2.0,
+                ),
+                galley,
+                Color32::WHITE,
+            );
+            let _ = t_resp.clone().on_hover_text(tr(
+                crate::ui::i18n::Lang::Zh,
+                "点击在代码浏览器打开此文件",
+                "Click to open this file in the code browser",
+            ));
+            t_resp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, title.clone())
+            });
+            if t_resp.clicked() {
+                title_clicked = true;
+            }
+            if let Some(note) = &card.note {
+                ui.label(RichText::new(note).size(10.5).color(Theme::text_faint()));
+            }
+            if let Some(diff) = &card.diff {
+                ui.add_space(2.0);
+                egui::ScrollArea::vertical()
+                    .id_salt(ui.id().with(("diff", &card.path)))
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for line in diff.lines() {
+                            let (color, text) = match line.chars().next() {
+                                Some('-') => (Theme::err(), line),
+                                Some('+') => (Theme::ok(), line),
+                                _ => (Theme::text_faint(), line),
+                            };
+                            ui.label(
+                                RichText::new(text)
+                                    .monospace()
+                                    .size(10.5)
+                                    .color(color),
+                            );
+                        }
+                    });
+            }
+        })
+        .response
+        .on_hover_text(tr(
+            crate::ui::i18n::Lang::Zh,
+            "AI 的文件改动（红=删除，绿=新增）；点击标题在代码浏览器打开",
+            "AI file edit (red=removed, green=added); click the title to open in the code browser",
+        ));
+    if title_clicked {
+        *open_req = Some(std::path::PathBuf::from(&card.path));
+    }
+    resp
 }
 
 /// 附件内容注入上限（单文件）：超出部分截断并说明。
@@ -2613,6 +3949,58 @@ fn attach_is_text(path: &std::path::Path) -> bool {
 /// 组装用户消息：正文 + 附件内容注入。
 /// 文本类：全文注入（超 ATTACH_MAX_BYTES 截断）；二进制/读取失败：占位说明
 /// （路径可见，AI 可用工具自行处理）。空正文 + 有附件 = 纯附件消息。
+/// 图片附件判定（与 llm::image_mime 的扩展名集保持一致）。
+fn is_image_path(p: &std::path::Path) -> bool {
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
+}
+
+/// 折叠用户消息里的附件块：把 compose_message_with_attachments 生成的
+/// "---\\n【附件 i/n：name】（path）\\n<内容>" 块替换为空（正文保留），
+/// 返回 (显示文本, [(文件名, 完整路径)])。悬浮芯片显示完整路径。
+pub fn collapse_attachment_blocks(content: &str) -> (String, Vec<(String, String)>) {
+    let mut names = Vec::new();
+    if !content.contains("【附件") {
+        return (content.to_string(), names);
+    }
+    let mut out = String::new();
+    let mut rest = content;
+    while let Some(pos) = rest.find("---\n【附件") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        // 块尾 = 下一个 "---\\n【附件" 或字符串末尾
+        let next = after[4..]
+            .find("---\n【附件")
+            .map(|o| o + 4)
+            .unwrap_or(after.len());
+        let block = &after[..next];
+        // 解析 "【附件 i/n：name】（path）" 行
+        for line in block.lines() {
+            if line.starts_with("【附件") {
+                let name = line
+                    .find("：")
+                    .and_then(|o| line[o + 3..].find("】").map(|e| line[o + 3..o + 3 + e].to_string()))
+                    .unwrap_or_default();
+                let path = line
+                    .find("（")
+                    .and_then(|o| line.find("）").map(|e| line[o + "（".len()..e].to_string()))
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    names.push((name, path));
+                }
+                break;
+            }
+        }
+        rest = &after[next..];
+    }
+    out.push_str(rest);
+    (out.trim().to_string(), names)
+}
+
 pub fn compose_message_with_attachments(base: &str, attachments: &[std::path::PathBuf]) -> String {
     if attachments.is_empty() {
         return base.to_string();
@@ -2825,7 +4213,7 @@ pub enum SendMode {
 
 /// 标题行卡片种类（单选：同一时间只开一张）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CardKind {
+pub enum PanelKind {
     None,
     Plan,
     Goals,
@@ -2839,8 +4227,18 @@ fn project(messages: &mut Vec<Message>, ev: &crate::core::SessionEvent) {
         if let Some(data) = &ev.data {
             if let Some(content) = data.get("content").and_then(|v| v.as_str()) {
                 let msg = if ev.r#type == types::USER_MESSAGE {
+                    let images = data
+                        .get("images")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect::<Vec<String>>()
+                        })
+                        .filter(|v| !v.is_empty());
                     Message::User {
                         content: content.to_string(),
+                        images,
                     }
                 } else {
                     let tool_calls = data
@@ -2849,9 +4247,15 @@ fn project(messages: &mut Vec<Message>, ev: &crate::core::SessionEvent) {
                             serde_json::from_value::<Vec<crate::core::ToolCall>>(v.clone()).ok()
                         })
                         .unwrap_or_default();
+                    let reasoning = data
+                        .get("reasoning_content")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .filter(|r| !r.is_empty());
                     Message::Assistant {
                         content: content.to_string(),
                         tool_calls,
+                        reasoning,
                     }
                 };
                 messages.push(msg);
@@ -2860,27 +4264,6 @@ fn project(messages: &mut Vec<Message>, ev: &crate::core::SessionEvent) {
     }
 }
 
-/// 把长思考文本切成弹幕句段（每段 <= 24 字符，按标点断句）。
-fn split_danmaku(text: &str) -> Vec<String> {
-    const MAX: usize = 24;
-    let mut out = Vec::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        current.push(ch);
-        let is_break = matches!(
-            ch,
-            '，' | '。' | '！' | '？' | '；' | ',' | '.' | '!' | '?' | ';' | '\n' | ' '
-        );
-        if (is_break && current.chars().count() >= 8) || current.chars().count() >= MAX {
-            out.push(current.trim().to_string());
-            current.clear();
-        }
-    }
-    if !current.trim().is_empty() {
-        out.push(current.trim().to_string());
-    }
-    out
-}
 
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -2894,6 +4277,37 @@ fn truncate(s: &str, max: usize) -> String {
 /// 工具调用弹幕摘要：显示工具名 + 主要参数值（提取常见主字段），
 /// 不展示原始 JSON 花括号；全量内容（完整参数 JSON）供悬浮显示。
 fn summarize_tool_call(name: &str, args: &str) -> (String, String) {
+    // 友好名称映射：内置工具用短中文标签（弹幕滚动时一眼可辨）
+    const LABELS: &[(&str, &str)] = &[
+        ("bash", "执行命令"),
+        ("pwsh", "执行命令"),
+        ("read_file", "读文件"),
+        ("write_file", "写文件"),
+        ("list_dir", "列目录"),
+        ("str_replace_editor", "编辑文件"),
+        ("fs_search", "搜索文件"),
+        ("web_search", "网页搜索"),
+        ("todo_write", "更新任务"),
+        ("ask_user", "询问用户"),
+        ("goal_create", "创建目标"),
+        ("plan_write", "制定计划"),
+        ("exit_plan_mode", "退出计划"),
+        ("subagent_fork", "派生子代理"),
+        ("load_skill", "加载技能"),
+        ("node_called", "调用Node"),
+        ("run_code", "组合执行"),
+        ("take_screenshot", "屏幕截图"),
+        ("mouse_click", "鼠标点击"),
+        ("mouse_move", "移动鼠标"),
+        ("mouse_drag", "鼠标拖拽"),
+        ("mouse_scroll", "滚动滚轮"),
+        ("key_type", "键入文本"),
+        ("key_press", "按键"),
+        ("read_image", "读图分析"),
+        ("read_url", "读取网页"),
+    ];
+    let label = LABELS.iter().find(|(n, _)| *n == name).map(|(_, l)| *l).unwrap_or(name);
+
     let full = format!("🔧 {name}\n参数: {args}");
     let trimmed = args.trim();
     // 尝试解析参数 JSON，提取第一个有意义的字符串字段
@@ -2945,8 +4359,8 @@ fn summarize_tool_call(name: &str, args: &str) -> (String, String) {
         }
     }
     match main {
-        Some(m) => (format!("🔧 {name} {}", truncate(&m, 40)), full),
-        None => (format!("🔧 {name} {}", truncate(trimmed, 40)), full),
+        Some(m) => (format!("🔧 {label} {}", truncate(&m, 40)), full),
+        None => (format!("🔧 {label} {}", truncate(trimmed, 40)), full),
     }
 }
 
@@ -3037,25 +4451,60 @@ fn bubble_text_color() -> egui::Color32 {
     egui::Color32::from_rgb(245, 245, 250)
 }
 
+/// 会话列表右缘的相对时间（极简阶梯：刚刚 / N分 / N时 / 昨天 / N天 / 更早）。
+/// `elapsed_secs` 是距今秒数（负值/NaN 按"刚刚"兜底）。
+fn relative_time(elapsed_secs: f64, lang: crate::ui::i18n::Lang) -> String {
+    use crate::ui::i18n::tr;
+    let s = if elapsed_secs.is_finite() && elapsed_secs > 0.0 {
+        elapsed_secs as i64
+    } else {
+        0
+    };
+    let (zh, en): (String, String) = match s {
+        0..=59 => ("刚刚".into(), "now".into()),
+        60..=3599 => (format!("{}分", s / 60), format!("{}m", s / 60)),
+        3600..=86399 => (format!("{}时", s / 3600), format!("{}h", s / 3600)),
+        86400..=172799 => ("昨天".into(), "1d".into()),
+        172800..=604799 => (format!("{}天", s / 86400), format!("{}d", s / 86400)),
+        _ => ("更早".into(), "old".into()),
+    };
+    tr(lang, &zh, &en).into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn danmaku_splitting() {
-        let segs = split_danmaku("首先我们需要分析需求，然后设计架构，最后实现并测试。");
-        assert!(segs.len() >= 2);
-        for s in &segs {
-            assert!(s.chars().count() <= 24, "segment too long: {s}");
-            assert!(!s.is_empty());
-        }
-    }
+#[test]
+fn collapse_attachment_blocks_extracts_names() {
+    let base = "看一下这个脚本";
+    let f = std::path::PathBuf::from("E:\\AI\\install-ada-rs.sh");
+    let composed = compose_message_with_attachments(base, &[f.clone()]);
+    assert!(composed.contains("【附件 1/1：install-ada-rs.sh】"));
+    let (display, names) = collapse_attachment_blocks(&composed);
+    assert_eq!(
+        display, base,
+        "正文保留,附件块(含全文围栏)整体折叠"
+    );
+    assert_eq!(names.len(), 1);
+    assert_eq!(names[0].0, "install-ada-rs.sh");
+    assert_eq!(names[0].1, "E:\\AI\\install-ada-rs.sh");
+    // 无附件消息原样
+    let (d2, n2) = collapse_attachment_blocks("普通消息");
+    assert_eq!(d2, "普通消息");
+    assert!(n2.is_empty());
+    // 多附件
+    let g = std::path::PathBuf::from("D:\\two.txt");
+    let composed2 = compose_message_with_attachments("多附件", &[f.clone(), g]);
+    let (_, names2) = collapse_attachment_blocks(&composed2);
+    assert_eq!(names2.len(), 2);
+    assert_eq!(names2[1].0, "two.txt");
+}
 
-    #[test]
-    fn short_text_single() {
-        let segs = split_danmaku("好的");
-        assert_eq!(segs, vec!["好的".to_string()]);
-    }
+
+    use super::*;
+
+    
 
     #[test]
     fn tool_call_summary_extracts_main_field() {
@@ -3098,6 +4547,85 @@ mod tests {
         // 非 JSON 字符串
         let (b3, _) = summarize_tool_result(true, "plain text");
         assert!(b3.contains("plain text"));
+    }
+}
+
+#[cfg(test)]
+mod slash_tests {
+    use super::*;
+
+    /// 斜杠命令解析：展开 / 补全 / 未知 / 非命令 / 缺省参数。
+    #[test]
+    fn slash_parse_paths() {
+        let lang = Lang::Zh;
+        // 非命令
+        assert!(matches!(parse_slash("普通消息", lang), SlashParse::NotSlash));
+        // 完整命令 + 参数 → 展开含参数
+        match parse_slash("/plan 重构登录模块", lang) {
+            SlashParse::Expanded(t) => {
+                assert!(t.contains("重构登录模块"), "{t}");
+                assert!(t.contains("plan_write"), "模板生效");
+            }
+            _ => panic!("应展开"),
+        }
+        // 带缺省参数的命令：空参数 → 缺省文案
+        match parse_slash("/review", lang) {
+            SlashParse::Expanded(t) => assert!(t.contains("当前项目"), "{t}"),
+            _ => panic!("应展开"),
+        }
+        // 必填参数缺失 → 用法提示（不 panic）
+        match parse_slash("/fix", lang) {
+            SlashParse::Expanded(t) => assert!(t.contains("用法"), "{t}"),
+            _ => panic!("应展开为用法提示"),
+        }
+        // 前缀未完整 → 补全（/re → /review；/p 歧义取第一个 /plan）
+        assert!(matches!(parse_slash("/re", lang), SlashParse::Complete(n) if n == "/review"));
+        assert!(matches!(parse_slash("/p", lang), SlashParse::Complete(n) if n == "/plan"));
+        // 完整无参命令 → 展开（不含 {args} 残留）
+        match parse_slash("/continue", lang) {
+            SlashParse::Expanded(t) => {
+                assert!(!t.contains("{args}"), "占位符必须被替换: {t}");
+            }
+            _ => panic!("应展开"),
+        }
+        // 未知
+        assert!(matches!(parse_slash("/nope", lang), SlashParse::Unknown(_)));
+    }
+}
+
+#[cfg(test)]
+mod diff_card_tests {
+    use super::*;
+
+    /// diff 卡片解析：带 diff / 降级 note / created / 普通工具结果。
+    #[test]
+    fn parse_diff_card_shapes() {
+        // 带 diff → 卡片
+        let json = serde_json::json!({
+            "path": "src/a.rs",
+            "replaced": true,
+            "diff": "-old\n+new\n"
+        })
+        .to_string();
+        let c = parse_diff_card(&json).unwrap();
+        assert_eq!(c.path, "src/a.rs");
+        assert_eq!(c.diff.as_deref(), Some("-old\n+new\n"));
+
+        // 超规模降级 note → 卡片
+        let c = parse_diff_card(
+            r#"{"path":"big.log","diff_note":"整文件重写：100 行 → 3 行"}"#,
+        )
+        .unwrap();
+        assert!(c.diff.is_none());
+        assert!(c.note.is_some());
+
+        // 新建（无 diff 文本）→ 卡片（标题走"新建"分支）
+        let c = parse_diff_card(r#"{"path":"new.txt","created":true}"#).unwrap();
+        assert!(c.created);
+
+        // 普通工具结果（bash/read）→ 不是 diff 卡片
+        assert!(parse_diff_card(r#"{"stdout":"ok"}"#).is_none());
+        assert!(parse_diff_card("not json").is_none());
     }
 }
 
