@@ -1,0 +1,287 @@
+
+running 189 tests
+test config::zoom_tests::ui_zoom_mapping ... ok
+test config::tests::old_config_without_last_workspace_loads ... ok
+test config::tests::last_workspace_roundtrip ... ok
+test core::agent::tests::goal_create_event_folds_into_card ... ok
+test core::agent::tests::ask_user_output_marks_await ... ok
+test core::agent::tests::delete_session_cancels_pending_approvals ... ok
+test core::agent::tests::context_estimate_grows_with_messages ... ok
+test core::agent::tests::message_feedback_roundtrip ... ok
+test core::agent::tests::export_session_markdown_shape ... ok
+test core::agent::tests::interject_allowed_when_running ... ok
+test core::agent::tests::persist_failure_rolls_back_running ... ok
+test core::agent::tests::new_turn_persists_images ... ok
+test core::agent::tests::cancel_and_interject_signals_separate ... ok
+test core::agent::tests::delete_session_removes_everywhere ... ok
+test core::agent::tests::remove_plugin_deletes_dir_and_registry ... ok
+test core::agent::tests::first_message_auto_titles_session ... ok
+test core::agent::tests::compaction_replays_folded ... ok
+test core::agent::tests::fork_session_copies_messages_with_tool_pairing ... ok
+test core::diff::tests::diff_identical_is_empty ... ok
+test core::agent::tests::token_usage_accessors ... ok
+test core::diff::tests::diff_basic_edit ... ok
+test core::agent::tests::turn_guard_respects_epoch ... ok
+test core::diff::tests::diff_context_elision ... ok
+test core::agent::tests::agents_md_injection_shapes ... ok
+test core::agent::tests::search_sessions_fulltext ... ok
+test core::diff::tests::diff_insert_delete_blocks ... ok
+test core::agent::tests::tombstones_shared_across_clone ... ok
+test core::diff::tests::diff_truncates_at_cap ... ok
+test core::llm::tests::ask_user_result_paired_keeps_tool_calls ... ok
+test core::llm::tests::paired_tool_calls_kept ... ok
+test core::llm::tests::partial_response_trims_unmatched_only ... ok
+test core::diff::tests::diff_oversize_returns_none ... ok
+test core::llm::tests::no_empty_shell_assistant_after_trim ... ok
+test core::preset::tests::approval_and_tools_matrix ... ok
+test core::llm::tests::token_usage_math_and_context_window ... ok
+test core::preset::tests::ids_and_names ... ok
+test core::llm::tests::usage_chunk_parses ... ok
+test core::preset::tests::parse_variants_and_legacy_fallback ... ok
+test core::preset::tests::personas_differ ... ok
+test core::session::tests::title_from_message_rules ... ok
+test core::settings::key_storage_tests::b64_roundtrip ... ok
+test core::settings::tests::parse_deepseek_key ... ok
+test core::settings::tests::parse_deepseek_key_flat ... ok
+test core::settings::tests::parse_missing_key_returns_none ... ok
+test core::settings::tests::settings_roundtrip ... ok
+test core::settings::key_storage_tests::dpapi_roundtrip ... ok
+test core::agent::tests::session_workspaces_are_independent ... ok
+test core::tools::diff_result_tests::glob_matching ... ok
+test core::tools::diff_result_tests::html_stripping ... ok
+test core::agent::tests::token_usage_persist_roundtrip ... ok
+test core::tools::tests::extract_absolute_paths_skips_urls ... ok
+test core::llm::tests::multimodal_message_serialization ... ok
+test core::tools::tests::node_called_rejected_under_sandbox ... ok
+test core::storage::tests::delete_removes ... ok
+test core::tools::diff_result_tests::write_file_result_carries_diff ... ok
+test core::storage::tests::append_and_load_roundtrip ... ok
+test core::tools::diff_result_tests::str_replace_result_carries_diff ... ok
+test core::tools::tests::node_called_needs_approval ... ok
+test core::tools::tests::gui_input_gated_by_sandbox ... ok
+test core::tools::web_search_tests::parse_bing_html_empty ... ok
+test core::tools::web_search_tests::parse_bing_html_fixture ... ok
+test core::tools::tests::read_file_blocked_outside_ws ... ok
+test core::tools::web_search_tests::parse_ddg_html_empty ... ok
+test core::tools::web_search_tests::parse_ddg_html_fixture ... ok
+test core::tools::web_search_tests::web_search_ddg_live ... ignored
+test core::tools::web_search_tests::parse_ddg_html_max ... ok
+test core::tools::tests::quoted_system_path_prefix_not_blocked ... ok
+test core::tools::tests::curl_download_in_workspace_not_blocked ... ok
+test core::tools::tests::approval_detects_outside_workspace ... ok
+test core::workspace::tests::nonexistent_rejected ... ok
+test dsh::cli::tests::parse_listening_pids_filters_port ... ok
+test core::tools::tests::run_code_steps_cannot_bypass_approval ... ok
+test dsh::plugins::tests::import_empty_spec_rejected ... ok
+test core::tools::tests::workspace_write_blocks_outside_reads ... ok
+test core::tools::tests::redirect_heuristic_covers_write_variants ... ok
+test core::tools::tests::str_replace_create_not_blocked_by_read_gate ... ok
+test core::settings::key_storage_tests::settings_save_load_key_persists_encrypted ... ok
+test core::workspace::tests::attach_session ... ok
+test engine::approval::tests::always_allow_records_target ... ok
+test dsh::plugins::tests::list_plugins_includes_bundles_only ... ok
+test core::workspace::tests::broad_roots_rejected ... ok
+test engine::approval::tests::decision_str_roundtrip ... ok
+test core::workspace::tests::open_and_canonicalize ... ok
+test engine::approval::tests::resolve_unknown_id_false ... ok
+test dsh::plugins::tests::list_plugins_parses_manifest ... ok
+test engine::compaction::tests::boundary_never_starts_with_orphan_tool ... ok
+test core::agent::tests::schedule_persist_and_fire ... ok
+test engine::compaction::tests::compaction_keeps_tail ... ok
+test core::tools::tests::write_tools_fail_closed_under_sandbox ... ok
+test engine::compaction::tests::no_compaction_when_small ... ok
+test dsh::plugins::tests::remove_dependency_updates_manifest ... ok
+test engine::compaction::tests::summary_injected_as_user_message ... ok
+test engine::approval::tests::request_resolve_flow ... ok
+test engine::feedback::tests::feedback_roundtrip ... ok
+test engine::goal::tests::goal_lifecycle_fold ... ok
+test engine::goal::tests::unknown_op_ignored ... ok
+test engine::jobs::tests::clear_finished ... ok
+test engine::jobs::tests::job_lifecycle ... ok
+test engine::lessons::tests::canonical_is_order_insensitive ... ok
+test engine::lessons::tests::failure_count_and_block ... ok
+test engine::lessons::tests::governance_errors_are_recognized ... ok
+test engine::lessons::tests::prompt_block_empty_and_cap ... ok
+test engine::plan::tests::fold_last_wins ... ok
+test engine::plan::tests::fold_plan_state_keeps_content ... ok
+test engine::lessons::tests::success_pairs_fix_then_exact_success_clears ... ok
+test dsh::plugins::tests::is_installed_locally_detects_node_modules ... ok
+test engine::plugin::tests::empty_command_rejected_not_panic ... ok
+test engine::lessons::tests::prune_cap_per_workspace ... ok
+test engine::skill::builtin_skill_tests::builtin_domain_skills_available ... ok
+test dsh::plugins::tests::toggle_disabled_roundtrip ... ok
+test engine::skill::tests::lower_rank_wins ... ok
+test engine::skill::tests::skill_name_grammar ... ok
+test engine::skill::tests::split_front_matter_basic ... ok
+test engine::subagent::tests::spawn_and_depth ... ok
+test engine::skill::tests::github_install_url_and_guard ... ok
+test engine::workflow::tests::workflow_lifecycle ... ok
+test engine::skill::builtin_skill_tests::user_dir_overrides_builtin ... ok
+test exec::acl::tests::e2e_workspace_write_denies_outside ... ignored
+test exec::input::tests::button_parse ... ok
+test exec::input::tests::combo_parsing ... ok
+test exec::input::tests::key_names ... ok
+test exec::acl::tests::danger_full_access_passthrough_signal ... ok
+test engine::skill::tests::loads_anthropic_skill_md ... ok
+test exec::acl::tests::can_write_respects_mode ... ok
+test engine::skill::tests::load_and_create_skills_from_dir ... ok
+test engine::plugin::tests::manifest_domain_and_theme_parsed ... ok
+test exec::sandbox::tests::mode_ladder ... ok
+test dsh::plugins::tests::transcribe_plugin_to_skill_writes_skill_md ... ok
+test exec::sandbox::tests::escalation_requires_justification ... ok
+test exec::winacl::tests::e2e_workspace_write_isolation ... ignored
+test engine::lessons::tests::persist_roundtrip ... ok
+test exec::sandbox::tests::read_only_denies_write ... ok
+test exec::winacl::tests::sid_string_roundtrip ... ok
+test service::events::tests::sse_batch_joins ... ok
+test exec::sandbox::tests::workspace_write_allows_inside ... ok
+test exec::sandbox::tests::dotdot_traversal_rejected ... ok
+test service::events::tests::sse_frame_shape ... ok
+test service::rpc::tests::envelope_roundtrip ... ok
+test service::rpc::tests::ok_err_shapes ... ok
+test service::rpc::tests::segment_grammar ... ok
+test ui::chat_tab::attach_tests::compose_binary_placeholder ... ok
+test ui::chat_tab::attach_tests::compose_no_attachments ... ok
+test exec::winacl::tests::restricted_token_builds ... ok
+test ui::chat_tab::diff_card_tests::parse_diff_card_shapes ... ok
+test ui::chat_tab::slash_tests::slash_parse_paths ... ok
+test ui::chat_tab::tests::collapse_attachment_blocks_extracts_names ... ok
+test ui::chat_tab::tests::tool_call_summary_extracts_main_field ... ok
+test ui::chat_tab::tests::tool_result_summary_extracts_stdout ... ok
+test ui::chat_tab::attach_tests::compose_fence_escape_and_attachment_only ... ok
+test ui::danmaku::tests::cap_at_limit ... ok
+test ui::chat_tab::attach_tests::compose_large_truncated ... ok
+test ui::danmaku::tests::empty_text_ignored ... ok
+test ui::danmaku::tests::fire_and_advance ... ok
+test ui::chat_tab::attach_tests::compose_text_attachment ... ok
+test ui::danmaku::tests::no_overlap_same_track ... ok
+test ui::danmaku::tests::same_track_speed_clamp_prevents_catchup ... ok
+test ui::markdown::tests::checkbox_state_detects_prefix ... ok
+test ui::markdown::tests::parse_code_block ... ok
+test ui::markdown::tests::parse_heading_bold_code ... ok
+test ui::chat_tab::attach_tests::attach_text_detection ... ok
+test ui::markdown::tests::parse_image_local_and_http ... ok
+test ui::markdown::tests::parse_list_ordered_unordered ... ok
+test ui::markdown::tests::parse_ordered_list_with_inline_code ... ok
+test ui::markdown::tests::parse_plain_text_keeps_newlines ... ok
+test ui::markdown::tests::parse_table ... ok
+test ui::settings_tab::tests::apply_proxy_env_sets_vars ... ok
+test ui::settings_tab::tests::config_proxy_roundtrip ... ok
+test ui::settings_tab::tests::opt_trims_and_clears ... ok
+test ui::theme::tests::apply_writes_both_theme_slots ... ok
+test ui::theme::tests::palette_switch_takes_effect ... ok
+test util::consolas_tests::bold_font_prefers_consolas ... ok
+test util::consolas_tests::ui_font_consolas_loads ... ok
+test ui::theme::tests::theme_json_roundtrip ... ok
+test engine::skill::tests::import_local_file_and_dir ... ok
+test ui::theme::tests::theme_manager_discover ... ok
+test ui::code_browser::tests::file_view_shapes ... ok
+test util::tests::emoji_glyph_resolves_via_fallback_font ... ok
+test ui::danmaku::tests::danmaku_filters_missing_glyphs ... ok
+test core::tools::tests::node_called_executes_js ... ok
+test exec::subprocess::tests::run_echo ... ok
+test util::tests::cjk_latin_metrics_normalized ... ok
+test core::tools::tests::node_called_can_require_dsh_packages ... ok
+test engine::plugin::tests::plugin_handshake_and_tool_invoke ... ok
+test exec::subprocess::tests::large_output_does_not_deadlock ... ok
+test dsh::cli::tests::reap_records_failure_with_stderr ... ok
+test engine::schedule::tests::scheduler_due ... ok
+test exec::subprocess::tests::timeout_kills ... ok
+test core::agent::tests::send_message_creates_turn_job ... ok
+test core::tools::tests::shell_read_gate_paths ... ok
+
+test result: ok. 186 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 2.74s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 32 tests
+test llm_messages_partial_response_no_orphans ... ok
+test llm_messages_trim_unpaired_tool_calls ... ok
+test plugin_loader_lifecycle ... ok
+test plugin_group_and_events ... ok
+test preset_tool_catalog_full ... ok
+test config_roundtrip ... ok
+test run_code_removed_rejected_everywhere ... ok
+test storage_load_projects_assistant ... ok
+test storage_replay_projects_tool_messages ... ok
+test tool_messages_pair_with_assistant_tool_calls ... ok
+test storage_replay_restores_assistant_tool_calls ... ok
+test plugin_management_roundtrip_temp_home ... ok
+test tools_fs_search ... ok
+test tools_str_replace_editor ... ok
+test sandbox_chip_toggle_actually_works ... ok
+test attachment_images_survive_queue_and_interject ... ok
+test tools_bash_and_fs ... ok
+test workspace_rejects_file ... ok
+test engine_session_crud ... ok
+test chip_switch_preserves_saved_api_key ... ok
+test no_key_does_not_pollute_state ... ok
+test queue_runs_after_turn_finishes ... ok
+test engine_no_key_no_crash ... ok
+test engine_create_session_and_error_path ... ok
+test workspace_open_and_bind_session ... ok
+test preset_sessions_created_restored_switched ... ok
+test default_preset_is_standard_and_configurable ... ok
+test tools_pwsh ... ok
+test bridge_starts ... ok
+test send_failure_does_not_stick_running ... ok
+test send_after_preset_switch_works ... ok
+test tools_web_search_validation ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.73s
+
+
+running 1 test
+test del_slash_f_flag_not_treated_as_path ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 35 tests
+test approval_card_renders_inside_window ... ok
+test kittest_smoke_renders_chat ... ok
+test chat_survives_window_shrink ... ok
+test ask_user_card_renders_and_answers ... ok
+test double_click_renames_session ... ok
+test ask_user_question_bound_to_session ... ok
+test mode_switch_updates_highlight_without_reopen ... ok
+test chinese_width_calibration ... ok
+test fonts_mut_measure_safe ... ok
+test long_session_messages_stay_left_aligned ... ok
+test send_immediately_has_user_message ... ok
+test full_shell_messages_visible_after_shrink ... ok
+test session_click_switches_current ... ok
+test goals_panel_data_driven_lifecycle ... ok
+test q_reply_markdown_renders_inside_viewport ... ok
+test session_list_delete_flow ... ok
+test stop_button_shown_when_running ... ok
+test sent_message_survives_session_switch ... ok
+test user_message_shown_once_after_send ... ok
+test user_scroll_up_not_overridden ... ignored
+test session_switch_shows_last_user_message ... ok
+test history_visible_after_shrink_when_scrolled_up ... ok
+test chinese_user_message_visible ... ok
+test light_theme_fills_all_panels ... ok
+test long_chinese_user_message_visible ... ok
+test messages_render_visible_pixels ... ok
+test messages_visible_after_shrink_pixels ... ok
+test multiline_user_bubble_right_aligned ... ok
+test open_session_shows_last_user_message ... ok
+test panels_data_driven_no_buttons ... ok
+test plan_panel_checklist_progress ... ok
+test replay_path_user_bubble ... ok
+test session_list_aligned_and_truncated ... ok
+test toolbar_chips_uniform_height ... ok
+test user_bubble_right_margin_kept ... ok
+
+test result: ok. 34 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 8.39s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

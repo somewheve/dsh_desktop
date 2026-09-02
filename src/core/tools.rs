@@ -3,7 +3,7 @@
 //! 对齐 DSH 的 dsh-tool-* 语义：每个工具返回 JSON 结果，
 //! agent 循环把它作为 tool/result 事件写回会话。
 //! 已实现：bash / pwsh / read_file / write_file / list_dir / todo_write /
-//!         str_replace_editor / fs_search / web_search / ask_user / goal_create
+//!         str_replace_editor / fs_search / web_search / ask_user
 
 use crate::core::preset::AgentPreset;
 use serde_json::{json, Value};
@@ -466,11 +466,6 @@ impl ToolRegistry {
                 json!({"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"}},"header":{"type":"string"}},"required":["question"]}),
             ),
             tool_spec(
-                "goal_create",
-                "创建长期目标（显示在 Goals 卡片并持久化）。当用户提出一个需要跨多轮持续推进/跟踪的长期目标时，自动调用它登记目标。",
-                json!({"type":"object","properties":{"objective":{"type":"string"}},"required":["objective"]}),
-            ),
-            tool_spec(
                 "plan_write",
                 "编写执行计划并进入计划模式（显示在 Plan 卡片，先计划后执行）。任务复杂/多步骤时先调用它产出计划，计划完成后再 exit_plan_mode。计划请用 markdown 任务列表（每步一行 `- [ ] 步骤`）；每完成一步，就在执行过程中用 plan_write 更新内容，把该步的 `- [ ]` 改成 `- [x]`，让 Plan 卡片的勾选框实时反映进度。",
                 json!({"type":"object","properties":{"content":{"type":"string"}},"required":["content"]}),
@@ -492,7 +487,7 @@ impl ToolRegistry {
             ),
             tool_spec(
                 "node_called",
-                "在 DSH 的 Node.js 环境中执行 JavaScript 代码（NODE_PATH 已指向本机 DSH 的 node_modules）。可 require 任意已安装的 DSH 官方插件/依赖（如 @deepseek-ai/dsh-goal）并调用其能力，返回 JSON 结果。适合调用 JS 库/插件、处理复杂数据处理。",
+                "在 DSH 的 Node.js 环境中执行 JavaScript 代码（NODE_PATH 已指向本机 DSH 的 node_modules）。可 require 任意已安装的 DSH 官方插件/依赖（如 @deepseek-ai/dsh-tool-bash）并调用其能力，返回 JSON 结果。适合调用 JS 库/插件、处理复杂数据处理。",
                 json!({"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}),
             ),
         ];
@@ -548,11 +543,6 @@ impl ToolRegistry {
                 "question": args.get("question").and_then(Value::as_str).unwrap_or(""),
                 "options": args.get("options").cloned().unwrap_or_else(|| json!([])),
                 "header": args.get("header").cloned().unwrap_or_else(|| json!(null)),
-            })),
-            "goal_create" => ToolOutput::ok(json!({
-                "goal": true,
-                "note": "目标已创建",
-                "objective": args.get("objective").and_then(Value::as_str).unwrap_or(""),
             })),
             "plan_write" => ToolOutput::ok(json!({
                 "plan": true,

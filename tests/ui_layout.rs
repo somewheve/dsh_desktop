@@ -1030,25 +1030,39 @@ fn panels_data_driven_no_buttons() {
 }
 
 
-/// 回归：目标卡片创建目标 → goal/change 事件持久化 → 卡片列表显示。
+/// 回归：连续工作场景下计划 + 子代理的稳定性——多回合事件流
+///（plan_write 制定 5 步 → 并行子代理 spawn/running/终态 → 逐项勾选推进 →
+/// exit_plan_mode），芯片实时跟随每一拍；随后用全新 ChatTab 重开会话，
+/// 全部状态从事件重放恢复（等价于重启应用）。
 #[test]
-fn goals_panel_data_driven_lifecycle() {
+fn plan_and_subagents_continuous_work_scenario() {
     let _theme_guard = THEME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
     let mut settings = EngineSettings::default();
     settings.api_key = None;
-    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
+    let data_dir = tempfile::tempdir().unwrap().path().join("sessions");
+    settings.data_dir = data_dir.clone();
     let engine = std::sync::Arc::new(std::sync::Mutex::new(
         DshEngine::new(settings, tx.clone()).expect("engine"),
     ));
     let sid = engine
         .lock()
         .unwrap()
-        .create_session(Some("goal panel test"))
+        .create_session(Some("连续工作场景"))
         .unwrap();
+    // 与引擎同目录的存储句柄：模拟回合线程 append_alive 的持久化半边；
+    // emit = 持久化 + tx 通知，与真实回合的两条链路一致
+    let store = dsh_desktop::core::storage::SessionStore::new(data_dir).expect("store");
+    let emit = |ev: SessionEvent| {
+        store.append(&sid, &ev).expect("append");
+        let _ = tx.send(EngineEvent::Event {
+            session_id: sid.clone(),
+            event: ev,
+        });
+    };
+
     let mut chat = ChatTab::new(engine.clone(), rx);
     chat.open(&sid);
-
     let mut harness = Harness::new_ui_state(
         |ui, chat: &mut ChatTab| {
             egui::Panel::left("test_session_list")
@@ -1062,39 +1076,137 @@ fn goals_panel_data_driven_lifecycle() {
     );
     harness.set_size(Vec2::new(900.0, 600.0));
     harness.run_steps(8);
-    // 无目标 → 无面板
+
+    // ---- 回合 1：制定 5 步计划 ----
+    emit(dsh_desktop::engine::plan::plan_content_event(
+        "- [ ] 步骤一：分析需求
+- [ ] 步骤二：准备数据
+- [ ] 步骤三：并行子任务
+- [ ] 步骤四：整合结果
+- [ ] 步骤五：收尾核对",
+    ));
+    harness.run_steps(4);
     assert!(
-        harness.query_by_label("🎯 1/1 ▸").is_none(),
-        "无目标时不应有目标方块按钮"
+        harness.query_by_label("📋 0/5 ▸").is_some(),
+        "计划制定后应显示 📋 0/5"
     );
 
-    // 经引擎创建目标（goal_op 持久化 + GOAL_CHANGE 事件）
-    {
-        let mut e = engine.lock().unwrap();
-        let _ = e.goal_op(&sid, dsh_desktop::engine::goal::GoalOp::Create, "", Some("实现目标面板"));
-    }
+    // ---- 回合 2：并行派生两个子代理 + 逐步勾选 ----
+    let sub_desc = |id: &str, status: &str, result: Option<&str>| {
+        dsh_desktop::engine::subagent::SubagentDescriptor {
+            subagent_id: id.to_string(),
+            parent_session_id: sid.clone(),
+            status: status.to_string(),
+            summary: Some("并行任务".into()),
+            task: Some("独立小任务".into()),
+            result: result.map(|s| s.to_string()),
+        }
+    };
+    let desc_ev = |d: &dsh_desktop::engine::subagent::SubagentDescriptor| {
+        SessionEvent::new(types::SUBAGENT_DESCRIPTOR, serde_json::to_value(d).ok())
+    };
+    emit(desc_ev(&sub_desc("sub-a", "running", None)));
+    emit(desc_ev(&sub_desc("sub-b", "running", None)));
+    harness.run_steps(4);
+    assert!(
+        harness.query_by_label("🤖 2/2 ▸").is_some(),
+        "两个子代理运行中应显示 🤖 2/2"
+    );
+
+    emit(dsh_desktop::engine::plan::plan_content_event(
+        "- [x] 步骤一：分析需求
+- [x] 步骤二：准备数据
+- [ ] 步骤三：并行子任务
+- [ ] 步骤四：整合结果
+- [ ] 步骤五：收尾核对",
+    ));
+    harness.run_steps(4);
+    assert!(
+        harness.query_by_label("📋 2/5 ▸").is_some(),
+        "计划进度应推进到 2/5"
+    );
+
+    // 子代理终态（一成一败）+ 计划推进
+    emit(desc_ev(&sub_desc("sub-a", "done", Some("结果A：数据齐备"))));
+    emit(desc_ev(&sub_desc("sub-b", "failed", Some("结果B：网络失败"))));
+    emit(dsh_desktop::engine::plan::plan_content_event(
+        "- [x] 步骤一：分析需求
+- [x] 步骤二：准备数据
+- [x] 步骤三：并行子任务
+- [x] 步骤四：整合结果
+- [ ] 步骤五：收尾核对",
+    ));
+    harness.run_steps(4);
+    assert!(
+        harness.query_by_label("🤖 2 ▸").is_some(),
+        "子代理全部终态后应显示总数 🤖 2"
+    );
+
+    // ---- 回合 3：用户追问 + 全部完成 + 退出计划模式 ----
+    emit(SessionEvent::new(
+        types::USER_MESSAGE,
+        Some(serde_json::json!({"content": "继续收尾"})),
+    ));
+    emit(dsh_desktop::engine::plan::plan_content_event(
+        "- [x] 步骤一：分析需求
+- [x] 步骤二：准备数据
+- [x] 步骤三：并行子任务
+- [x] 步骤四：整合结果
+- [x] 步骤五：收尾核对",
+    ));
+    emit(dsh_desktop::engine::plan::plan_exit_event());
+    emit(SessionEvent::new(
+        types::ASSISTANT_MESSAGE,
+        Some(serde_json::json!({"content": "全部完成"})),
+    ));
     harness.run_steps(6);
-    // 面板出现（数据驱动）
-    let header = harness
-        .query_by_label("🎯 1/1 ▸")
-        .expect("有目标时目标方块按钮应出现");
-    header.click();
-    harness.run_steps(5);
     assert!(
-        harness.query_by_label("实现目标面板").is_some(),
-        "展开后目标应可见"
+        harness.query_by_label("📋 5/5 ▸").is_some(),
+        "退出计划模式后 📋 5/5 保留（完整历史）"
     );
-    // 完成：面板仍在（1 总数），状态 complete
-    harness.get_by_label("完成").click();
-    harness.run_steps(8);
+
+    // 子代理卡片可展开，终态行可见（一成一败）
+    harness.get_by_label("🤖 2 ▸").click();
+    harness.run_steps(4);
     assert!(
-        harness.query_by_label("complete").is_some(),
-        "完成后状态应为 complete"
+        harness.query_by_label("✅ sub-a  并行任务").is_some(),
+        "已完成子代理行应可见"
     );
     assert!(
-        harness.query_by_label("🎯 0/1 ▸").is_some()
-            || harness.query_by_label("🎯 0/1 ▾").is_some(),
-        "完成后按钮保留（活动 0/总数 1）"
+        harness.query_by_label("❌ sub-b  并行任务").is_some(),
+        "失败子代理行应可见"
+    );
+
+    // ---- 重开会话（全新 ChatTab，等价重启应用）：状态从事件重放恢复 ----
+    let (_tx2, rx2) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut chat2 = ChatTab::new(engine.clone(), rx2);
+    chat2.open(&sid);
+    let mut harness2 = Harness::new_ui_state(
+        |ui, chat2: &mut ChatTab| {
+            egui::Panel::left("test_session_list2")
+                .exact_size(172.0)
+                .show(ui, |ui| {
+                    let _ = chat2.ui_session_list(ui, None);
+                });
+            chat2.ui(ui);
+        },
+        chat2,
+    );
+    harness2.set_size(Vec2::new(900.0, 600.0));
+    harness2.run_steps(8);
+    assert!(
+        harness2.query_by_label("📋 5/5 ▸").is_some(),
+        "重放后计划芯片应恢复 5/5"
+    );
+    assert!(
+        harness2.query_by_label("🤖 2 ▸").is_some(),
+        "重放后子代理芯片应恢复（2 个终态）"
+    );
+    harness2.get_by_label("📋 5/5 ▸").click();
+    harness2.run_steps(4);
+    assert!(
+        harness2.query_by_label("步骤五：收尾核对").is_some(),
+        "重放后计划卡展开应显示条目"
     );
 }
 

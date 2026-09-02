@@ -3,7 +3,6 @@
 pub mod approval;
 pub mod compaction;
 pub mod feedback;
-pub mod goal;
 pub mod jobs;
 pub mod lessons;
 pub mod plan;
@@ -16,7 +15,6 @@ pub mod workflow;
 pub use approval::{ApprovalDecision, ApprovalRegistry, ApprovalRequest};
 pub use compaction::{plan_compaction, CompactionPlan};
 pub use feedback::{FeedbackKind, FeedbackStore};
-pub use goal::{Goal, GoalManager, GoalOp, GoalPhase};
 pub use jobs::{Job, JobManager, JobStatus};
 pub use plan::{fold_plan_mode, PlanMode};
 pub use plugin::{PluginManager, PluginManifest, PluginStatus};

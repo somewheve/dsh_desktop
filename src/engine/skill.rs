@@ -91,6 +91,25 @@ pub fn builtin_skills() -> Vec<Skill> {
             },
             rank: 600,
         },
+        Skill {
+            name: "paper-authenticity-review".into(),
+            description: Some(
+                "Authenticity review and scoring of an academic paper on a \
+                 0-100 scale (0 = demonstrably fabricated): internal \
+                 plausibility analysis of the paper's data and content, \
+                 bounded one-level verification of its own reference list \
+                 (no recursive citation chasing), and a weighted final \
+                 verdict with itemized evidence. Use when the user asks to \
+                 evaluate, fact-check, or score a paper / preprint / \
+                 manuscript for credibility or fabrication risk"
+                    .into(),
+            ),
+            instructions: Some(PAPER_REVIEW_INSTRUCTIONS.into()),
+            invocation: SkillInvocation {
+                model_invocable: true,
+            },
+            rank: 600,
+        },
     ]
 }
 
@@ -170,6 +189,62 @@ When handling paper writing (any manuscript section, abstract, cover letter, rev
 ## 6 Delivery Habits
 - Follow the journal/institution template supplied by the user; when absent, ask for the format requirements first (citation style, word limit, language).
 - For long documents, deliver an outline for confirmation before expanding; for revised drafts, include a change note (what changed and why).
+"#;
+
+const PAPER_REVIEW_INSTRUCTIONS: &str = r#"# Paper Authenticity Review and Scoring Protocol
+
+When the user asks to evaluate, fact-check, verify, or score a paper / preprint / manuscript for authenticity, credibility, or fabrication risk, execute this protocol strictly. Write the report in the user's language.
+
+## 0 Scope and Hard Bounds (MUST obey)
+- Input: a paper supplied as a file path, pasted text, or URL. Read the full text first (read_file / read_url), including the complete reference list. If only an abstract or fragment is available, say so explicitly and mark every score as reduced-confidence.
+- DEPTH LIMIT (hard): verify ONLY the references in the paper under review. NEVER open, search, or enumerate the reference lists of the cited works (no second-level citations), and NEVER iterate over bibliographies found in search results. Citation analysis depth is exactly one level.
+- BUDGET LIMIT (hard): at most 25 web_search calls for the entire review, and at most 20 references verified individually. If the reference list is longer than 20, sample by the priority rules in Stage B and state the sampling (checked N of R).
+- If the user asks to exceed these bounds (e.g., "check the references of the references"), refuse and restate the depth limit; proceed only on explicit confirmation, and still never recurse.
+- Do not modify the paper. This is a read-only review.
+
+## 1 Stage A - Content and Data Plausibility (0-40 points)
+Examine and report item by item, each with its location (section / table / figure):
+- Numeric cross-consistency: compare every number that appears in more than one place (abstract vs body vs tables vs figure captions): sample sizes, percentages, means, standard deviations, p-values, effect sizes, accuracy metrics. Any unreconciled contradiction is a major finding.
+- Dimensional and magnitude sanity: units, scales, and orders of magnitude against domain norms (e.g., yields above 100%, physically impossible concentrations or temperatures, questionnaire categories not summing to 100%, error bars smaller than the reported measurement resolution).
+- Statistical validity: p-values consistent with the reported test statistics and degrees of freedom, confidence intervals consistent with p-values, baseline-group sizes, multiple-comparison handling, and overfitting signals (number of variables comparable to or larger than n).
+- Methodological red flags: procedures that cannot work as described, missing parameters that make reproduction impossible, claimed datasets or instruments that do not plausibly exist, ethics-approval or trial-registration mismatches, impossible experimental timelines.
+- Narrative consistency: whether the evidence presented actually supports each conclusion drawn; overclaiming; author-affiliation-venue mismatches; template or AI-generation artifacts.
+- If nothing anomalous is found, state precisely: "no internal contradictions found within the checked items" - never phrase absence of findings as proof of authenticity.
+
+## 2 Stage B - Reference List Analysis (0-40 points)
+- Extract the full reference list. Record the total count R.
+- Verification priority (when R > 20): (1) references that support the paper's central claims (most frequently cited in the text), (2) self-citations, (3) foundational or methodological references, (4) the head of the remaining list.
+- For each selected reference, run web_search with the query `"<exact reference title>" <first-author surname> <year>`. Use one refined retry (title words only) before concluding NOT FOUND. Classify each as:
+  - VERIFIED - the title is actually seen in the results (journal page, PubMed, Google Scholar, publisher record, or DOI record) and the authors / venue / year are consistent;
+  - PARTIAL - a highly similar work exists but the metadata disagrees (different authors, venue, or year);
+  - NOT FOUND - no matching record after the retry;
+  - UNVERIFIABLE - books, pre-internet literature, theses, or items outside index coverage; these are NEVER counted as fabricated.
+- Citation-claim fidelity spot check (at most 5 references, chosen where the paper's key claims depend on them): from the abstract or summary of the cited work, does it actually support the sentence it is attached to? For paywalled full texts, check at abstract level and say so.
+- Flag any DOI or URL that does not resolve to the claimed work, and any reference entry lacking title, venue, and year altogether.
+- Report the counts (verified / partial / not-found / unverifiable) and a per-item evidence table.
+
+## 3 Stage C - Composite Score (0-100; 0 = fabricated)
+Weights: Stage A 40 + Stage B 40 + transparency 20. The final score must be reproducible from the itemized deductions; always show the arithmetic.
+- Stage A (start at 40): each demonstrated internal numeric contradiction -8 (floor 0); each implausible methodological or data element -5; each instance of overclaiming -3.
+- Stage B: base = 40 x (verified + 0.5 x unverifiable) / checked; then each PARTIAL -2, each NOT FOUND -6, each misattributed key citation -8, each fabricated-looking DOI/URL -10, omitting the fidelity spot-checks without stated reason -5 (floor 0).
+- Transparency (0-20): availability of data and code, methodological detail sufficient for reproduction, ethics / registration information, coherent author-affiliation-venue record.
+Score discipline:
+- 0 is reserved for demonstrable fabrication: internal evidence that the data were invented, or the majority of the checked references provably do not exist. NEVER assign 0 merely because the paper is offline, unindexed, non-English, or behind a paywall.
+- Unverifiable does not mean nonexistent. Never assert "this paper is fraudulent" as a certainty; present the evidence and use calibrated language (e.g., "consistent with fabricated references: 7 of 10 checked items not found").
+- Do not reward volume: a long reference list adds nothing unless its entries verify.
+
+## 4 Confidentiality and Data-Use Restriction (hard)
+- Treat the paper's core information (unpublished data, methods, results, figures, and any supplementary material) as confidential review material. It MUST NOT be used for AI retraining or for any purpose other than this review, and it MUST NOT be reproduced or redistributed beyond the report delivered to the user.
+- Outbound minimization: external verification queries may carry only the minimum identifying metadata (reference titles, author names, venue, year). NEVER transmit the paper's core content (datasets, novel methods, unpublished results) to any external service.
+- The report MUST end with this notice verbatim: "Confidentiality: the reviewed paper's core information was used solely for this assessment, only the verifying metadata above was sent externally, and it may not be used for AI retraining or redistribution."
+
+## 5 Output Template
+1. Verdict band (one line): 0-15 fabricated | 16-39 severe concerns | 40-59 mixed reliability | 60-79 sound with caveats | 80-100 credible.
+2. Final score X/100, with the three subscores and the deduction arithmetic.
+3. Stage A findings table: finding, location, severity (major / moderate / minor).
+4. Stage B reference table: ref number, short title, classification, evidence note; plus the sampling statement (checked N of R) and total search count used.
+5. Limitations (full-text access, language, index coverage, PDF-only checks) and recommended human follow-ups (contact the journal, COPE guidelines, publisher inquiry).
+6. The confidentiality notice from section 4, verbatim.
 "#;
 
 /// 技能注册表。
@@ -550,7 +625,7 @@ mod tests {
         // 从目录加载
         let mut reg2 = SkillRegistry::default();
         reg2.load_from_dir(td.path());
-        // len = 目录技能 + 2 个内置领域技能；断言目标技能内容正确
+        // len = 目录技能 + 3 个内置领域技能；断言目标技能内容正确
         let s = reg2.get("my-skill").unwrap();
         assert_eq!(s.description.as_deref(), Some("我的技能"));
         assert_eq!(s.instructions.as_deref(), Some("按以下步骤执行…"));
@@ -662,7 +737,7 @@ mod tests {
         // 导入后可加载
         let mut reg2 = SkillRegistry::default();
         reg2.load_from_dir(&skills_dir);
-        // len = 导入的 2 个 + 2 个内置领域技能
+        // len = 导入的 2 个 + 3 个内置领域技能
         assert!(reg2.get("from-file").is_some());
         assert!(reg2.get("my-local-skill").is_some());
     }
@@ -716,6 +791,28 @@ mod builtin_skill_tests {
             .as_deref()
             .unwrap()
             .contains("URLs actually returned"));
+        // 论文真实性评分技能（用户要求：数据/内容合理性 + 仅一层引用核验 +
+        // 0-100 综合分，严禁递归查引用）
+        let paper = reg
+            .get("paper-authenticity-review")
+            .expect("paper authenticity skill");
+        assert!(paper.invocation.model_invocable);
+        let ins = paper.instructions.as_deref().unwrap();
+        assert!(ins.contains("Composite Score (0-100; 0 = fabricated)"));
+        assert!(paper
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("0-100 scale"));
+        assert!(ins.contains("DEPTH LIMIT"));
+        assert!(ins.contains("exactly one level"));
+        assert!(ins.contains("BUDGET LIMIT"));
+        assert!(ins.contains("at most 25 web_search"));
+        assert!(ins.contains("0 = fabricated"));
+        assert!(ins.contains("Unverifiable does not mean nonexistent"));
+        // 保密与再训练禁令（用户要求：论文核心信息不得用于 AI 再训练）
+        assert!(ins.contains("MUST NOT be used for AI retraining"));
+        assert!(ins.contains("Outbound minimization"));
     }
 
     /// 用户目录同名技能覆盖内置（rank 250 < 600）。

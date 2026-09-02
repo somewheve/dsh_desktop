@@ -121,11 +121,16 @@ impl SubagentManager {
 
 fn uuidish() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
+    // 纯时间派生在同一时钟 tick 内会碰撞（join_all 并发 fork 时真实可触达：
+    // Windows SystemTime 分辨率 ~100ns，两个 fork 同 tick spawn → 同 id →
+    // HashMap 互相覆盖、descriptor 串台）。追加单调计数器保证唯一。
+    static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("{nanos:x}")
+    let c = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{nanos:x}-{c:x}")
 }
 
 /// 子代理回合：独立 LLM 调用（对齐 subagent-in-process-driver 的核心语义）。
@@ -205,5 +210,34 @@ mod tests {
         assert_eq!(mgr.get(&id).unwrap().task.as_deref(), Some("分析文件"));
         assert_eq!(mgr.get(&id).unwrap().summary.as_deref(), Some("done"));
         assert!(mgr.spawn("s-parent", 4, 3, "t").is_err(), "深度超限应失败");
+    }
+
+    /// 并发 fork 的 id 唯一性（join_all 并行 spawn 在同一时钟 tick 内也不碰撞）。
+    #[test]
+    fn spawn_ids_unique_under_parallelism() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        let mgr = Arc::new(std::sync::Mutex::new(SubagentManager::default()));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let mgr = mgr.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut ids = Vec::new();
+                for _ in 0..64 {
+                    let id = mgr.lock().unwrap().spawn("s", 1, 3, "t").unwrap();
+                    ids.push(id);
+                }
+                ids
+            }));
+        }
+        let mut all: HashSet<String> = HashSet::new();
+        let mut total = 0;
+        for h in handles {
+            for id in h.join().unwrap() {
+                all.insert(id);
+                total += 1;
+            }
+        }
+        assert_eq!(all.len(), total, "并发 spawn 的 id 必须全部唯一");
     }
 }

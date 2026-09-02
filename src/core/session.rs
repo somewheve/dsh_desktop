@@ -35,7 +35,6 @@ pub mod types {
     pub const COMPACTION_START: &str = "compaction/start";
     pub const COMPACTION_SUMMARY: &str = "compaction/summary";
     pub const COMPACTION_END: &str = "compaction/end";
-    pub const GOAL_CHANGE: &str = "goal/change";
     pub const PLAN_MODE: &str = "plan/mode";
     pub const WORKFLOW_RUN_START: &str = "tool-workflow/run-start";
     pub const WORKFLOW_RUN_END: &str = "tool-workflow/run-end";

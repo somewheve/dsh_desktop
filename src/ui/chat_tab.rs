@@ -92,18 +92,14 @@ pub struct ChatTab {
     plan_mode: crate::engine::plan::PlanMode,
     /// 最近计划内容（plan_write 写入
     plan_content: String,
-    /// 目标（fold goal/change 事件
-    goals: crate::engine::goal::GoalManager,
     /// 子代理（fold 自 subagent/descriptor 事件）
     subs: std::collections::HashMap<String, crate::engine::subagent::SubagentDescriptor>,
-    /// 目标卡片的新目标输入
-    goal_input: String,
     /// 复制成功的内联反馈（消息 id + 点击时刻；按钮旁短暂显示"已复制 ✓"）
     copy_flash: Option<(String, std::time::Instant)>,
     /// 状态方块按钮行上一帧实测宽（两遍测宽：右缘对齐用）
     chips_row_w: f32,
     /// 展开面板上一帧实测宽（下标 = PanelKind 判别值；内容自适应宽）
-    panel_widths: [f32; 5],
+    panel_widths: [f32; 4],
     pub(crate) status: String,
     /// 顶部错误提示（app 侧也可写入，web 启动失败
     pub error: Option<String>,
@@ -166,12 +162,10 @@ impl ChatTab {
             panel_expanded: PanelKind::None,
             plan_mode: crate::engine::plan::PlanMode::Inactive,
             plan_content: String::new(),
-            goals: crate::engine::goal::GoalManager::default(),
             subs: std::collections::HashMap::new(),
-            goal_input: String::new(),
             copy_flash: None,
             chips_row_w: 0.0,
-            panel_widths: [0.0; 5],
+            panel_widths: [0.0; 4],
             status: String::new(),
             error: None,
             ws_input: ws_current.clone().unwrap_or_default(),
@@ -206,11 +200,9 @@ impl ChatTab {
                 let (mode, content) = crate::engine::plan::fold_plan_state(&s.events);
                 self.plan_mode = mode;
                 self.plan_content = content;
-                // 从会话事件恢复目+ 子代
-                self.goals = crate::engine::goal::GoalManager::default();
+                // 从会话事件恢复子代理状态
                 self.subs.clear();
                 for ev in &s.events {
-                    self.goals.apply(ev);
                     if ev.r#type == types::SUBAGENT_DESCRIPTOR {
                         if let Some(d) = ev.data.as_ref().and_then(|d| {
                             serde_json::from_value::<crate::engine::subagent::SubagentDescriptor>(
@@ -350,10 +342,6 @@ impl ChatTab {
                                     s.title = t.to_string();
                                 }
                             }
-                        }
-                        // 目标事件：fold 更新目标卡片
-                        if event.r#type == types::GOAL_CHANGE {
-                            self.goals.apply(&event);
                         }
                         // 子代理事件：更新子代理卡片（事件含完descriptor
                         if event.r#type == types::SUBAGENT_DESCRIPTOR {
@@ -1170,11 +1158,6 @@ impl ChatTab {
             .values()
             .filter(|d| d.status == "running")
             .count();
-        let goals_list = self.goals.list();
-        let goals_active = goals_list
-            .iter()
-            .filter(|g| matches!(g.phase, crate::engine::goal::GoalPhase::Active))
-            .count();
         let jobs_live = self
             .engine
             .lock()
@@ -1218,14 +1201,6 @@ impl ChatTab {
                 label,
                 subs_running > 0,
                 tr(lang, "子代理", "Subagents").to_string(),
-            ));
-        }
-        if !goals_list.is_empty() {
-            chips.push((
-                PanelKind::Goals,
-                format!("🎯 {goals_active}/{}", goals_list.len()),
-                goals_active > 0,
-                tr(lang, "目标", "Goals").to_string(),
             ));
         }
         if jobs_live > 0 {
@@ -1323,7 +1298,6 @@ impl ChatTab {
                             match kind {
                                 PanelKind::Plan => self.render_plan_items(ui, &plan_items),
                                 PanelKind::Subagents => self.render_subagents_card(ui),
-                                PanelKind::Goals => self.render_goals_card(ui, session),
                                 PanelKind::Jobs => self.render_jobs_card(ui, &session.id),
                                 PanelKind::None => {}
                             }
@@ -1418,126 +1392,6 @@ impl ChatTab {
                     }
                 }
             });
-    }
-
-    /// 目标卡片：fold goal/change 事件；操作经 engine.goal_op 持久化
-    fn render_goals_card(&mut self, ui: &mut egui::Ui, session: &RenderSession) {
-        // 直接在状态卡内渲染（外层 status_panel 提供卡片边框与自适应宽度），
-        // 列表限高防撑爆——不写死卡片高度。
-        // 新建目标输入
-        let mut create_obj: Option<String> = None;
-        let lang = self.lang;
-        ui.horizontal(|ui| {
-            // 胶囊输入框：与 mini_button 等高（24px）同圆角/配色风格
-            //（历史缺陷：默认 TextEdit 与创建按钮不等高、风格突兀）
-            ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
-            let edit = TextEdit::singleline(&mut self.goal_input)
-                .hint_text(
-                    RichText::new(tr(lang, "新目标描述…", "New goal…"))
-                        .size(11.5)
-                        .color(Theme::text_faint()),
-                )
-                .font(egui::FontId::proportional(11.5))
-                .text_color(Theme::text())
-                .frame(
-                    egui::Frame::default()
-                        .fill(Theme::bg_elevated())
-                        .stroke(egui::Stroke::new(1.0, Theme::border()))
-                        .corner_radius(egui::CornerRadius::same(8))
-                        .inner_margin(egui::Margin::symmetric(10, 3)),
-                );
-            let resp = ui.add_sized([220.0, 24.0], edit);
-            let clicked = Theme::mini_button(ui, tr(lang, "创建", "Create"), ChipTint::Accent)
-                .clicked()
-                || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-            if clicked && !self.goal_input.trim().is_empty() {
-                create_obj = Some(self.goal_input.trim().to_string());
-                self.goal_input.clear();
-            }
-        });
-        ui.add_space(2.0);
-        let goals: Vec<crate::engine::goal::Goal> =
-            self.goals.list().iter().map(|g| (*g).clone()).collect();
-        let mut ops: Vec<(String, crate::engine::goal::GoalOp)> = Vec::new();
-        ScrollArea::vertical()
-            .max_height(260.0)
-            .id_salt("goals_card_scroll")
-            .show(ui, |ui| {
-                use crate::engine::goal::{GoalOp, GoalPhase};
-                ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
-                for g in &goals {
-                    let (color, done) = match g.phase {
-                        GoalPhase::Active => (Theme::ok(), false),
-                        GoalPhase::Paused => (Theme::warn(), false),
-                        GoalPhase::Blocked => (Theme::err(), false),
-                        GoalPhase::Complete => (Theme::text_faint(), true),
-                    };
-                    // 目标文字独立成块（换行）——历史缺陷：与状态/按钮同一
-                    // horizontal 且不 wrap，长目标把 active/完成/暂停/阻塞
-                    // 挤得重叠错乱。
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("●").size(12.0).color(color));
-                        let text = RichText::new(g.objective.clone()).size(12.0).color(color);
-                        let text = if done { text.strikethrough() } else { text };
-                        ui.add(egui::Label::new(text).wrap());
-                    });
-                    // 状态 + 操作按钮独立一行（左状态、右按钮，不再挤压文字）
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(g.phase.as_str())
-                                .size(10.5)
-                                .color(Theme::text_faint()),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                            if g.phase != GoalPhase::Complete
-                                && Theme::mini_button(ui, &tr(lang, "完成", "Complete"), ChipTint::Accent).clicked()
-                            {
-                                ops.push((g.id.clone(), GoalOp::Complete));
-                            }
-                            if g.phase == GoalPhase::Active
-                                && Theme::mini_button(ui, &tr(lang, "暂停", "Pause"), ChipTint::Neutral).clicked()
-                            {
-                                ops.push((g.id.clone(), GoalOp::Pause));
-                            }
-                            if g.phase == GoalPhase::Paused
-                                && Theme::mini_button(ui, &tr(lang, "恢复", "Resume"), ChipTint::Accent).clicked()
-                            {
-                                ops.push((g.id.clone(), GoalOp::Resume));
-                            }
-                            if g.phase == GoalPhase::Active
-                                && Theme::mini_button(ui, &tr(lang, "阻塞", "Block"), ChipTint::Danger).clicked()
-                            {
-                                ops.push((g.id.clone(), GoalOp::Block));
-                            }
-                        });
-                    });
-                    ui.add_space(4.0);
-                }
-                if goals.is_empty() {
-                    ui.label(Theme::dim(&tr(
-                        lang,
-                        "暂无目标。告诉 AI 创建，或在上方输入后点「创建」。",
-                        "No goals. Ask the AI to create one, or enter above and click Create.",
-                    )));
-                }
-            });
-        // 执行操作（引goal_op goal/change 事件持久+ 通知，pump 回灌 fold
-        if let Some(obj) = create_obj {
-            let gid = format!("g-{}", crate::util::simple_id());
-            let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
-            let _ = engine.goal_op(
-                &session.id,
-                crate::engine::goal::GoalOp::Create,
-                &gid,
-                Some(&obj),
-            );
-        }
-        for (gid, op) in ops {
-            let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
-            let _ = engine.goal_op(&session.id, op, &gid, None);
-        }
-        ui.add_space(4.0);
     }
 
     /// 子代理卡片：fold subagent/descriptor 事件（持久化，重放可恢复）
@@ -4216,7 +4070,6 @@ pub enum SendMode {
 pub enum PanelKind {
     None,
     Plan,
-    Goals,
     Subagents,
     Jobs,
 }
@@ -4289,7 +4142,6 @@ fn summarize_tool_call(name: &str, args: &str) -> (String, String) {
         ("web_search", "网页搜索"),
         ("todo_write", "更新任务"),
         ("ask_user", "询问用户"),
-        ("goal_create", "创建目标"),
         ("plan_write", "制定计划"),
         ("exit_plan_mode", "退出计划"),
         ("subagent_fork", "派生子代理"),

@@ -739,7 +739,7 @@ impl DshEngine {
             if !s.messages.is_empty() || s.running {
                 // 共享内存的 events/messages 可能是旧快照（回合中只同步 messages，
                 // 不回写 events；而 store 由 agent 线程持续追加）——用 store 的
-                // 最新内容补齐，否则打开会话重放会缺 GOAL_CHANGE / PLAN_MODE /
+                // 最新内容补齐，否则打开会话重放会缺 PLAN_MODE /
                 // SUBAGENT_DESCRIPTOR / 新消息（历史回归："界面端一直不更新"、
                 // "发送的消息偶尔会消失"：shared 快照旧 → 切回会话看不到新消息）。
                 let mut s = s;
@@ -759,7 +759,7 @@ impl DshEngine {
             if !s.messages.is_empty() {
                 let mut s = s.clone();
                 // 同上：events/messages 用 store 补齐（回合中追加的
-                // goal/plan/subagent 事件与新消息）
+                // plan/subagent 事件与新消息）
                 if let Ok(loaded) = self.store.load_session(session_id) {
                     if loaded.events.len() > s.events.len() {
                         s.events = loaded.events;
@@ -1102,40 +1102,6 @@ impl DshEngine {
             .all_tools()
             .iter()
             .any(|t| t.name == name)
-    }
-
-    /// UI 驱动的目标操作：goal/change 事件写入会话日志（持久化 + 通知），
-    /// 与 goal_create 工具同一事件通道，重放 fold 恢复目标状态。
-    pub fn goal_op(
-        &mut self,
-        session_id: &str,
-        op: crate::engine::goal::GoalOp,
-        goal_id: &str,
-        objective: Option<&str>,
-    ) -> Result<()> {
-        let ev = crate::engine::goal::goal_change_event(op, goal_id, objective);
-        // 会话已删除：不落盘（append 的 create(true) 会重建已删除会话的文件）
-        if !self.sessions.contains_key(session_id)
-            && !lock_shared(&self.sessions_shared).contains_key(session_id)
-        {
-            return Err(anyhow::anyhow!("session not found: {session_id}"));
-        }
-        if let Some(s) = self.sessions.get_mut(session_id) {
-            s.push_event(ev.clone());
-        }
-        {
-            let mut shared = lock_shared(&self.sessions_shared);
-            if let Some(s) = shared.get_mut(session_id) {
-                s.push_event(ev.clone());
-            }
-        }
-        self.store.append(session_id, &ev)?;
-        let _ = self.tx.send(EngineEvent::Event {
-            session_id: session_id.to_string(),
-            event: ev,
-        });
-        info!("goal op {} on {goal_id} for {session_id}", op.as_str());
-        Ok(())
     }
 
     /// 当前工作区根目录。
@@ -2905,7 +2871,6 @@ async fn run_turn_inner(
             // 协作机制引导 + 输出风格
             persona.push_str(
                 "\n\nCollaboration mechanisms:\n\
-                 - Goals: long-term objective → goal_create.\n\
                  - Plan: complex multi-step → plan_write, then exit_plan_mode.\n\
                  - Subagents: independent subtasks → subagent_fork (parallel).\n\
                  - Jobs: automatic.\n\
@@ -3458,51 +3423,6 @@ async fn run_turn_inner(
                 info!("ask_user: turn paused awaiting user for {session_id}");
                 break 'outer;
             }
-            // goal_create：写入 goal/change 事件（goal 面板 fold 恢复）
-            if tc.function.name == "goal_create" {
-                if let Some(obj) = parsed_args.get("objective").and_then(|v| v.as_str()) {
-                    let gid = format!("g-{}", uuid());
-                    let gev = crate::engine::goal::goal_change_event(
-                        crate::engine::goal::GoalOp::Create,
-                        &gid,
-                        Some(obj),
-                    );
-                    append_alive(&store, sessions_shared, session_id, &gev)?;
-                    let _ = tx.send(EngineEvent::Event {
-                        session_id: session_id.to_string(),
-                        event: gev,
-                    });
-                    info!("goal created {gid}: {obj}");
-                }
-            }
-            // goal_create：创建长期目标（Goals 卡片显示 + goal/change 事件
-            // 持久化，重放恢复）。历史缺陷：dispatch 层只返回"目标已创建"
-            // 假成功，goal_op 从未被调用 → 无事件 → Goals 卡片永远为空
-            //（用户实测：AI 说创建成功、芯片亮了、卡片里什么都没有）。
-            if tc.function.name == "goal_create" {
-                if let Some(objective) =
-                    parsed_args.get("objective").and_then(|v| v.as_str())
-                {
-                    let objective = objective.trim();
-                    if !objective.is_empty() {
-                        let gid = format!("g-{}", crate::util::simple_id());
-                        // goal_op 需 &mut engine——回合线程持有的是克隆,
-                        // 这里直接构造事件走 append_alive（与 plan_write 同
-                        // 一模式），UI pump fold + 重放恢复都吃同一事件。
-                        let gev = crate::engine::goal::goal_change_event(
-                            crate::engine::goal::GoalOp::Create,
-                            &gid,
-                            Some(objective),
-                        );
-                        append_alive(&store, sessions_shared, session_id, &gev)?;
-                        let _ = tx.send(EngineEvent::Event {
-                            session_id: session_id.to_string(),
-                            event: gev,
-                        });
-                        info!("goal created for {session_id}: {objective}");
-                    }
-                }
-            }
             // plan_write：进入计划模式并写入计划内容（聊天界面计划卡片显示）
             if tc.function.name == "plan_write" {
                 if let Some(content) = parsed_args.get("content").and_then(|v| v.as_str()) {
@@ -3705,32 +3625,6 @@ mod tests {
         settings.plugins_dir = Some(td_plugins.join("plugins"));
         let engine = DshEngine::new(settings, tx).expect("engine");
         (engine, rx)
-    }
-
-    /// goal_create 事件链：goal_change_event(Create) → GoalManager.apply
-    /// fold 出 Active 目标（UI 卡片数据源）。历史缺陷回归锚点：goal_create
-    /// 曾是假桩，无事件 → 卡片永远为空。
-    #[test]
-    fn goal_create_event_folds_into_card() {
-        let mut mgr = crate::engine::goal::GoalManager::default();
-        let ev = crate::engine::goal::goal_change_event(
-            crate::engine::goal::GoalOp::Create,
-            "g-test",
-            Some("完成体素游戏"),
-        );
-        mgr.apply(&ev);
-        let list = mgr.list();
-        assert_eq!(list.len(), 1, "创建后应有 1 个目标");
-        assert_eq!(list[0].objective, "完成体素游戏");
-        assert!(matches!(list[0].phase, crate::engine::goal::GoalPhase::Active));
-        // 完成后 Complete + 删除语义
-        let done = crate::engine::goal::goal_change_event(
-            crate::engine::goal::GoalOp::Complete,
-            "g-test",
-            None,
-        );
-        mgr.apply(&done);
-        assert!(matches!(mgr.list()[0].phase, crate::engine::goal::GoalPhase::Complete));
     }
 
     /// 删除本地插件：停进程 → 删目录 → 注册表清除；名称穿越/不存在
