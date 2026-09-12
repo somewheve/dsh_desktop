@@ -40,6 +40,8 @@ pub struct ExtensionsTab {
     dsh_plugins: Vec<(String, String)>,
     /// 本地已装 DSH 插件名
     local_plugins: Vec<String>,
+    /// 本地插件过滤词（197 个插件太多,标题/ID 子串过滤）
+    local_filter: String,
     bg_rx: Option<Receiver<String>>,
     busy: bool,
     status: String,
@@ -48,6 +50,8 @@ pub struct ExtensionsTab {
     web_restart: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// 待确认删除的插件名（两段式：第一次点 ✕ 进入确认态，再点执行）
     pending_remove: Option<String>,
+    /// 论文扩展卸载确认（两段式）
+    paper_uninstall_confirm: bool,
     /// 本帧收集的插件操作（ui 结束后统一短锁执行）
     actions: Vec<ExtAction>,
 }
@@ -60,10 +64,12 @@ impl ExtensionsTab {
             tab: ExtTab::Installed,
             dsh_plugins: Vec::new(),
             local_plugins: Vec::new(),
+            local_filter: String::new(),
             bg_rx: None,
             busy: false,
             web_restart: None,
             pending_remove: None,
+            paper_uninstall_confirm: false,
             status: String::new(),
             error: None,
             actions: Vec::new(),
@@ -148,7 +154,7 @@ impl ExtensionsTab {
         self.busy = true;
         self.status = String::new();
         self.error = None;
-        std::thread::Builder::new()
+        let spawn_res = std::thread::Builder::new()
             .name("ext-op".into())
             .spawn(move || {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
@@ -161,15 +167,13 @@ impl ExtensionsTab {
                         let _ = tx.send(format!("__DONE__ err: {e}"));
                     }
                 }
-            })
-            .map_err(|e| e.to_string())
-            .err()
-            .map(|e| {
-                // 线程启动失败：立即解除 busy 并提示（否则面板永久卡"操作中"）
-                self.busy = false;
-                self.error = Some(format!("后台线程启动失败: {e}"));
-                self.bg_rx = None;
             });
+        // 线程启动失败：立即解除 busy 并提示（否则面板永久卡"操作中"）
+        if let Some(e) = spawn_res.err() {
+            self.busy = false;
+            self.error = Some(format!("后台线程启动失败: {e}"));
+            self.bg_rx = None;
+        }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -327,6 +331,242 @@ impl ExtensionsTab {
         }
     }
 
+    // ================= 内置扩展：论文搜索 =================
+    /// 内置扩展卡片：paper_search（多源学术聚合）。与子进程插件区分：
+    /// 原生 Rust 实现，无进程管理；支持源级配置 / 停用 / 卸载（可恢复）。
+    fn ui_builtin_paper(&mut self, ui: &mut egui::Ui, lang: Lang) {
+        ui.label(Theme::card_section_title(&tr(lang, "内置扩展", "Built-in extensions")));
+        ui.add_space(4.0);
+        let cfg = self
+            .engine
+            .lock()
+            .map(|e| e.paper_search_cfg())
+            .unwrap_or_default();
+        let mut next = cfg.clone();
+
+        Theme::card().show(ui, |ui| {
+            ui.set_max_width(560.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("📚").size(14.0));
+                ui.label(
+                    RichText::new("paper-search")
+                        .size(13.5)
+                        .strong()
+                        .color(Theme::accent_light()),
+                );
+                // 状态徽标
+                let (pill, color) = if cfg.uninstalled {
+                    (tr(lang, "已卸载", "uninstalled"), Theme::text_faint())
+                } else if cfg.enabled {
+                    (tr(lang, "运行中", "active"), Theme::ok())
+                } else {
+                    (tr(lang, "已停用", "disabled"), Theme::warn())
+                };
+                ui.label(
+                    RichText::new(format!("· {pill}"))
+                        .size(10.5)
+                        .color(color),
+                );
+                ui.label(
+                    RichText::new(tr(
+                        lang,
+                        "· 原生实现 · agent 工具 paper_search",
+                        "· native · agent tool paper_search",
+                    ))
+                    .size(10.5)
+                    .color(Theme::text_faint()),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                    if cfg.uninstalled {
+                        if Theme::mini_button(
+                            ui,
+                            &tr(lang, "恢复", "Restore"),
+                            ChipTint::Accent,
+                        )
+                        .on_hover_text(tr(
+                            lang,
+                            "重新装回（恢复默认配置）",
+                            "Reinstall (default config)",
+                        ))
+                        .clicked()
+                        {
+                            next = crate::core::paper::PaperSearchConfig::default();
+                            self.paper_uninstall_confirm = false;
+                            self.status = tr(lang, "已恢复论文搜索扩展", "Paper-search restored").into();
+                        }
+                    } else {
+                        // 卸载（两段式确认）
+                        let lbl: String = if self.paper_uninstall_confirm {
+                            "OK".to_string()
+                        } else {
+                            tr(lang, "卸载", "Uninstall").to_string()
+                        };
+                        if Theme::mini_button(ui, &lbl, ChipTint::Danger)
+                            .on_hover_text(tr(
+                                lang,
+                                "卸载后 agent 不再有 paper_search 工具（可随时恢复）",
+                                "Removes the paper_search tool (restorable)",
+                            ))
+                            .clicked()
+                        {
+                            if self.paper_uninstall_confirm {
+                                next.uninstalled = true;
+                                next.enabled = false;
+                                self.paper_uninstall_confirm = false;
+                                self.status =
+                                    tr(lang, "已卸载论文搜索扩展", "Paper-search uninstalled").into();
+                            } else {
+                                self.paper_uninstall_confirm = true;
+                            }
+                        }
+                        if self.paper_uninstall_confirm {
+                            ui.label(
+                                RichText::new(tr(lang, "再点一次确认", "click again"))
+                                    .size(10.0)
+                                    .color(Theme::err()),
+                            );
+                        }
+                        // 总开关
+                        let (tl, tt) = if cfg.enabled {
+                            (
+                                tr(lang, "停用", "Disable"),
+                                tr(lang, "临时停用（保留配置）", "temporarily off (config kept)"),
+                            )
+                        } else {
+                            (tr(lang, "启用", "Enable"), tr(lang, "启用扩展", "enable"))
+                        };
+                        if Theme::mini_button(ui, tl, ChipTint::Neutral)
+                            .on_hover_text(tt)
+                            .clicked()
+                        {
+                            next.enabled = !cfg.enabled;
+                        }
+                    }
+                });
+            });
+
+            if !cfg.uninstalled {
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+                // 源配置：每源一行（checkbox + 说明）
+                ui.label(
+                    RichText::new(tr(lang, "搜索源", "Sources"))
+                        .size(11.5)
+                        .color(Theme::text_dim()),
+                );
+                for (key, desc) in crate::core::paper::SOURCES {
+                    let on = cfg.source_enabled(key);
+                    let mut toggle = on;
+                    ui.checkbox(
+                        &mut toggle,
+                        RichText::new(format!("{key} — {desc}"))
+                            .size(11.5)
+                            .color(Theme::text()),
+                    )
+                    .on_hover_text(tr(
+                        lang,
+                        "勾选启用此源（并发查询；单源故障不影响其余）",
+                        "enable this source (parallel; failures isolated)",
+                    ));
+                    if toggle != on {
+                        next.set_source(key, toggle);
+                    }
+                }
+                ui.add_space(4.0);
+                // 条数 + 超时
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                    ui.label(
+                        RichText::new(tr(lang, "每源条数:", "Per-source limit:"))
+                            .size(11.5)
+                            .color(Theme::text_dim()),
+                    );
+                    if Theme::mini_button(ui, "−", ChipTint::Neutral).clicked() {
+                        next.max_per_source = next.max_per_source.saturating_sub(1).max(1);
+                    }
+                    ui.label(
+                        RichText::new(format!("{}", cfg.max_per_source))
+                            .size(12.0)
+                            .color(Theme::text()),
+                    );
+                    if Theme::mini_button(ui, "＋", ChipTint::Neutral).clicked() {
+                        next.max_per_source = (next.max_per_source + 1).min(20);
+                    }
+                    ui.label(
+                        RichText::new(tr(lang, "超时(秒):", "Timeout (s):"))
+                            .size(11.5)
+                            .color(Theme::text_dim()),
+                    );
+                    if Theme::mini_button(ui, "−2", ChipTint::Neutral).clicked() {
+                        next.timeout_secs = next.timeout_secs.saturating_sub(2).max(3);
+                    }
+                    ui.label(
+                        RichText::new(format!("{}", cfg.timeout_secs))
+                            .size(12.0)
+                            .color(Theme::text()),
+                    );
+                    if Theme::mini_button(ui, "＋2", ChipTint::Neutral).clicked() {
+                        next.timeout_secs = (next.timeout_secs + 2).min(60);
+                    }
+                    // 连通性测试（真实发一次查询）
+                    if Theme::mini_button(ui, &tr(lang, "测试", "Test"), ChipTint::Accent)
+                        .on_hover_text(tr(
+                            lang,
+                            "用 quantum 查询实测各源连通性（走系统网络/代理）",
+                            "probe sources with a quantum query",
+                        ))
+                        .clicked()
+                    {
+                        self.busy = true;
+                        self.status = String::new();
+                        self.error = None;
+                        let cfg2 = cfg.clone();
+                        let proxy = self
+                            .engine
+                            .lock()
+                            .ok()
+                            .and_then(|e| e.settings().http_proxy.clone());
+                        let (tx, rx) = std::sync::mpsc::channel::<String>();
+                        self.bg_rx = Some(rx);
+                        std::thread::Builder::new()
+                            .name("paper-test".into())
+                            .spawn(move || {
+                                let (hits, errs) = crate::core::paper::search(
+                                    "quantum computing",
+                                    &cfg2,
+                                    proxy.as_deref(),
+                                );
+                                let msg = if errs.is_empty() {
+                                    format!("__DONE__ ok {} 条", hits.len())
+                                } else {
+                                    format!(
+                                        "__DONE__ ok {} 条；不可达: {}",
+                                        hits.len(),
+                                        errs.iter()
+                                            .map(|(k, _)| k.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )
+                                };
+                                let _ = tx.send(msg);
+                            })
+                            .ok();
+                    }
+                });
+            }
+        });
+        ui.add_space(8.0);
+
+        // 配置落盘（有变化才写）
+        if next != cfg {
+            if let Ok(mut e) = self.engine.lock() {
+                e.set_paper_search_cfg(next);
+            }
+        }
+    }
+
     // ================= 已安装（管理） =================
     fn ui_installed(
         &mut self,
@@ -336,6 +576,7 @@ impl ExtensionsTab {
         skills_dir: &std::path::Path,
         domain_of: &std::collections::HashMap<String, String>,
     ) {
+        self.ui_builtin_paper(ui, lang);
         ui.horizontal(|ui| {
             ui.label(Theme::card_section_title(&tr(
                 lang,
@@ -540,11 +781,41 @@ impl ExtensionsTab {
                 "No locally installed DSH plugins (profiles/node_modules). Use Remote tab to fetch online.",
             )));
         } else {
+            // 过滤框（与技能页/会话搜索同族的紧凑胶囊）
+            ui.add(
+                egui::TextEdit::singleline(&mut self.local_filter)
+                    .hint_text(
+                        RichText::new(tr(lang, "🔍 过滤插件…", "🔍 Filter plugins…"))
+                            .size(10.5)
+                            .color(Theme::text_faint()),
+                    )
+                    .desired_width(260.0)
+                    .font(egui::FontId::proportional(10.5))
+                    .text_color(Theme::text_dim())
+                    .frame(
+                        egui::Frame::default()
+                            .fill(Theme::bg())
+                            .stroke(egui::Stroke::new(1.0, Theme::border()))
+                            .corner_radius(egui::CornerRadius::same(7))
+                            .inner_margin(egui::Margin::symmetric(8, 4)),
+                    ),
+            );
+            ui.add_space(2.0);
+            let q = self.local_filter.trim().to_lowercase();
+            let shown: Vec<String> = self
+                .local_plugins
+                .iter()
+                .filter(|n| q.is_empty() || n.to_lowercase().contains(&q))
+                .cloned()
+                .collect();
+            if shown.is_empty() {
+                ui.label(Theme::dim(&tr(lang, "无匹配插件", "No matching plugins")));
+            }
             ScrollArea::vertical()
                 .max_height(120.0)
                 .id_salt("local_dsh_plugins")
                 .show(ui, |ui| {
-                    for name in self.local_plugins.clone() {
+                    for name in shown {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("•").color(Theme::accent_light()));
                             ui.label(RichText::new(&name).size(12.0).color(Theme::text()));

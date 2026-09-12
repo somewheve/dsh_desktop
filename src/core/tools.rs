@@ -67,6 +67,13 @@ pub struct ToolRegistry {
     workspace_root: Option<PathBuf>,
     /// HTTP 代理（内置 web_search 走系统出口；None = 直连）
     http_proxy: Option<String>,
+    /// 论文搜索内置扩展配置（卸载/停用 → 工具不列出）
+    pub paper_cfg: crate::core::paper::PaperSearchConfig,
+    /// 编辑审批门（开启时写工具改动入待确认队列）
+    pub review_edits: bool,
+    /// 待确认编辑队列（引擎共享）
+    pub edits_queue:
+        Option<std::sync::Arc<std::sync::Mutex<Vec<crate::core::agent::PendingEdit>>>>,
 }
 
 impl ToolRegistry {
@@ -81,6 +88,9 @@ impl ToolRegistry {
             sandbox: None,
             workspace_root: None,
             http_proxy: None,
+            paper_cfg: crate::core::paper::PaperSearchConfig::default(),
+            review_edits: false,
+            edits_queue: None,
         }
     }
 
@@ -102,6 +112,9 @@ impl ToolRegistry {
             sandbox: self.sandbox.clone(),
             workspace_root: self.workspace_root.clone(),
             http_proxy: self.http_proxy.clone(),
+            paper_cfg: self.paper_cfg.clone(),
+            review_edits: self.review_edits,
+            edits_queue: self.edits_queue.clone(),
         }
     }
 
@@ -116,6 +129,47 @@ impl ToolRegistry {
     pub fn with_http_proxy(&self, proxy: Option<String>) -> Self {
         let mut r = self.clone_for_preset();
         r.http_proxy = proxy;
+        r
+    }
+
+    /// 编辑审批门开启时入队（读原内容在写入前!由调用方保证顺序）。
+    fn enqueue_edit(&self, path: &str, original: Option<String>, note: &str) {
+        if !self.review_edits {
+            return;
+        }
+        let Some(q) = &self.edits_queue else { return };
+        let sid = q as *const _ as usize; // 占位;真实 sid 由 note 携带场景
+        let _ = sid;
+        q.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(crate::core::agent::PendingEdit {
+                id: format!("ed-{}", crate::util::simple_id()),
+                path: path.to_string(),
+                original,
+                note: note.to_string(),
+                session_id: String::new(),
+            });
+        log::info!("edit queued for review: {path} ({note})");
+    }
+
+    /// 绑定编辑审批门（设置开关 + 引擎队列）。
+    pub fn with_review_edits(
+        &self,
+        on: bool,
+        queue: std::sync::Arc<
+            std::sync::Mutex<Vec<crate::core::agent::PendingEdit>>,
+        >,
+    ) -> Self {
+        let mut r = self.clone_for_preset();
+        r.review_edits = on;
+        r.edits_queue = Some(queue);
+        r
+    }
+
+    /// 绑定论文搜索扩展配置。
+    pub fn with_paper_cfg(&self, cfg: crate::core::paper::PaperSearchConfig) -> Self {
+        let mut r = self.clone_for_preset();
+        r.paper_cfg = cfg;
         r
     }
 
@@ -391,9 +445,19 @@ impl ToolRegistry {
                 json!({"type":"object","properties":{"path":{"type":"string","description":"搜索起始目录"},"pattern":{"type":"string","description":"搜索词：文件名子串（支持 * ? 通配符）或内容关键词"}},"required":["path","pattern"]}),
             ),
             tool_spec(
+                "memory_write",
+                "写入一条长期记忆（跨会话持久:用户偏好、项目事实、约定）。当用户说\"记住...\"或你在回合中确认了值得跨会话保留的事实/偏好时调用。每条一行,带时间戳追加到 $DSH_HOME/memory.md,之后每个会话自动注入。",
+                json!({"type":"object","properties":{"note":{"type":"string","description":"记忆内容(一行,自包含,含必要上下文)"}},"required":["note"]}),
+            ),
+            tool_spec(
                 "web_search",
                 "联网搜索最新信息（DuckDuckGo，结果上限 8 条：标题/链接/摘要）。查事实、时效信息、文档时使用。",
                 json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}),
+            ),
+            tool_spec(
+                "paper_search",
+                "学术论文多源聚合搜索（arXiv/Crossref/PubMed/OpenAlex/Semantic Scholar，并发查询去重）。查论文、文献综述、找 DOI/引用数时使用。返回各源归一化条目：标题/作者/年份/期刊/DOI/链接/引用数/摘要片段。",
+                json!({"type":"object","properties":{"query":{"type":"string","description":"检索词（标题/关键词，英文效果最佳）"},"limit":{"type":"integer","description":"每源最大条数（默认 5）"}},"required":["query"]}),
             ),
             tool_spec(
                 "read_url",
@@ -491,6 +555,10 @@ impl ToolRegistry {
                 json!({"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}),
             ),
         ];
+        // 论文搜索内置扩展：停用/卸载 → 不列出（dispatch 侧另有守卫）
+        if !self.paper_cfg.any_source_on() {
+            specs.retain(|s| s.function.name != "paper_search");
+        }
         if let Some(whitelist) = self.preset.tool_whitelist() {
             specs.retain(|s| whitelist.contains(&s.function.name.as_str()));
         }
@@ -528,6 +596,7 @@ impl ToolRegistry {
             "str_replace_editor" => self.tool_str_replace(args),
             "fs_search" => self.tool_fs_search(args),
             "web_search" => self.tool_web_search(args),
+            "paper_search" => self.tool_paper_search(args),
             "take_screenshot" => self.tool_take_screenshot(args),
             "mouse_click" => self.tool_mouse_click(args),
             "mouse_move" => self.tool_mouse_move(args),
@@ -536,6 +605,7 @@ impl ToolRegistry {
             "key_type" => self.tool_key_type(args),
             "key_press" => self.tool_key_press(args),
             "read_url" => self.tool_read_url(args),
+            "memory_write" => self.tool_memory_write(args),
             "read_image" => self.tool_read_image(args),
             "ask_user" => ToolOutput::ok(json!({
                 "await_user": true,
@@ -939,6 +1009,12 @@ impl ToolRegistry {
         let old = std::fs::read_to_string(&path).ok();
         match std::fs::write(&path, content) {
             Ok(()) => {
+                // 编辑审批门:入队(原内容备份;None=新建)
+                self.enqueue_edit(
+                    &path.display().to_string(),
+                    old.clone(),
+                    &format!("write_file {}B", content.len()),
+                );
                 let mut out = json!({"path": path.display().to_string(), "bytes": content.len()});
                 match old {
                     Some(old) => {
@@ -1064,6 +1140,12 @@ impl ToolRegistry {
                 }
                 match std::fs::write(&path, content) {
                     Ok(()) => {
+                        // 编辑审批门：新建(None=回滚即删除)
+                        self.enqueue_edit(
+                            &path.display().to_string(),
+                            None,
+                            &format!("create {}B", content.len()),
+                        );
                         // 新建文件：diff = 全部为新增行（UI diff 卡片可审阅全文）
                         let mut out = json!({
                             "path": path.display().to_string(),
@@ -1109,6 +1191,12 @@ impl ToolRegistry {
                         let new_text = text.replacen(old_str, new_str, 1);
                         match std::fs::write(&path, &new_text) {
                             Ok(()) => {
+                                // 编辑审批门：原内容入队
+                                self.enqueue_edit(
+                                    &path.display().to_string(),
+                                    Some(text.clone()),
+                                    &format!("str_replace {}B→{}B", old_str.len(), new_str.len()),
+                                );
                                 let mut out = json!({
                                     "path": path.display().to_string(),
                                     "replaced": true,
@@ -1506,6 +1594,80 @@ impl ToolRegistry {
             "question": question,
             "note": "图片已就绪。下一回合把此图片路径附加到消息中，vision 模型将分析图片内容。",
         }))
+    }
+
+    /// paper_search：内置论文扩展（多源聚合；扩展页可配置/卸载）。
+    fn tool_paper_search(&self, args: &Value) -> ToolOutput {
+        if !self.paper_cfg.any_source_on() {
+            return ToolOutput::err("论文搜索扩展已停用/卸载（扩展页可重新启用）");
+        }
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if query.is_empty() {
+            return ToolOutput::err("query 不能为空");
+        }
+        let mut cfg = self.paper_cfg.clone();
+        if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+            cfg.max_per_source = (l as usize).clamp(1, 20);
+        }
+        let (hits, errors) = crate::core::paper::search(query, &cfg, self.http_proxy.as_deref());
+        let mut out = json!({
+            "query": query,
+            "count": hits.len(),
+            "results": hits,
+        });
+        if !errors.is_empty() {
+            out["source_errors"] = json!(errors
+                .iter()
+                .map(|(k, e)| format!("{k}: {e}"))
+                .collect::<Vec<_>>());
+        }
+        ToolOutput::ok(out)
+    }
+
+    /// memory_write：长期记忆追加（$DSH_HOME/memory.md;回合循环侧
+    /// 另有一份同路径实现——dispatch 命中时走这里,两者幂等）。
+    fn tool_memory_write(&self, args: &Value) -> ToolOutput {
+        let note = args
+            .get("note")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if note.is_empty() {
+            return ToolOutput::err("note 不能为空");
+        }
+        let home = std::env::var_os("DSH_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(|p| std::path::PathBuf::from(p).join(".dsh"))
+            })
+            .unwrap_or_default();
+        let path = home.join("memory.md");
+        let write = || -> std::io::Result<()> {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            use std::io::Write as _;
+            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M");
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            f.write_all(format!("- [{ts}] {note}
+").as_bytes())
+        };
+        match write() {
+            Ok(()) => ToolOutput::ok(json!({
+                "written": true,
+                "note": note,
+                "path": path.display().to_string(),
+            })),
+            Err(e) => ToolOutput::err(format!("写入失败: {e}")),
+        }
     }
 
     /// web_search：调用 dsh-desktop 自己的搜索通道。
@@ -2460,6 +2622,34 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         }
     }
     rec(pattern.as_bytes(), text.as_bytes())
+}
+
+#[cfg(test)]
+mod paper_tool_tests {
+    use crate::core::tools::ToolRegistry;
+
+    /// 论文扩展：启用 → paper_search 列出；停用/卸载 → 不列出且 dispatch 拒绝。
+    #[test]
+    fn paper_search_spec_gated_by_extension_state() {
+        let reg = ToolRegistry::new(std::path::PathBuf::from("."));
+        assert!(
+            reg.tool_specs().iter().any(|s| s.function.name == "paper_search"),
+            "默认启用应列出"
+        );
+        let mut cfg = reg.paper_cfg.clone();
+        cfg.uninstalled = true;
+        cfg.enabled = false;
+        let off = reg.with_paper_cfg(cfg);
+        assert!(
+            !off.tool_specs().iter().any(|s| s.function.name == "paper_search"),
+            "卸载后不应列出"
+        );
+        let out = off.dispatch(
+            "paper_search",
+            &serde_json::json!({"query": "test"}),
+        );
+        assert!(!out.ok, "卸载后 dispatch 应拒绝: {:?}", out.value);
+    }
 }
 
 #[cfg(test)]

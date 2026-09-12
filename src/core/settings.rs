@@ -15,6 +15,18 @@ pub struct EngineSettings {
     pub model: String,
     /// 推理强度（none/low/high/max；none = 关闭思考，默认 high 走 API 缺省）
     pub reasoning_effort: Option<String>,
+    /// 子代理模型（None = 同主模型；fork 的机械子任务可走便宜档）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_model: Option<String>,
+    /// 编辑审批门：AI 的文件修改先入待确认队列,用户逐项 确认/回滚
+    #[serde(default)]
+    pub review_edits: bool,
+    /// 已归档会话 id（list_sessions 过滤;文件保留）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archived_sessions: Vec<String>,
+    /// 论文搜索内置扩展配置（源开关/条数/超时/卸载）
+    #[serde(default)]
+    pub paper_search: crate::core::paper::PaperSearchConfig,
     /// 沙箱模式（danger-full-access / workspace-write / read-only；重启恢复）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox_mode: Option<String>,
@@ -54,10 +66,25 @@ pub struct StoredTokenUsage {
 pub struct StoredScheduledTask {
     pub id: String,
     pub name: String,
+    /// interval | daily | once（旧配置无此字段 → interval）
+    #[serde(default = "default_sched_kind")]
+    pub kind: String,
     pub interval_secs: u64,
+    /// daily/once：本地时:分
+    #[serde(default)]
+    pub at_hour: u32,
+    #[serde(default)]
+    pub at_min: u32,
+    /// once：目标日期（unix 秒，本地 00:00 基准）
+    #[serde(default)]
+    pub at_date: i64,
     pub prompt: String,
     pub session_id: String,
     pub enabled: bool,
+}
+
+fn default_sched_kind() -> String {
+    "interval".into()
 }
 
 impl Default for EngineSettings {
@@ -66,6 +93,10 @@ impl Default for EngineSettings {
             api_key: None,
             model: "deepseek-v4-flash".into(),
             reasoning_effort: None,
+            subagent_model: None,
+            review_edits: false,
+            archived_sessions: Vec::new(),
+            paper_search: crate::core::paper::PaperSearchConfig::default(),
             sandbox_mode: None,
             base_url: "https://api.deepseek.com".into(),
             http_proxy: None,

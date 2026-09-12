@@ -160,7 +160,7 @@ impl CodeBrowser {
                 ui.painter().galley(
                     egui::pos2(
                         rect.left() + 8.0,
-                        rect.center().y - galley.size().y / 2.0,
+                        rect.center().y - galley.mesh_bounds.height() / 2.0 - galley.mesh_bounds.min.y,
                     ),
                     galley,
                     egui::Color32::WHITE,

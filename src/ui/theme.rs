@@ -362,11 +362,8 @@ impl Theme {
         style.visuals.widgets.hovered.bg_fill = Self::bg_hover();
         style.visuals.widgets.hovered.fg_stroke.color = Self::text();
         style.visuals.widgets.active.bg_fill = Self::accent();
-        style.visuals.widgets.active.fg_stroke.color = if light {
-            Color32::WHITE
-        } else {
-            Color32::WHITE
-        };
+        // accent 底上白字在深浅主题下均可读（原 if light 分支两臂同值）
+        style.visuals.widgets.active.fg_stroke.color = Color32::WHITE;
         // 双槽写入（否则系统浅色模式下整个主题被忽略）
         ctx.set_style_of(egui::Theme::Dark, style.clone());
         ctx.set_style_of(egui::Theme::Light, style);
@@ -388,30 +385,35 @@ impl Theme {
 
     /// 导航项（选中高亮）。
     pub fn nav_button(ui: &mut egui::Ui, label: &str, icon: &str, selected: bool) -> bool {
+        // ZCode 式导航：选中 = 高亮底色整行 + 亮字；未选中 = 弱灰字，
+        // hover 极淡提亮；不用左侧强调条（与列表选中语言一致）
         let text = format!("{icon}  {label}");
         let (text_color, fill) = if selected {
-            (Self::accent_light(), Self::bg_hover())
+            (Self::text(), Self::bg_hover().gamma_multiply(0.8))
         } else {
-            (Self::text_dim(), egui::Color32::TRANSPARENT)
+            (Self::text_faint(), egui::Color32::TRANSPARENT)
         };
-        let size = Vec2::new(ui.available_width().max(120.0), 34.0);
+        let size = Vec2::new(ui.available_width().max(120.0), 32.0);
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+        // 高亮框内缩（与会话行同语言）：左 8px/右 4px 的可见边距
+        let fill_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 8.0, rect.top() + 1.0),
+            egui::pos2(rect.right() - 4.0, rect.bottom() - 1.0),
+        );
         if resp.hovered() && !selected {
             ui.painter()
-                .rect_filled(rect, 7.0, Self::bg_hover().gamma_multiply(0.5));
+                .rect_filled(fill_rect, 7.0, Self::bg_hover().gamma_multiply(0.3));
         } else if selected {
-            ui.painter().rect_filled(rect, 7.0, fill);
-            // 左侧强调条（2px）：选中态的"大气"表达——不靠重底色抢视觉
-            let bar = egui::Rect::from_min_max(
-                egui::pos2(rect.left() + 4.0, rect.top() + 7.0),
-                egui::pos2(rect.left() + 6.0, rect.bottom() - 7.0),
-            );
-            ui.painter().rect_filled(bar, 1.0, Self::accent());
+            ui.painter().rect_filled(fill_rect, 7.0, fill);
         }
         let galley =
             ui.painter()
                 .layout(text, FontId::proportional(13.5), text_color, f32::INFINITY);
-        let text_pos = egui::pos2(rect.left() + 16.0, rect.center().y - galley.size().y / 2.0);
+        let mb = galley.mesh_bounds;
+        let text_pos = egui::pos2(
+            rect.left() + 14.0,
+            rect.center().y - mb.height() / 2.0 - mb.min.y,
+        );
         ui.painter().galley(text_pos, galley, egui::Color32::WHITE);
         // painter 绘制不进 accessibility 树，手动补上（屏幕阅读器可导航）
         resp.widget_info(|| {

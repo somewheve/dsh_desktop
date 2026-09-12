@@ -907,7 +907,7 @@ fn tools_bash_and_fs() {
     // list_dir
     let out = tools.dispatch("list_dir", &json!({}));
     assert!(out.ok);
-    assert!(out.value["items"].as_array().unwrap().len() >= 1);
+    assert!(!out.value["items"].as_array().unwrap().is_empty());
 }
 
 /// M1：str_replace_editor view/create/str_replace 往返。

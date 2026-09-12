@@ -523,7 +523,6 @@ mod tests {
     /// 错误信息退出 → reap 写 last_error → UI 显示）
     #[test]
     fn reap_records_failure_with_stderr() {
-        use std::io::Write;
         let mut child = Command::new("cmd")
             .args(["/C", "echo profile_not_found>&2 & exit /B 2"])
             .stdout(std::process::Stdio::null())

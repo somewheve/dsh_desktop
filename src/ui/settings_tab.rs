@@ -27,6 +27,8 @@ pub struct SettingsTab {
     default_preset: String,
     api_key: String,
     model: String,
+    /// 子代理模型（空 = 同主模型）
+    subagent_model: String,
     base_url: String,
     /// 沙箱模式（danger-full-access / workspace-write / read-only）
     sandbox_mode: SandboxMode,
@@ -59,6 +61,7 @@ impl SettingsTab {
             default_preset: es.default_preset.clone(),
             api_key: es.api_key.clone().unwrap_or_default(),
             model: es.model.clone(),
+            subagent_model: es.subagent_model.clone().unwrap_or_default(),
             base_url: es.base_url.clone(),
             sandbox_mode,
             engine: runtime,
@@ -110,6 +113,32 @@ impl SettingsTab {
                                 .desired_width(420.0),
                         );
                         ui.end_row();
+                        ui.label(form_label(&tr(lang, "编辑审批:", "Edit review:")));
+                        ui.horizontal(|ui| {
+                            let on = {
+                                let e = self.engine.lock().unwrap();
+                                e.settings().review_edits
+                            };
+                            if Theme::mini_button(
+                                ui,
+                                &tr(lang, if on { "开（AI 改动需确认）" } else { "关（改动直接落盘）" },
+                                     if on { "ON (review AI edits)" } else { "OFF (auto-apply)" }),
+                                if on { ChipTint::Accent } else { ChipTint::Neutral },
+                            )
+                            .on_hover_text(tr(
+                                lang,
+                                "开启后 AI 的每次文件修改先入待确认队列，可逐项 确认保留 / 回滚原内容",
+                                "AI file edits queue for review: confirm or revert each",
+                            ))
+                            .clicked()
+                            {
+                                if let Ok(mut e) = self.engine.lock() {
+                                    e.set_review_edits(!on);
+                                }
+                                self.status = tr(lang, "编辑审批门已切换（下一回合生效）", "Edit review toggled (next turn)").into();
+                            }
+                        });
+                        ui.end_row();
                         ui.label(form_label(&tr(lang, "模型:", "Model:")));
                         ui.horizontal(|ui| {
                             // 下拉：DeepSeek 官方模型表（V4 系列 + legacy），
@@ -143,6 +172,62 @@ impl SettingsTab {
                                 RichText::new(tr(lang, "V4 系列（flash / pro / vision-exp）+ legacy", "V4 series (flash / pro / vision-exp) + legacy"))
                                     .color(Theme::text_faint())
                                     .size(11.0),
+                            );
+                        });
+                        ui.end_row();
+                        ui.label(form_label(&tr(lang, "子代理模型:", "Subagent model:")));
+                        ui.horizontal(|ui| {
+                            // 分级模型：fork 的机械子任务走便宜档；空 = 同主模型
+                            let same = tr(lang, "（同主模型）", "(same as main)");
+                            let mut sel = if self.subagent_model.is_empty() {
+                                same.clone()
+                            } else {
+                                self.subagent_model.clone()
+                            };
+                            egui::ComboBox::from_id_salt("subagent_model_select")
+                                .selected_text(
+                                    RichText::new(&sel)
+                                        .size(12.5)
+                                        .color(Theme::text()),
+                                )
+                                .width(240.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut sel, same.clone(), same.as_str());
+                                    for m in crate::core::llm::DEEPSEEK_MODELS {
+                                        ui.selectable_value(&mut sel, m.to_string(), *m);
+                                    }
+                                });
+                            let picked = if sel == same.clone() {
+                                String::new()
+                            } else {
+                                sel.clone()
+                            };
+                            if picked != self.subagent_model {
+                                self.subagent_model = picked;
+                                // 即时生效 + 持久化（下一回合的 fork 使用）
+                                if let Ok(mut e) = self.engine.lock() {
+                                    let m = if self.subagent_model.is_empty() {
+                                        None
+                                    } else {
+                                        Some(self.subagent_model.clone())
+                                    };
+                                    e.set_subagent_model(m.as_deref());
+                                }
+                                self.status = tr(
+                                    lang,
+                                    "子代理模型已更改（下个 fork 生效）",
+                                    "Subagent model changed (next fork)",
+                                )
+                                .into();
+                            }
+                            ui.label(
+                                RichText::new(tr(
+                                    lang,
+                                    "subagent_fork 走此模型；不填则与主模型相同",
+                                    "subagent_fork uses this model; empty = same as main",
+                                ))
+                                .color(Theme::text_faint())
+                                .size(11.0),
                             );
                         });
                         ui.end_row();
@@ -358,6 +443,8 @@ impl SettingsTab {
                         ui.end_row();
                     });
             });
+            ui.add_space(10.0);
+
             ui.add_space(10.0);
 
             // ===== 操作行（主按钮 + 次级 chips + 状态） =====

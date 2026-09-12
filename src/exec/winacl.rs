@@ -330,7 +330,8 @@ pub struct KillOnCloseJob {
 
 impl KillOnCloseJob {
     /// 创建 Job 并把子进程挂进去。失败返回 None（调用方退化为杀直接子进程）。
-    pub fn attach(child_process: HANDLE) -> Option<Self> {
+    /// pub(crate)：参数是裸 HANDLE，不作为跨 crate API 导出。
+    pub(crate) fn attach(child_process: HANDLE) -> Option<Self> {
         unsafe {
             let job = CreateJobObjectW(ptr::null(), ptr::null());
             if job.is_null() {
@@ -474,7 +475,8 @@ fn wide(p: &Path) -> Vec<u16> {
 /// 匿名管道捕获 stdout/stderr，超时经 Job Object 杀整棵进程树。
 /// 返回 (exit_code, stdout_bytes, stderr_bytes)。
 /// fail-closed：token 构建或 CreateProcessAsUserW 失败即返回 Err，绝不直通。
-pub fn spawn_restricted(
+/// pub(crate)：参数含裸 HANDLE，不作为跨 crate API 导出。
+pub(crate) fn spawn_restricted(
     restricted_token: HANDLE,
     command: &str,
     args: &[&str],

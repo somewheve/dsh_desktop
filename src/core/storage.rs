@@ -22,6 +22,10 @@ pub struct SessionStore {
     pub(crate) tombstones: std::sync::Arc<
         std::sync::Mutex<std::collections::HashSet<String>>,
     >,
+    /// 追加互斥锁：引擎线程（rename/title）、回合线程（事件落盘）、桥
+    /// 并发 append 同一 JSONL 时行交错/撕裂会丢事件（历史偶发根因：
+    /// rename 行被并发写撕掉，load 折叠回旧标题）。必须 Arc 共享。
+    pub(crate) write_lock: std::sync::Arc<std::sync::Mutex<()>>,
     pub(crate) dir: PathBuf,
 }
 
@@ -30,6 +34,7 @@ impl SessionStore {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create session dir {}", dir.display()))?;
         Ok(Self {
+            write_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             dir,
             tombstones: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
@@ -75,13 +80,21 @@ impl SessionStore {
             return Ok(()); // 静默丢弃（调用侧的 session_alive 已 warn）
         }
         let path = self.path_for(session_id);
+        // 串行化追加（跨线程行交错防护——见字段注释）
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
+        // 真·单次 write_all：write! 宏按格式分片多次 write_str（参数 +
+        // 字面量至少两笔 syscall），并发 load 仍可能读到无换行半行
         let line = serde_json::to_string(event)?;
-        writeln!(f, "{line}")?;
+        let buf = format!("{line}\n");
+        f.write_all(buf.as_bytes())?;
         Ok(())
     }
 

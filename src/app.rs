@@ -24,6 +24,7 @@ enum Tab {
     Skills,
     Extensions,
     Code,
+    Tasks,
     Settings,
 }
 
@@ -51,6 +52,25 @@ pub struct DshDesktopApp {
     ws_saved: Option<String>,
     /// 侧栏"会话"导航下方的会话列表展开状态（收纳自 Chat 中央区）
     sessions_expanded: bool,
+    /// 定时任务编辑弹层（None = 关闭）
+    sched_dialog: Option<SchedEdit>,
+    /// 管理页删除两级确认
+    sched_page_del: Option<String>,
+}
+
+/// 定时任务新建/编辑表单（侧栏弹层）。
+struct SchedEdit {
+    editing_id: Option<String>,
+    name: String,
+    /// interval | daily | once
+    mode: String,
+    interval_min: String,
+    /// daily/once：HH:MM
+    at_time: String,
+    /// once：YYYY-MM-DD
+    at_date: String,
+    prompt: String,
+    session: Option<String>,
 }
 
 impl DshDesktopApp {
@@ -168,6 +188,8 @@ impl DshDesktopApp {
             engine,
             ws_saved,
             sessions_expanded: true,
+            sched_dialog: None,
+            sched_page_del: None,
         };
         // 默认不自动拉起 DSH web（用户手动在侧边栏启动）。
         if app.web_probe.is_up() {
@@ -206,6 +228,605 @@ impl DshDesktopApp {
             }
         }
         app
+    }
+
+
+    // ===== 定时任务管理页（右侧主区）=====
+    /// 全量管理：标题 + 新建按钮 + 任务卡列表（宽幅卡：名称/状态/间隔/
+    /// 下次触发/绑定会话/提示词预览/操作），编辑走居中弹层。
+    fn ui_tasks_page(&mut self, ui: &mut egui::Ui, lang: crate::ui::i18n::Lang) {
+        use crate::ui::i18n::tr;
+        ui.label(Theme::page_title(tr(lang, "定时任务", "Scheduled tasks")));
+        ui.add_space(3.0);
+        ui.label(
+            egui::RichText::new(tr(
+                lang,
+                "周期性自动任务：到期把提示词发送到绑定会话并自动发起回合（如每日代码审查、每周进度盘点）。配置即时生效并持久化，重启自动恢复。",
+                "Recurring automation: on due, the prompt is sent to the bound session as a new turn (e.g. daily code review). Changes apply immediately and survive restarts.",
+            ))
+            .size(11.5)
+            .color(crate::ui::theme::Theme::text_dim()),
+        );
+        ui.add_space(8.0);
+
+        // 单次短锁取双份快照（此前两次取锁：中途任务变更会不一致）
+        let (tasks, sessions) = {
+            let e = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+            (e.scheduler_tasks(), e.list_sessions())
+        };
+        let sess_title = |id: &str| {
+            sessions
+                .iter()
+                .find(|s| s.session_id == id)
+                .map(|s| s.title.clone())
+                .unwrap_or_else(|| id.chars().take(10).collect())
+        };
+
+        // 操作行：左说明 + 右 [＋ 新建任务]
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} {}",
+                    tr(lang, "共", "Total"),
+                    tasks.len()
+                ))
+                .size(12.0)
+                .color(crate::ui::theme::Theme::text_dim()),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if Theme::mini_button(
+                    ui,
+                    &tr(lang, "＋ 新建任务", "＋ New task"),
+                    crate::ui::theme::ChipTint::Accent,
+                )
+                .clicked()
+                {
+                    let sess_default = self.chat.current_session_id().map(String::from);
+                    let hh: u32 = chrono::Local::now().format("%H").to_string().parse().unwrap_or(9);
+                    self.sched_dialog = Some(SchedEdit {
+                        editing_id: None,
+                        name: String::new(),
+                        mode: "interval".into(),
+                        interval_min: "30".into(),
+                        at_time: format!("{hh:02}:00"),
+                        at_date: (chrono::Local::now() + chrono::Duration::days(1))
+                            .format("%Y-%m-%d")
+                            .to_string(),
+                        prompt: String::new(),
+                        session: sess_default,
+                    });
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        if tasks.is_empty() {
+            egui::Frame::default()
+                .fill(crate::ui::theme::Theme::bg_elevated())
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::symmetric(16, 24))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("\u{23F0}")
+                                .size(28.0)
+                                .color(crate::ui::theme::Theme::text_faint()),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(tr(
+                                lang,
+                                "还没有定时任务",
+                                "No scheduled tasks yet",
+                            ))
+                            .size(13.5)
+                            .color(crate::ui::theme::Theme::text()),
+                        );
+                        ui.label(
+                            egui::RichText::new(tr(
+                                lang,
+                                "点右上「＋ 新建任务」，把重复工作交给它定时跑",
+                                "Click \u{FF0B} New task to automate recurring work",
+                            ))
+                            .size(11.0)
+                            .color(crate::ui::theme::Theme::text_faint()),
+                        );
+                    });
+                });
+        }
+
+        // 任务卡列表（宽幅，信息分区：头行 + 元信息 + 提示词预览）
+        let mut del_id: Option<String> = None;
+        let mut toggle_id: Option<String> = None;
+        let mut edit_task: Option<crate::engine::schedule::ScheduledTask> = None;
+        for t in &tasks {
+            egui::Frame::default()
+                .fill(crate::ui::theme::Theme::bg_elevated())
+                .stroke(egui::Stroke::new(1.0, crate::ui::theme::Theme::border()))
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    ui.set_max_width(640.0);
+                    // 头行：状态点 + 名称 + 右侧操作（编辑/暂停/删除）
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                        ui.label(
+                            egui::RichText::new(if t.fired_once() {
+                                "\u{2713}"
+                            } else if t.enabled {
+                                "\u{23F1}"
+                            } else {
+                                "\u{23F8}"
+                            })
+                                .size(13.0)
+                                .color(if t.enabled && !t.fired_once() {
+                                    crate::ui::theme::Theme::ok()
+                                } else {
+                                    crate::ui::theme::Theme::text_faint()
+                                }),
+                        );
+                        ui.label(
+                            egui::RichText::new(&t.name)
+                                .size(13.5)
+                                .strong()
+                                .color(crate::ui::theme::Theme::text()),
+                        );
+                        // 已触发（once 触发后禁用）> 运行中 > 已暂停
+                        let fired = t.fired_once();
+                        ui.label(
+                            egui::RichText::new(if fired {
+                                tr(lang, "已触发", "fired")
+                            } else if t.enabled {
+                                tr(lang, "运行中", "active")
+                            } else {
+                                tr(lang, "已暂停", "paused")
+                            })
+                            .size(10.0)
+                            .color(if fired {
+                                crate::ui::theme::Theme::text_faint()
+                            } else if t.enabled {
+                                crate::ui::theme::Theme::ok()
+                            } else {
+                                crate::ui::theme::Theme::warn()
+                            }),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                                // 删除（两级确认）
+                                let dl: String = if self.sched_page_del == Some(t.id.clone()) {
+                                    "OK".to_string()
+                                } else {
+                                    tr(lang, "删除", "Delete").to_string()
+                                };
+                                let tint = crate::ui::theme::ChipTint::Danger;
+                                if Theme::mini_button(ui, dl, tint).clicked() {
+                                    if self.sched_page_del == Some(t.id.clone()) {
+                                        del_id = Some(t.id.clone());
+                                        self.sched_page_del = None;
+                                    } else {
+                                        self.sched_page_del = Some(t.id.clone());
+                                    }
+                                }
+                                let (tl, tt) = if t.enabled {
+                                    (
+                                        tr(lang, "暂停", "Pause"),
+                                        tr(lang, "暂停此任务（保留配置）", "pause (config kept)"),
+                                    )
+                                } else {
+                                    (
+                                        tr(lang, "启用", "Enable"),
+                                        tr(lang, "启用此任务", "enable"),
+                                    )
+                                };
+                                if Theme::mini_button(ui, tl, crate::ui::theme::ChipTint::Neutral)
+                                    .on_hover_text(tt)
+                                    .clicked()
+                                {
+                                    toggle_id = Some(t.id.clone());
+                                }
+                                if Theme::mini_button(
+                                    ui,
+                                    &tr(lang, "编辑", "Edit"),
+                                    crate::ui::theme::ChipTint::Neutral,
+                                )
+                                .clicked()
+                                {
+                                    edit_task = Some(t.clone());
+                                }
+                            },
+                        );
+                    });
+                    // 元信息行：间隔 · 下次触发 · 绑定会话
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}  ·  {}  ·  {} {}",
+                            fmt_sched(t),
+                            fmt_next(t.next_at),
+                            tr(lang, "绑定会话:", "session:"),
+                            sess_title(&t.session_id),
+                        ))
+                        .size(11.0)
+                        .color(crate::ui::theme::Theme::text_faint()),
+                    );
+                    // 提示词预览（截断 + hover 全文）
+                    if !t.prompt.is_empty() {
+                        let preview: String = t.prompt.chars().take(80).collect();
+                        let more = t.prompt.chars().count() > 80;
+                        ui.add_space(2.0);
+                        let resp = ui.label(
+                            egui::RichText::new(format!(
+                                "\u{21B3} {}{}",
+                                preview,
+                                if more { "\u{2026}" } else { "" }
+                            ))
+                            .size(10.5)
+                            .color(crate::ui::theme::Theme::text_dim()),
+                        );
+                        resp.on_hover_text(&t.prompt);
+                    }
+                });
+            ui.add_space(6.0);
+        }
+
+        // 执行收集的操作（渲染闭包外持短锁）
+        if let Some(id) = del_id {
+            if let Ok(mut e) = self.engine.lock() {
+                e.remove_scheduled_task(&id);
+            }
+        }
+        if let Some(id) = toggle_id {
+            let enable = tasks
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| !t.enabled)
+                .unwrap_or(true);
+            if let Ok(mut e) = self.engine.lock() {
+                e.toggle_scheduled_task(&id, enable);
+            }
+        }
+        if let Some(t) = edit_task {
+            use chrono::TimeZone as _;
+            let (at_time, at_date) = if t.kind == "daily" || t.kind == "once" {
+                (
+                    format!("{:02}:{:02}", t.at_hour, t.at_min),
+                    if t.kind == "once" {
+                        chrono::Local
+                            .timestamp_opt(t.at_date, 0)
+                            .single()
+                            .map(|d| d.format("%Y-%m-%d").to_string())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    },
+                )
+            } else {
+                (String::new(), String::new())
+            };
+            self.sched_dialog = Some(SchedEdit {
+                editing_id: Some(t.id.clone()),
+                name: t.name.clone(),
+                mode: t.kind.clone(),
+                // 向上取整：亚分钟任务回显 0 会导致校验不过
+                interval_min: format!("{}", (t.interval_secs + 59) / 60),
+                at_time,
+                at_date,
+                prompt: t.prompt.clone(),
+                session: Some(t.session_id.clone()),
+            });
+        }
+
+        // 居中编辑弹层
+        self.render_sched_dialog(ui.ctx(), lang);
+    }
+
+    // ===== 定时任务编辑弹层 =====
+    /// 居中悬浮卡（Area Foreground）：新建/编辑表单 + 保存/取消。
+    /// Esc 关闭；会话下拉列出全部会话（标题 + 短 id）。
+    fn render_sched_dialog(&mut self, ctx: &egui::Context, lang: crate::ui::i18n::Lang) {
+        use crate::ui::i18n::tr;
+        let Some(d) = self.sched_dialog.as_mut() else {
+            return;
+        };
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.sched_dialog = None;
+            return;
+        }
+        let editing = d.editing_id.is_some();
+        let mut save_clicked = false;
+        let mut cancel_clicked = false;
+        egui::Area::new(egui::Id::new("sched_dialog"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(260.0, 140.0))
+            .show(ctx, |ui| {
+                egui::Frame::default()
+                    .fill(crate::ui::theme::Theme::bg_elevated())
+                    .stroke(egui::Stroke::new(1.0, crate::ui::theme::Theme::border()))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::symmetric(16, 14))
+                    .shadow(egui::Shadow {
+                        blur: 18,
+                        offset: [0, 6],
+                        color: egui::Color32::from_black_alpha(120),
+                        ..Default::default()
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(430.0);
+                        ui.label(
+                            egui::RichText::new(tr(
+                                lang,
+                                if editing { "编辑定时任务" } else { "新建定时任务" },
+                                if editing { "Edit task" } else { "New scheduled task" },
+                            ))
+                            .size(14.0)
+                            .strong()
+                            .color(crate::ui::theme::Theme::accent_light()),
+                        );
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(tr(
+                                lang,
+                                "到期时把下方提示词发送到绑定会话，自动发起一个回合",
+                                "On due, the prompt is sent to the bound session as a new turn",
+                            ))
+                            .size(10.5)
+                            .color(crate::ui::theme::Theme::text_faint()),
+                        );
+                        ui.add_space(8.0);
+                        egui::Grid::new("sched_grid")
+                            .num_columns(2)
+                            .spacing([8.0, 6.0])
+                            .show(ui, |ui| {
+                            ui.label(egui::RichText::new(tr(lang, "名称:", "Name:")).size(12.0).color(crate::ui::theme::Theme::text_dim()));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.name)
+                                    .desired_width(300.0)
+                                    .font(egui::FontId::proportional(12.5)),
+                            );
+                            ui.end_row();
+                            // 模式：三个并排分段按钮（一眼可见，不藏在下拉里）
+                            ui.label(egui::RichText::new(tr(lang, "触发方式:", "Trigger:")).size(12.0).color(crate::ui::theme::Theme::text_dim()));
+                            {
+                                let opts: [(&str, &str, &str); 3] = [
+                                    ("interval", "循环间隔", "Recurring"),
+                                    ("daily", "每天定时", "Daily"),
+                                    ("once", "单次", "Once"),
+                                ];
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                                    for (k, zh, en) in opts {
+                                        let sel = d.mode == k;
+                                        if crate::ui::theme::Theme::mini_button(
+                                            ui,
+                                            tr(lang, zh, en),
+                                            if sel {
+                                                crate::ui::theme::ChipTint::Accent
+                                            } else {
+                                                crate::ui::theme::ChipTint::Neutral
+                                            },
+                                        )
+                                        .clicked()
+                                        {
+                                            d.mode = k.into();
+                                        }
+                                    }
+                                });
+                            }
+                            ui.end_row();
+                            match d.mode.as_str() {
+                                "interval" => {
+                                    ui.label(egui::RichText::new(tr(lang, "间隔(分钟):", "Every (min):")).size(12.0).color(crate::ui::theme::Theme::text_dim()));
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut d.interval_min)
+                                                .desired_width(80.0)
+                                                .font(egui::FontId::proportional(12.5)),
+                                        );
+                                        ui.label(egui::RichText::new(tr(lang, "分钟一跑", "minutes")).size(10.5).color(crate::ui::theme::Theme::text_faint()));
+                                    });
+                                    ui.end_row();
+                                }
+                                "daily" | "once" => {
+                                    ui.label(egui::RichText::new(tr(lang, "时间:", "At:")).size(12.0).color(crate::ui::theme::Theme::text_dim()));
+                                    ui.horizontal(|ui| {
+                                        if d.mode == "once" {
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut d.at_date)
+                                                    .desired_width(110.0)
+                                                    .font(egui::FontId::proportional(12.5))
+                                                    .hint_text("YYYY-MM-DD"),
+                                            );
+                                        }
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut d.at_time)
+                                                .desired_width(64.0)
+                                                .font(egui::FontId::proportional(12.5))
+                                                .hint_text("HH:MM"),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(if d.mode == "once" {
+                                                tr(lang, "（24h 制，本地时间）", "(local time)")
+                                            } else {
+                                                tr(lang, "（每天，24h 制）", "(every day)")
+                                            })
+                                            .size(10.5)
+                                            .color(crate::ui::theme::Theme::text_faint()),
+                                        );
+                                    });
+                                    ui.end_row();
+                                }
+                                _ => {}
+                            }
+                            ui.label(egui::RichText::new(tr(lang, "绑定会话:", "Session:")).size(12.0).color(crate::ui::theme::Theme::text_dim()));
+                            {
+                                let sessions = self
+                                    .engine
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .list_sessions();
+                                let sel_text = match &d.session {
+                                    Some(id) => sessions
+                                        .iter()
+                                        .find(|s| s.session_id == *id)
+                                        .map(|s| s.title.clone())
+                                        .unwrap_or_else(|| id.clone()),
+                                    None => tr(lang, "（选择会话）", "(pick one)").to_string(),
+                                };
+                                let mut picked = d.session.clone();
+                                egui::ComboBox::from_id_salt("sched_sess")
+                                    .selected_text(sel_text)
+                                    .width(300.0)
+                                    .show_ui(ui, |ui| {
+                                        for s in &sessions {
+                                            let short: String = s.session_id.chars().take(10).collect();
+                                            ui.selectable_value(
+                                                &mut picked,
+                                                Some(s.session_id.clone()),
+                                                format!("{} ({short})", s.title),
+                                            );
+                                        }
+                                    });
+                                d.session = picked;
+                            }
+                            ui.end_row();
+                        });
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(tr(lang, "到期提示词:", "Prompt:")).size(12.0).color(crate::ui::theme::Theme::text_dim()));
+                        ui.add(
+                            egui::TextEdit::multiline(&mut d.prompt)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(3)
+                                .font(egui::FontId::proportional(12.5)),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                            // 校验按模式：间隔>0 / HH:MM 合法 / once 日期合法且未来
+                            let time_ok = parse_hhmm(&d.at_time).is_some();
+                            let (date_ok, date_future) = if d.mode == "once" {
+                                match chrono::NaiveDate::parse_from_str(d.at_date.trim(), "%Y-%m-%d") {
+                                    Ok(day) => {
+                                        let hhmm = parse_hhmm(&d.at_time).unwrap_or((0, 0));
+                                        let dt = day.and_hms_opt(hhmm.0, hhmm.1, 0)
+                                            .map(|x| x.and_local_timezone(chrono::Local).single())
+                                            .flatten();
+                                        (
+                                            dt.is_some(),
+                                            dt.map(|x| x.timestamp() > chrono::Local::now().timestamp())
+                                                .unwrap_or(false),
+                                        )
+                                    }
+                                    Err(_) => (false, false),
+                                }
+                            } else {
+                                (true, true)
+                            };
+                            let sched_ok = match d.mode.as_str() {
+                                "interval" => d
+                                    .interval_min
+                                    .trim()
+                                    .parse::<u64>()
+                                    .map(|m| m > 0)
+                                    .unwrap_or(false),
+                                "daily" => time_ok,
+                                "once" => time_ok && date_ok && date_future,
+                                _ => false,
+                            };
+                            let can = !d.name.trim().is_empty()
+                                && !d.prompt.trim().is_empty()
+                                && d.session.is_some()
+                                && sched_ok;
+                            if crate::ui::theme::Theme::mini_button(
+                                ui,
+                                &tr(lang, "取消", "Cancel"),
+                                crate::ui::theme::ChipTint::Neutral,
+                            )
+                            .clicked()
+                            {
+                                cancel_clicked = true;
+                            }
+                            if can
+                                && crate::ui::theme::Theme::mini_button(
+                                    ui,
+                                    &tr(lang, "保存", "Save"),
+                                    crate::ui::theme::ChipTint::Accent,
+                                )
+                                .clicked()
+                            {
+                                save_clicked = true;
+                            }
+                            if !can {
+                                let why = if d.mode == "interval" {
+                                    tr(lang, "名称/提示词/间隔/会话 均必填", "name / prompt / interval / session required")
+                                } else if !time_ok {
+                                    tr(lang, "时间格式 HH:MM", "time must be HH:MM")
+                                } else if d.mode == "once" && !date_ok {
+                                    tr(lang, "日期格式 YYYY-MM-DD", "date must be YYYY-MM-DD")
+                                } else if d.mode == "once" && !date_future {
+                                    tr(lang, "单次时间须在未来", "one-shot time must be in the future")
+                                } else {
+                                    tr(lang, "名称/提示词/会话 均必填", "name / prompt / session required")
+                                };
+                                ui.label(
+                                    egui::RichText::new(why)
+                                        .size(10.0)
+                                        .color(crate::ui::theme::Theme::text_faint()),
+                                );
+                            }
+                        });
+                    });
+            });
+        if cancel_clicked {
+            self.sched_dialog = None;
+        }
+        if save_clicked {
+            // 取出表单（编辑 = 删旧建新），按模式构造任务
+            let (edit_id, task) = {
+                let d = self.sched_dialog.as_ref().unwrap();
+                let kind = d.mode.clone();
+                let interval_secs = d
+                    .interval_min
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(30)
+                    .min(60 * 24 * 365)
+                    * 60; // 分钟→秒（上限夹取防溢出）
+                let (hh, mm) = parse_hhmm(&d.at_time).unwrap_or((9, 0));
+                let at_date = chrono::NaiveDate::parse_from_str(d.at_date.trim(), "%Y-%m-%d")
+                    .ok()
+                    .and_then(|day| {
+                        day.and_hms_opt(0, 0, 0)
+                            .map(|n| n.and_local_timezone(chrono::Local).single())
+                            .flatten()
+                            .map(|l| l.timestamp())
+                    })
+                    .unwrap_or(0);
+                let t = crate::engine::schedule::ScheduledTask {
+                    id: String::new(),
+                    name: d.name.trim().to_string(),
+                    kind: kind.clone(),
+                    interval_secs,
+                    at_hour: hh,
+                    at_min: mm,
+                    at_date,
+                    prompt: d.prompt.trim().to_string(),
+                    session_id: d.session.clone().unwrap_or_default(),
+                    next_at: 0.0,
+                    enabled: true,
+                };
+                (d.editing_id.clone(), t)
+            };
+            if let Ok(mut e) = self.engine.lock() {
+                if let Some(id) = &edit_id {
+                    e.remove_scheduled_task(id);
+                }
+                e.add_scheduled_task_full(task);
+            }
+            self.sched_dialog = None;
+        }
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
@@ -279,11 +900,26 @@ impl DshDesktopApp {
             }
         }
         if self.sessions_expanded {
+            // 导航行与列表之间的呼吸间距（此前紧贴显得挤）
+            ui.add_space(6.0);
             // 点击/新建会话时自动切回会话页（否则在设置/技能页点会话无反馈）
             if self.chat.ui_session_list(ui, None).is_some() {
                 self.tab = Tab::Chat;
             }
+            ui.add_space(6.0);
         }
+        // ⏰ 定时任务：右侧独立管理页（导航与技能/扩展同构）
+        if Theme::nav_button(
+            ui,
+            &tr(lang, "定时任务", "Tasks"),
+            "\u{23F0}",
+            self.tab == Tab::Tasks,
+        ) {
+            self.tab = Tab::Tasks;
+        }
+        // ===== 定时任务编辑弹层（居中悬浮卡）=====
+        self.render_sched_dialog(ui.ctx(), lang);
+
         if Theme::nav_button(
             ui,
             &tr(lang, "技能", "Skills"),
@@ -527,6 +1163,91 @@ impl eframe::App for DshDesktopApp {
         // 但泵本身必须无条件执行——否则切到技能/扩展/设置页时后台回合的
         // 事件积压在无界通道里，状态不更新、UI 冻结到下次鼠标移动
         self.chat.pump(&ui.ctx().clone());
+        // 拖拽文件入窗 → 附件（同样必须任何标签页都处理：放在 chat.ui()
+        // 内则切页拖拽会被静默丢弃）
+        self.chat.handle_dropped_files(ui.ctx());
+        // Ctrl+P 会话快速切换器（任意标签页可唤起）
+        self.chat.render_switcher(ui.ctx());
+        // Ctrl+K 全局命令面板 + 动作执行
+        self.chat.render_palette(ui.ctx());
+        if let Some(act) = self.chat.palette_action.take() {
+            use crate::ui::chat_tab::PaletteAction as PA;
+            let lang = crate::ui::i18n::Lang::parse(&self.cfg.lang);
+            use crate::ui::i18n::tr;
+            match act {
+                PA::NewSession => {
+                    let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Ok(id) = engine.create_session(None) {
+                        drop(engine);
+                        self.chat.refresh_sessions();
+                        self.chat.open(&id);
+                        self.tab = Tab::Chat;
+                    }
+                }
+                PA::TabSettings => self.tab = Tab::Settings,
+                PA::TabSkills => self.tab = Tab::Skills,
+                PA::TabExtensions => self.tab = Tab::Extensions,
+                PA::TabCode => self.tab = Tab::Code,
+                PA::TabTasks => self.tab = Tab::Tasks,
+                PA::ToggleSandbox => {
+                    let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+                    let next = match engine.sandbox_mode() {
+                        crate::exec::SandboxMode::DangerFullAccess => crate::exec::SandboxMode::WorkspaceWrite,
+                        crate::exec::SandboxMode::WorkspaceWrite => crate::exec::SandboxMode::ReadOnly,
+                        crate::exec::SandboxMode::ReadOnly => crate::exec::SandboxMode::DangerFullAccess,
+                    };
+                    engine.set_sandbox_mode(next);
+                    drop(engine);
+                }
+                PA::ExportMarkdown => {
+                    let sid = self.chat.current_session_id().map(String::from);
+                    if let Some(sid) = sid {
+                        let md = {
+                            let engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+                            engine.export_session_markdown(&sid)
+                        };
+                        match md {
+                            Ok(text) => {
+                                let name = format!(
+                                    "{}.md",
+                                    chrono::Local::now().format("session-%Y%m%d-%H%M%S")
+                                );
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .set_file_name(&name)
+                                    .set_title(tr(lang, "导出会话", "Export session"))
+                                    .save_file()
+                                {
+                                    match std::fs::write(&path, text) {
+                                        Ok(()) => self.chat.status = tr(
+                                            lang,
+                                            &format!("已导出 {}", path.display()),
+                                            &format!("Exported {}", path.display()),
+                                        ).into(),
+                                        Err(e) => self.chat.error = Some(format!("{e}")),
+                                    }
+                                }
+                            }
+                            Err(e) => self.chat.error = Some(format!("{e:#}")),
+                        }
+                    }
+                }
+                PA::ArchiveSession => {
+                    let sid = self.chat.current_session_id().map(String::from);
+                    if let Some(sid) = sid {
+                        {
+                            let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+                            let _ = engine.archive_session(&sid);
+                        }
+                        self.chat.refresh_sessions();
+                        self.chat.status = tr(lang, "已归档（文件保留）", "Archived (file kept)").into();
+                    }
+                }
+                PA::WriteMemory => {
+                    // 打开输入框预填记忆指令
+                    self.chat.prefill_memory_prompt();
+                }
+            }
+        }
         // 工作区变更 → 立即持久化 last_workspace（避免崩溃/异常退出丢失）
         {
             let ws = self.engine.lock().unwrap_or_else(|p| p.into_inner()).workspace_root().cloned();
@@ -539,10 +1260,26 @@ impl eframe::App for DshDesktopApp {
                 }
             }
         }
-        Panel::left("sidebar").show(ui, |ui| {
-            ui.set_width(172.0);
-            self.sidebar(ui);
-        });
+        Panel::left("sidebar")
+            .frame(
+                egui::Frame::default()
+                    .fill({
+                        // ZCode 式侧栏：比主背景深一档（bg_elevated 与 bg 的
+                        // 阶差反转——侧栏深、内容浅，层级靠色差不靠线）
+                        let b = Theme::bg().to_array();
+                        let f = (b[0] as i32 * 3 / 4) as u8;
+                        egui::Color32::from_rgb(
+                            f,
+                            (b[1] as i32 * 3 / 4) as u8,
+                            (b[2] as i32 * 3 / 4) as u8,
+                        )
+                    })
+                    .inner_margin(egui::Margin::symmetric(6, 0)),
+            )
+            .show(ui, |ui| {
+                ui.set_width(172.0);
+                self.sidebar(ui);
+            });
         // 简约布局：无顶栏（页面标题由各内容区自带），底部一行弱化状态
         // 错误信息显示在底部状态栏（RUST_LOG 前）：不打断内容区布局，
         // 用户视线自然落底即可看到
@@ -570,6 +1307,10 @@ impl eframe::App for DshDesktopApp {
                 self.ext.ui(ui);
             }
             Tab::Code => self.code.ui(ui),
+            Tab::Tasks => {
+                self.sched_page_del = None; // 进入时清残留确认态
+                self.ui_tasks_page(ui, lang)
+            }
             Tab::Settings => self.settings.ui(ui, &mut self.cfg),
         });
         // 桥访问信息（端口/token）注入设置页展示
@@ -737,4 +1478,62 @@ pub(crate) fn setup_fonts(ctx: &egui::Context) {
         crate::ui::markdown::set_bold_bound(true);
     }
     ctx.set_fonts(fonts);
+}
+
+/// 调度描述：按模式显示（间隔 / 每天 HH:MM / 一次性日期时间）。
+fn fmt_sched(t: &crate::engine::schedule::ScheduledTask) -> String {
+    match t.kind.as_str() {
+        "daily" => format!("每天 {:02}:{:02}", t.at_hour, t.at_min),
+        "once" => {
+            use chrono::TimeZone as _;
+            let d = chrono::Local
+                .timestamp_opt(t.at_date, 0)
+                .single()
+                .map(|x| x.format("%Y-%m-%d").to_string())
+                .unwrap_or_default();
+            format!("{d} {:02}:{:02} 单次", t.at_hour, t.at_min)
+        }
+        _ => fmt_interval(t.interval_secs),
+    }
+}
+
+/// "HH:MM" → (时, 分)；格式不符返回 None。
+fn parse_hhmm(s: &str) -> Option<(u32, u32)> {
+    let (h, m) = s.trim().split_once(':')?;
+    let h: u32 = h.trim().parse().ok()?;
+    let m: u32 = m.trim().parse().ok()?;
+    (h < 24 && m < 60).then_some((h, m))
+}
+
+/// 间隔人性化：<60s / Nm / Nh / Nd。
+fn fmt_interval(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
+
+/// 下次触发相对时间（"下次 3m" / "已到期"）。
+fn fmt_next(next_at: f64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let remain = next_at - now;
+    if remain <= 0.0 {
+        "已到期".into()
+    } else if remain < 60.0 {
+        format!("下次 {:.0}s", remain)
+    } else if remain < 3600.0 {
+        format!("下次 {:.0}m", remain / 60.0)
+    } else if remain < 86400.0 {
+        format!("下次 {:.1}h", remain / 3600.0)
+    } else {
+        format!("下次 {:.1}d", remain / 86400.0)
+    }
 }

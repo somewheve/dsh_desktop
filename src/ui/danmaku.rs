@@ -96,7 +96,7 @@ impl DanmakuLayer {
     pub fn new() -> Self {
         Self {
             items: VecDeque::new(),
-            track_h: 24.0,
+            track_h: 26.0,
             width: 0.0,
             height: 88.0,
         }
@@ -112,8 +112,10 @@ impl DanmakuLayer {
         if text.trim().is_empty() {
             return;
         }
-        // 找最空轨道：统计每条轨道上最靠右的弹幕位置
-        let tracks = ((self.height() / self.track_h) as f32).round().max(1.0) as usize;
+        // 找最空轨道：统计每条轨道上最靠右的弹幕位置。
+        // 轨道数必须 floor：round 会多算装不下的轨道，末轨底部超出
+        // 弹幕区裁剪矩形 → 气泡下缘被切（"只显示一大半"的根因）。
+        let tracks = ((self.height() / self.track_h) as f32).floor().max(1.0) as usize;
         let mut track_right: Vec<f32> = vec![0.0; tracks];
         for d in &self.items {
             let ti = ((d.y / self.track_h) as usize).min(tracks - 1);
@@ -151,11 +153,12 @@ impl DanmakuLayer {
         // 注：self.width 在 advance() 才同步——首次 fire 时可能是 0（旧值），
         // max(track_right) 保证至少不与现有弹幕重叠
         let start_x = self.width.max(track_right[best]);
-        // 固定速度 120px/s + 内容 hash 微差（±9，同条内容稳定不变）。
-        // 旧版用 text.len()（字节数）做速度变量——中文/emoji 一个字符 3-4
-        // 字节，同一个流式 chunk 切出的段速度差达 60px/s，视觉忽快忽慢。
+        // 固定速度 64px/s + 内容 hash 微差（±6，同条内容稳定不变）。
+        // 120px/s 时约 9 秒穿越全屏，读不完就飘走了；64 ≈ 舒适阅读速度
+        // （~16s 穿越）。旧版用 text.len()（字节数）做速度变量——中文/
+        // emoji 一个字符 3-4 字节，同一切片速度差达 60px/s，忽快忽慢。
         let hash = text.chars().fold(0u32, |h, c| h.wrapping_add(c as u32));
-        let desired = 120.0 + (hash % 4) as f32 * 3.0; // 120~129
+        let desired = 64.0 + (hash % 4) as f32 * 2.0; // 64~70
         let speed = track_min_speed.map_or(desired, |m| desired.min(m));
         self.items.push_back(Danmaku {
             text,
@@ -175,12 +178,16 @@ impl DanmakuLayer {
     }
 
     /// 每帧推进：dt 秒后更新位置，清理移出的弹幕。
-    pub fn advance(&mut self, dt: f32, width: f32) {
+    /// `hover_pause`：指针悬浮在任意弹幕上时暂停移动（可交互性——
+    /// 悬浮读全文时文字不能跑）。
+    pub fn advance(&mut self, dt: f32, width: f32, hover_pause: bool) {
         self.width = width;
         // 弹幕（含左侧 lo 娘）整体移出左侧即销毁
         self.items.retain(|d| d.x + d.width + LOLI_W > 0.0);
-        for d in self.items.iter_mut() {
-            d.x -= d.speed * dt;
+        if !hover_pause {
+            for d in self.items.iter_mut() {
+                d.x -= d.speed * dt;
+            }
         }
     }
 
@@ -235,10 +242,17 @@ impl DanmakuLayer {
 
     /// 绘制所有弹幕：每个弹幕左侧带一个小 lo 娘（拉着丝带），
     /// 弹幕按种类画气泡（颜色+形状），悬浮时显示全量内容。
-    pub fn draw(&self, painter: &egui::Painter, origin: Pos2, _font: &FontId) {
+    pub fn draw(
+        &self,
+        painter: &egui::Painter,
+        origin: Pos2,
+        _font: &FontId,
+    ) -> Option<String> {
         let pad_x = 8.0;
         let bubble_h = self.track_h - 6.0;
         let hover_pos = painter.ctx().pointer_hover_pos();
+        let clicked_now = painter.ctx().input(|i| i.pointer.primary_clicked());
+        let mut clicked_full: Option<String> = None;
 
         for d in self.items.iter() {
             // 性能：未进入可视区（还在右边缘外等待）或已完全移出左侧的弹幕跳过绘制
@@ -272,6 +286,9 @@ impl DanmakuLayer {
             // 3) 悬浮：显示全量内容（手动绘制 tooltip，避免依赖 egui tooltip API）
             if let Some(hp) = hover_pos {
                 if bubble.contains(hp) {
+                    if clicked_now && clicked_full.is_none() {
+                        clicked_full = Some(d.full.clone());
+                    }
                     let tip_font = FontId::monospace(12.0);
                     // 超长内容截断，避免 tooltip 撑爆屏幕
                     let mut tip_text = d.full.clone();
@@ -311,6 +328,23 @@ impl DanmakuLayer {
                 }
             }
         }
+        clicked_full
+    }
+
+    /// 指针是否悬浮在任意弹幕上（advance 暂停用）。
+    pub fn any_hovered(&self, ctx: &egui::Context, origin: Pos2) -> bool {
+        let Some(hp) = ctx.pointer_hover_pos() else {
+            return false;
+        };
+        let bubble_h = self.track_h - 6.0;
+        self.items.iter().any(|d| {
+            let top = origin.y + d.y + (self.track_h - bubble_h) / 2.0;
+            Rect::from_min_size(
+                pos2(origin.x + d.x, top),
+                Vec2::new(d.width + 16.0, bubble_h),
+            )
+            .contains(hp)
+        })
     }
 
     /// 气泡左侧的小 lo 娘：头发+蝴蝶结+脸+裙子+手臂，
@@ -455,15 +489,15 @@ mod tests {
         let mut d = DanmakuLayer::new();
         d.set_height(24.0); // 单轨道
         d.fire(DanmakuKind::ToolCall, "AAAA".into(), String::new()); // hash→某速度
-        // 强制第一条为最慢 120
-        d.items.back_mut().unwrap().speed = 120.0;
+        // 强制第一条为最慢 64
+        d.items.back_mut().unwrap().speed = 64.0;
         d.items.back_mut().unwrap().measured = true;
         d.items.back_mut().unwrap().width = 100.0;
-        // 第二条:desired 可能 129,同轨封顶到 120
+        // 第二条:desired 可能 70,同轨封顶到 64
         d.fire(DanmakuKind::ToolCall, "BBBBBBBB".into(), String::new());
         {
             let second = d.items.back_mut().unwrap();
-            assert_eq!(second.speed, 120.0, "同轨新弹幕速度必须被压到 120");
+            assert_eq!(second.speed, 64.0, "同轨新弹幕速度必须被压到旧最小速度");
             second.measured = true;
             second.width = 100.0;
         }
@@ -474,12 +508,39 @@ mod tests {
         );
         let init_gap = x2 - (x1 + 100.0);
         for _ in 0..300 {
-            x1 -= 120.0 * 0.1;
-            x2 -= 120.0 * 0.1;
+            x1 -= 64.0 * 0.1;
+            x2 -= 64.0 * 0.1;
         }
         assert!(
             x2 - (x1 + 100.0) >= init_gap - 0.5,
             "同速穿越间隙不得缩小"
+        );
+    }
+
+    /// 轨道完整可见性：可用高必须是轨道高的整数倍容量——末轨气泡底缘
+    /// 不得超过弹幕区（round 多算轨道导致"只显示一大半"的回归锚点）。
+    #[test]
+    fn tracks_never_exceed_visible_height() {
+        let mut d = DanmakuLayer::new(); // track_h = 26
+        d.set_height(68.0); // 90px 弹幕区 - 22px 标题条
+        // 连发 10 条,统计用到的最大轨道下标
+        for i in 0..10 {
+            d.fire(DanmakuKind::Thinking, format!("msg{i}"), String::new());
+            // 拉开右边缘让轨道循环分配
+            for it in d.items.iter_mut() {
+                it.x -= 200.0;
+                it.width = 50.0;
+                it.measured = true;
+            }
+        }
+        let max_bottom = d
+            .items
+            .iter()
+            .map(|it| it.y + 26.0)
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_bottom <= 68.0 + 0.5,
+            "末轨底缘 {max_bottom} 不得超出可用高 68(floor 轨道数)"
         );
     }
 
@@ -497,7 +558,7 @@ mod tests {
         assert_eq!(layer.items[1].full, "🔧 exec {\"command\":\"dir\"}");
         // 推进 10 秒：都移出左侧
         for _ in 0..100 {
-            layer.advance(0.1, 800.0);
+            layer.advance(0.1, 800.0, false);
         }
         assert!(layer.is_empty(), "弹幕应全部移出");
     }
@@ -526,11 +587,11 @@ mod tests {
             // 每帧 advance + measure（真实时序）
             let mut ui_ctx = egui::Context::default();
             let _ = &mut ui_ctx;
-            layer.advance(0.016, w);
+            layer.advance(0.016, w, false);
         }
         // 模拟多帧飞行，检查任意时刻同轨不重叠
         for _ in 0..500 {
-            layer.advance(0.016, w);
+            layer.advance(0.016, w, false);
             let mut sorted: Vec<&Danmaku> = layer.items.iter().collect();
             sorted.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
             for pair in sorted.windows(2) {

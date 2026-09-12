@@ -334,13 +334,15 @@ impl SkillsPanel {
                     );
                 }
             }
-            // 说明预览（可读性：截断 + 等宽字体）
+            // 说明预览（可读性：整行截取 + 等宽字体——按字符硬切会
+            // 把句子劈成两半，很难看；技能文本是短行格式，取前几整行）
             if let Some(ins) = &skill.instructions {
                 if !ins.is_empty() {
                     ui.add_space(4.0);
-                    let preview: String = ins.chars().take(220).collect();
-                    let preview = if ins.chars().count() > 220 {
-                        format!("{preview}…")
+                    let total_lines = ins.lines().count();
+                    let preview: String = ins.lines().take(6).collect::<Vec<_>>().join("\n");
+                    let preview = if total_lines > 6 {
+                        format!("{preview}\n…")
                     } else {
                         preview
                     };

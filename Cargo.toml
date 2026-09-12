@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 # eframe：仅保留 Windows 需要的 feature（wgpu 渲染 + accesskit + 链接），
 # 去掉 wayland/x11/web_screen_reader 等平台无用项，显著减少依赖编译量
+# 与 egui 0.36 内部同版本：应用层处理 AccessKit SetValue(egui TextEdit 不支持)
+accesskit = "0.24.1"
 eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "links", "wgpu"] }
 egui = "0.36"
 serde = { version = "1", features = ["derive"] }
@@ -33,6 +35,8 @@ pulldown-cmark = "0.13"
 # 沙箱 capability SID 派生用（与官方 workspace-sid 哈希算法一致）
 sha2 = "0.10"
 # 图片附件 → vision 多模态（data URI base64）
+# 定时任务:每天/单次模式的本地时间与日期算术
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 base64 = "0.22"
 # 对话消息内嵌图片解码（png/jpg/gif/webp → egui 纹理）
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }

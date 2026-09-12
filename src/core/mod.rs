@@ -15,6 +15,7 @@ pub mod preset;
 pub mod session;
 pub mod settings;
 pub mod storage;
+pub mod paper;
 pub mod tools;
 pub mod workspace;
 

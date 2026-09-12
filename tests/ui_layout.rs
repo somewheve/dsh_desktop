@@ -1100,6 +1100,7 @@ fn plan_and_subagents_continuous_work_scenario() {
             summary: Some("并行任务".into()),
             task: Some("独立小任务".into()),
             result: result.map(|s| s.to_string()),
+            tokens: None,
         }
     };
     let desc_ev = |d: &dsh_desktop::engine::subagent::SubagentDescriptor| {
@@ -1208,6 +1209,187 @@ fn plan_and_subagents_continuous_work_scenario() {
         harness2.query_by_label("步骤五：收尾核对").is_some(),
         "重放后计划卡展开应显示条目"
     );
+}
+
+
+/// Ctrl+P 会话快速切换器：快捷键开/关、过滤、回车跳转。
+#[test]
+fn ctrl_p_session_switcher_flow() {
+    let _theme_guard = THEME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = None;
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
+    let engine = std::sync::Arc::new(std::sync::Mutex::new(
+        DshEngine::new(settings, tx).expect("engine"),
+    ));
+    let a = engine.lock().unwrap().create_session(Some("甲会话")).unwrap();
+    let b = engine.lock().unwrap().create_session(Some("乙目标会话")).unwrap();
+    let mut chat = ChatTab::new(engine.clone(), rx);
+    chat.open(&a);
+    let mut harness = Harness::new_ui_state(
+        |ui, chat: &mut ChatTab| {
+            chat.render_switcher(ui.ctx()); // app 层每帧调用（镜像真实结构）
+            egui::Panel::left("test_session_list")
+                .exact_size(172.0)
+                .show(ui, |ui| {
+                    let _ = chat.ui_session_list(ui, None);
+                });
+            chat.ui(ui);
+        },
+        chat,
+    );
+    harness.set_size(Vec2::new(900.0, 600.0));
+    harness.run_steps(6);
+    let base_count = harness.get_all_by_label("甲会话").count();
+    assert_eq!(base_count, 2, "初始甲会话 = 侧栏导航+列表两处: {base_count}");
+    // Ctrl+P 打开
+    harness.event(egui::Event::Key {
+        key: egui::Key::P,
+        physical_key: Some(egui::Key::P),
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::CTRL,
+    });
+    harness.run_steps(2);
+    assert!(
+        harness.get_all_by_label("甲会话").count() >= 3,
+        "Ctrl+P 应打开切换器（弹层再出现一次）"
+    );
+    // 过滤到乙会话并回车
+    let node = egui::Id::new("chat_input_edit").accesskit_id();
+    let _ = node;
+    // 直接对切换器输入框注入文本（a11y SetValue 走主输入框,这里用键盘事件）
+    for ch in "乙目标".chars() {
+        harness.event(egui::Event::Text(ch.to_string()));
+        harness.run_steps(1);
+    }
+    harness.run_steps(2);
+    assert!(
+        harness.get_all_by_label("乙目标会话").count() >= 2,
+        "过滤后乙会话应在弹层显示"
+    );
+    // 焦点证明：输入确实落在过滤框——弹层里的"甲会话"被过滤掉
+    //（打开未过滤时甲 = 侧栏导航+列表+弹层 三处；现在应回到两处）
+    assert_eq!(
+        harness.get_all_by_label("甲会话").count(),
+        2,
+        "输入应进入过滤框并把甲会话从弹层滤除（焦点自动落位的回归锚点）"
+    );
+    // Enter 打开第一个匹配
+    harness.event(egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: Some(egui::Key::Enter),
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.run_steps(6);
+    // 当前会话切到乙
+    let _ = &engine;
+    // 通过标题栏会话名验证
+    assert!(
+        harness.get_all_by_label("乙目标会话").count() >= 2,
+        "切换后乙会话仍可见（标题栏已切换）"
+    );
+    // Esc 关闭切换器（再次打开后）
+    harness.event(egui::Event::Key {
+        key: egui::Key::P,
+        physical_key: Some(egui::Key::P),
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::CTRL,
+    });
+    harness.run_steps(2);
+    harness.event(egui::Event::Key {
+        key: egui::Key::Escape,
+        physical_key: Some(egui::Key::Escape),
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.run_steps(2);
+    assert_eq!(
+        harness.get_all_by_label("甲会话").count(),
+        1,
+        "Esc 应关闭切换器（已切到乙:甲只剩列表一处）"
+    );
+    let _ = b;
+}
+
+
+/// 反馈→纠正闭环：👎 记录 → 下一次发送注入纠正上下文（一次性消费），
+/// 👍 撤销。注入通过 AccessKit SetValue + AXPress 发送（顺带回归 ⑧）。
+#[test]
+fn dislike_injects_correction_on_next_send() {
+    let _theme_guard = THEME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (tx, rx) = std::sync::mpsc::channel::<EngineEvent>();
+    let mut settings = EngineSettings::default();
+    settings.api_key = None;
+    settings.data_dir = tempfile::tempdir().unwrap().path().join("sessions");
+    let engine = std::sync::Arc::new(std::sync::Mutex::new(
+        DshEngine::new(settings, tx.clone()).expect("engine"),
+    ));
+    let sid = engine
+        .lock()
+        .unwrap()
+        .create_session(Some("feedback loop"))
+        .unwrap();
+    // 注入一条 assistant 回复（👎 按钮的渲染条件）
+    let _ = tx.send(EngineEvent::Event {
+        session_id: sid.clone(),
+        event: SessionEvent::new(
+            types::ASSISTANT_MESSAGE,
+            Some(serde_json::json!({"content": "这是有问题的旧回复"})),
+        ),
+    });
+    let mut chat = ChatTab::new(engine.clone(), rx);
+    chat.open(&sid);
+    let mut harness = Harness::new_ui_state(
+        |ui, chat: &mut ChatTab| {
+            egui::Panel::left("test_session_list")
+                .exact_size(172.0)
+                .show(ui, |ui| {
+                    let _ = chat.ui_session_list(ui, None);
+                });
+            chat.ui(ui);
+        },
+        chat,
+    );
+    harness.set_size(Vec2::new(900.0, 600.0));
+    harness.run_steps(8);
+
+    // 👎 → 记录纠正上下文
+    harness.get_by_label("👎").click();
+    harness.run_steps(3);
+
+    // AccessKit SetValue 草稿 + AXPress 发送
+    let node = egui::Id::new("chat_input_edit").accesskit_id();
+    harness.event(egui::Event::AccessKitActionRequest(accesskit::ActionRequest {
+        action: accesskit::Action::SetValue,
+        target_tree: accesskit::TreeId::ROOT,
+        target_node: node,
+        data: Some(accesskit::ActionData::Value("换个思路重做".into())),
+    }));
+    harness.run_steps(2);
+    harness.get_by_label("发送").click_accesskit();
+    harness.run_steps(10);
+    eprintln!("DBG msg-in-chat: {:?}", harness.query_by_label("换个思路重做").is_some());
+
+    // 落库的 user/message 应含纠正上下文（一次性）
+    // 存储回读（send_message 先落盘；shared 快照不含回合外写入）
+    let evs = engine
+        .lock()
+        .unwrap()
+        .open_session(&sid)
+        .map(|s| s.events)
+        .unwrap_or_default();
+    let injected = evs
+        .iter()
+        .filter(|e| e.r#type == types::USER_MESSAGE)
+        .filter_map(|e| e.data.as_ref().and_then(|d| d.get("content")).and_then(|v| v.as_str()))
+        .any(|c| c.contains("用户对上一条回复点了") && c.contains("换个思路重做"));
+    assert!(injected, "👎 后发送应注入纠正上下文: {evs:?}");
 }
 
 
@@ -1404,18 +1586,24 @@ fn session_list_aligned_and_truncated() {
     // 名字不得挤占删除按钮：长标题项（第 2 项）的名字文本最右像素
     // 必须 < 该行 x 按钮的左缘（clip 保证文本不溢出按钮区域）
     let x_left = xs[1].rect().min.x;
-    let y2 = (xs[1].rect().min.y + xs[1].rect().max.y) / 2.0;
+    let (y_lo, y_hi) = (xs[1].rect().min.y, xs[1].rect().max.y);
+    // 整行垂直扫描（行高收紧后文字基线位置随行高变化，固定中线可能
+    // 落在字形间隙）
     let mut name_right: Option<u32> = None;
-    for x in (0..img.width()).step_by(2) {
-        let p = img.get_pixel(x, y2 as u32);
-        let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
-        // 名字文本（明显亮于背景且偏蓝灰；细字抗锯齿像素是混合色，
-        // 阈值按"亮度和 + 冷色调"判而不是接近纯 text_dim 色）且在 x 按钮左侧
-        if r + g + b > 170 && b >= r && (x as f32) < x_left {
-            name_right = Some(x);
+    for y2 in y_lo as i32..y_hi as i32 {
+        if y2 < 0 || y2 as u32 >= img.height() {
+            continue;
+        }
+        for x in (0..img.width()).step_by(2) {
+            let p = img.get_pixel(x, y2 as u32);
+            let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+            // 名字文本（明显亮于背景且偏蓝灰；细字抗锯齿像素是混合色，
+            // 阈值按"亮度和 + 冷色调"判而不是接近纯 text_dim 色）且在 x 按钮左侧
+            if r + g + b > 170 && b >= r && (x as f32) < x_left {
+                name_right = Some(x);
+            }
         }
     }
-    eprintln!("NAME_RIGHT: {name_right:?} (x button left = {x_left})");
     let nr = name_right.expect("长标题项应有名字文本");
     assert!(
         (nr as f32) < x_left - 4.0,

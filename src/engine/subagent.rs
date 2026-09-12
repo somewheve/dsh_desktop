@@ -46,6 +46,10 @@ pub struct SubagentDescriptor {
     /// 完整输出（卡片展开可见；descriptor 事件持久化，重放可恢复）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// 本回合 token 消耗（prompt+completion；仅终态 descriptor 携带，
+    /// 旧事件无此字段 → None → UI 不显示）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
 }
 
 /// 子代理管理器。
@@ -76,6 +80,7 @@ impl SubagentManager {
                 summary: None,
                 task: Some(task.to_string()),
                 result: None,
+                tokens: None,
             },
         );
         Ok(id)
@@ -97,6 +102,13 @@ impl SubagentManager {
     pub fn set_result(&mut self, id: &str, result: String) {
         if let Some(s) = self.subagents.get_mut(id) {
             s.result = Some(result);
+        }
+    }
+
+    /// 本回合 token 消耗（终态时写入，卡片行展示）。
+    pub fn set_tokens(&mut self, id: &str, tokens: u64) {
+        if let Some(s) = self.subagents.get_mut(id) {
+            s.tokens = Some(tokens);
         }
     }
 

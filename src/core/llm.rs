@@ -144,7 +144,10 @@ pub struct FunctionSpec {
     pub parameters: serde_json::Value,
 }
 
-/// DeepSeek API 模型表（2026-08 官方价目页；legacy 名称保留兼容旧配置）。
+/// DeepSeek API 模型表。已对 dsh 0.1.5 全栈核对
+/// （dsh-llm-deepseek / dsh-client-ui-settings-models /
+/// dsh-agent-default-model）：v4-flash、v4-pro、v4-flash-vision-exp
+/// 即当前全部在售模型。
 pub const DEEPSEEK_MODELS: &[&str] = &[
     "deepseek-v4-flash",
     "deepseek-v4-pro",
@@ -328,6 +331,18 @@ impl LlmClient {
             model,
             reasoning_effort,
         })
+    }
+
+    /// 同配置换模型的轻量变体（子代理分级：fork 是 token 放大器，
+    /// 机械子任务可走更便宜的档位）。reqwest Client 内部是 Arc，克隆廉价。
+    pub fn with_model(&self, model: &str) -> Self {
+        Self {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            model: model.to_string(),
+            reasoning_effort: self.reasoning_effort.clone(),
+        }
     }
 
     /// 流式 chat.completions。
@@ -725,6 +740,22 @@ pub type SharedLlm = Arc<LlmClient>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 分级模型变体：换模型不改原客户端配置。
+    #[test]
+    fn with_model_keeps_config() {
+        let c = LlmClient::new(
+            "https://example.invalid".into(),
+            "k".into(),
+            "deepseek-v4-pro".into(),
+            None,
+            None,
+        )
+        .unwrap();
+        let sub = c.with_model("deepseek-v4-flash");
+        assert_eq!(sub.model(), "deepseek-v4-flash");
+        assert_eq!(c.model(), "deepseek-v4-pro");
+    }
 
     fn tc(id: &str) -> ToolCall {
         ToolCall {

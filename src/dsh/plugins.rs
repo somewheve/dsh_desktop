@@ -111,13 +111,8 @@ pub fn set_plugin_enabled(profile_dir: &Path, plugin: &str, enabled: bool) -> Re
 
 /// 检查插件本地是否已安装（node_modules 里存在）。
 pub fn is_installed_locally(profile_dir: &Path, package: &str) -> bool {
-    let scoped = package.starts_with('@');
-    let rel = if scoped {
-        PathBuf::from(package)
-    } else {
-        PathBuf::from(package)
-    };
-    profile_dir.join("node_modules").join(rel).is_dir()
+    // 包名即 node_modules 下的相对路径（scoped @a/b 与普通包同构）
+    profile_dir.join("node_modules").join(package).is_dir()
 }
 
 /// 插件 → 技能转写：把已安装插件的说明（package.json description +

@@ -107,6 +107,8 @@ pub struct DshEngine {
     tx: Sender<EngineEvent>,
     /// 任务管理器（回合 / 子代理等耗时操作的可见进度）
     jobs: Arc<std::sync::Mutex<JobManager>>,
+    /// 待确认编辑队列（review_edits 门）
+    pending_edits: Arc<std::sync::Mutex<Vec<PendingEdit>>>,
     /// 子代理管理器（subagent/descriptor 事件 + 运行状态）
     subagents: Arc<std::sync::Mutex<SubagentManager>>,
     /// 技能注册表（$DSH_HOME/skills 加载；agent 可用 load_skill 调用）
@@ -207,13 +209,21 @@ impl DshEngine {
             scheduler
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .add(&t.id, &t.name, t.interval_secs, &t.prompt, &t.session_id);
-            if !t.enabled {
-                scheduler
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .toggle(&t.id, false);
-            }
+                .add_full(crate::engine::schedule::ScheduledTask {
+                    id: t.id.clone(),
+                    name: t.name.clone(),
+                    kind: t.kind.clone(),
+                    interval_secs: t.interval_secs,
+                    at_hour: t.at_hour,
+                    at_min: t.at_min,
+                    at_date: t.at_date,
+                    prompt: t.prompt.clone(),
+                    session_id: t.session_id.clone(),
+                    next_at: 0.0,
+                    enabled: t.enabled,
+                });
+            // once 已触发过的持久化态（enabled=false）在 add_full 中因
+            // next_at=0 且 disabled 保持——无需再 toggle
         }
         Self::spawn_scheduler_thread(scheduler.clone(), tx.clone());
         // 自动启动 autostart 插件（安装即生效：agent 回合可直接调用其工具）
@@ -278,6 +288,7 @@ impl DshEngine {
             turn_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tx,
             jobs: Arc::new(std::sync::Mutex::new(JobManager::default())),
+            pending_edits: Arc::new(std::sync::Mutex::new(Vec::new())),
             subagents: Arc::new(std::sync::Mutex::new(SubagentManager::default())),
             skills,
             skills_dir,
@@ -415,6 +426,95 @@ impl DshEngine {
 
     pub fn settings(&self) -> &EngineSettings {
         &self.settings
+    }
+
+    /// 定时任务清单（UI 面板展示）。
+    pub fn scheduler_tasks(&self) -> Vec<crate::engine::schedule::ScheduledTask> {
+        self.scheduler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .list()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// 新增定时任务（interval 秒后首触发，绑定会话到期注入 prompt）。
+    pub fn add_scheduled_task(
+        &mut self,
+        name: &str,
+        interval_secs: u64,
+        prompt: &str,
+        session_id: &str,
+    ) -> String {
+        let id = format!("sch-{}", crate::util::simple_id());
+        self.scheduler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .add(&id, name, interval_secs.max(1), prompt, session_id);
+        self.persist_scheduled_tasks();
+        info!("scheduled task added: {id} ({name}) every {interval_secs}s -> {session_id}");
+        id
+    }
+
+    /// 完整参数新增（daily/once 模式；内部生成 id）。
+    pub fn add_scheduled_task_full(
+        &mut self,
+        t: crate::engine::schedule::ScheduledTask,
+    ) -> String {
+        let mut t = t;
+        let id = format!("sch-{}", crate::util::simple_id());
+        t.id = id.clone();
+        self.scheduler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .add_full(t);
+        self.persist_scheduled_tasks();
+        info!("scheduled task added (full): {id}");
+        id
+    }
+
+    pub fn remove_scheduled_task(&mut self, id: &str) {
+        self.scheduler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(id);
+        self.persist_scheduled_tasks();
+    }
+
+    pub fn toggle_scheduled_task(&mut self, id: &str, enabled: bool) {
+        self.scheduler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .toggle(id, enabled);
+        self.persist_scheduled_tasks();
+    }
+
+    /// 调度器 → 设置持久化（重启恢复）。
+    fn persist_scheduled_tasks(&mut self) {
+        let tasks: Vec<crate::core::settings::StoredScheduledTask> = self
+            .scheduler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .list()
+            .into_iter()
+            .map(|t| crate::core::settings::StoredScheduledTask {
+                id: t.id.clone(),
+                name: t.name.clone(),
+                kind: t.kind.clone(),
+                interval_secs: t.interval_secs,
+                at_hour: t.at_hour,
+                at_min: t.at_min,
+                at_date: t.at_date,
+                prompt: t.prompt.clone(),
+                session_id: t.session_id.clone(),
+                enabled: t.enabled,
+            })
+            .collect();
+        self.settings.scheduled_tasks = tasks;
+        if let Err(e) = self.settings.save() {
+            log::warn!("scheduled tasks persist failed: {e}");
+        }
     }
 
     /// 查询当前沙箱模式。
@@ -578,6 +678,36 @@ impl DshEngine {
         info!("model switched to {model}");
     }
 
+    /// 编辑审批门开关（持久化;回合快照绑定队列）。
+    pub fn set_review_edits(&mut self, on: bool) {
+        self.settings.review_edits = on;
+        let _ = self.settings.save();
+        info!("review edits gate: {on}");
+    }
+
+    /// 论文搜索内置扩展：更新配置（扩展页调用；持久化 + 后续回合生效）。
+    pub fn set_paper_search_cfg(
+        &mut self,
+        cfg: crate::core::paper::PaperSearchConfig,
+    ) {
+        self.settings.paper_search = cfg;
+        let _ = self.settings.save();
+        info!("paper-search extension config updated");
+    }
+
+    pub fn paper_search_cfg(&self) -> crate::core::paper::PaperSearchConfig {
+        self.settings.paper_search.clone()
+    }
+
+    /// 子代理分级模型（None = 同主模型；下一回合的 fork 生效）。
+    pub fn set_subagent_model(&mut self, model: Option<&str>) {
+        self.settings.subagent_model = model
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+        let _ = self.settings.save();
+        info!("subagent model set to {:?}", self.settings.subagent_model);
+    }
+
     /// 运行时切换思考深度（none/low/high/max；none = 关闭思考）。
     pub fn set_reasoning_effort(&mut self, effort: &str) {
         let effort = if REASONING_EFFORTS.contains(&effort) {
@@ -626,7 +756,17 @@ impl DshEngine {
 
     /// 列出会话摘要。
     pub fn list_sessions(&self) -> Vec<crate::core::session::SessionSummary> {
+        let archived: std::collections::HashSet<&str> = self
+            .settings
+            .archived_sessions
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         let ids = self.store.list_sessions();
+        let ids: Vec<String> = ids
+            .into_iter()
+            .filter(|id| !archived.contains(id.as_str()))
+            .collect();
         let mut out = Vec::new();
         for id in ids {
             if let Ok(s) = self.store.load_session(&id) {
@@ -853,6 +993,43 @@ impl DshEngine {
     /// 定时任务调度器句柄（UI/桥注册定时任务；到期由后台线程驱动）。
     pub fn scheduler_handle(&self) -> Arc<std::sync::Mutex<crate::engine::schedule::Scheduler>> {
         self.scheduler.clone()
+    }
+
+    /// 归档会话：移出活动列表（侧栏不显示）,文件保留可恢复。
+    /// 实现：settings.archived 集合 + list_sessions 过滤。
+    pub fn archive_session(&mut self, session_id: &str) -> Result<()> {
+        self.settings.archived_sessions.push(session_id.to_string());
+        let _ = self.settings.save();
+        info!("archived session {session_id}");
+        Ok(())
+    }
+
+    /// 恢复归档。
+    pub fn unarchive_session(&mut self, session_id: &str) -> Result<()> {
+        self.settings.archived_sessions.retain(|s| s != session_id);
+        let _ = self.settings.save();
+        Ok(())
+    }
+
+    pub fn archived_ids(&self) -> Vec<String> {
+        self.settings.archived_sessions.clone()
+    }
+
+    /// 运行/待运行任务计数（UI 每帧调用——不 clone 整个快照 Vec）。
+    pub fn jobs_live_count(&self) -> usize {
+        self.jobs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .list()
+            .into_iter()
+            .filter(|j| {
+                matches!(
+                    j.status,
+                    crate::engine::jobs::JobStatus::Running
+                        | crate::engine::jobs::JobStatus::Pending
+                )
+            })
+            .count()
     }
 
     /// 任务列表快照（新→旧）。
@@ -1424,12 +1601,24 @@ impl DshEngine {
         } else {
             self.llm.clone().expect("checked at entry")
         };
+        // 子代理分级模型：fork 是 token 放大器，机械子任务（摘要/核验/
+        // 格式化）可走便宜档；未配置或与主模型相同 → 复用主客户端
+        let sub_llm = match self.settings.subagent_model.as_deref() {
+            Some(m) if !m.is_empty() && m != llm.model() => {
+                Arc::new(llm.with_model(m))
+            }
+            _ => llm.clone(),
+        };
         let model = llm.model().to_string();
         let tools = {
             // 快照注入技能（load_skill 工具 + persona 技能列表用）；
             // 会话级沙箱覆盖（会话 read-only/write → 受限工具集，此前死代码）
             let mut t = self.tools.clone_handle();
             t.skills = self.skills.list().into_iter().cloned().collect();
+            // 论文搜索扩展配置随回合快照（扩展页改配置即对后续回合生效）
+            t = t.with_paper_cfg(self.settings.paper_search.clone());
+            // 编辑审批门随回合快照
+            t = t.with_review_edits(self.settings.review_edits, self.pending_edits.clone());
             if let Some(sb) = sess_sb
                 .as_deref()
                 .and_then(crate::exec::SandboxMode::parse)
@@ -1512,6 +1701,7 @@ impl DshEngine {
                         &session_id,
                         snapshot,
                         llm,
+                        sub_llm,
                         tools,
                         store,
                         &model,
@@ -1835,6 +2025,94 @@ impl DshEngine {
         format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", tod / 3600, tod % 3600 / 60)
     }
 
+    /// 待确认编辑（review_edits 开启时写入工具产生的改动)。
+    pub fn pending_edits(&self) -> Vec<PendingEdit> {
+        self.pending_edits.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// 确认一条编辑（移出队列,改动保留）。
+    pub fn confirm_edit(&self, id: &str) {
+        self.pending_edits
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|e| e.id != id);
+    }
+
+    /// 回滚一条编辑：写回原内容（整体备份;部分编辑的场景由原内容恢复）。
+    pub fn revert_edit(&self, id: &str) -> Result<()> {
+        let e = {
+            let mut q = self.pending_edits.lock().unwrap_or_else(|p| p.into_inner());
+            let pos = q.iter().position(|e| e.id == id);
+            match pos {
+                Some(i) => q.remove(i),
+                None => anyhow::bail!("no such edit {id}"),
+            }
+        };
+        if let Some(orig) = &e.original {
+            if let Some(dir) = std::path::Path::new(&e.path).parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&e.path, orig)?;
+            info!("edit reverted: {}", e.path);
+        } else {
+            // 新建文件回滚 = 删除
+            let _ = std::fs::remove_file(&e.path);
+            info!("created file removed: {}", e.path);
+        }
+        Ok(())
+    }
+
+    /// 注册表访问（tools 写入时入队）。
+    pub fn edits_queue_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<PendingEdit>>> {
+        self.pending_edits.clone()
+    }
+
+    /// 长期记忆文件路径（$DSH_HOME/memory.md）。
+    fn memory_path() -> std::path::PathBuf {
+        let home = std::env::var_os("DSH_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(|p| std::path::PathBuf::from(p).join(".dsh"))
+            })
+            .unwrap_or_default();
+        home.join("memory.md")
+    }
+
+    /// 追加一条长期记忆（AI 经 memory_write 工具调用;带时间戳）。
+    pub fn memory_append(&self, note: &str) -> Result<()> {
+        let note = note.trim();
+        if note.is_empty() {
+            anyhow::bail!("empty note");
+        }
+        let path = Self::memory_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M");
+        let line = format!("- [{ts}] {note}
+");
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| anyhow::anyhow!("open memory: {e:#}"))?;
+        f.write_all(line.as_bytes())?;
+        info!("memory appended: {note}");
+        Ok(())
+    }
+
+    /// 读取长期记忆（每回合注入摘要;空文件返回 None）。
+    pub fn memory_read(&self) -> Option<String> {
+        let path = Self::memory_path();
+        let text = std::fs::read_to_string(path).ok()?;
+        let t = text.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    }
+
     /// 会话导出为 Markdown（用户/AI 消息完整保留，工具调用与结果以
     /// 代码块附录，思考过程折叠于 details——可直接归档/分享）。
     pub fn export_session_markdown(&self, session_id: &str) -> Result<String> {
@@ -2006,7 +2284,7 @@ impl DshEngine {
         }
     }
 
-    /// 调度器 → settings 持久化。
+    /// 调度器 → settings 持久化（委托统一实现，含新字段）。
     fn persist_scheduled(&mut self) {
         let tasks: Vec<_> = {
             let s = self
@@ -2018,7 +2296,11 @@ impl DshEngine {
                 .map(|t| crate::core::settings::StoredScheduledTask {
                     id: t.id.clone(),
                     name: t.name.clone(),
+                    kind: t.kind.clone(),
                     interval_secs: t.interval_secs,
+                    at_hour: t.at_hour,
+                    at_min: t.at_min,
+                    at_date: t.at_date,
                     prompt: t.prompt.clone(),
                     session_id: t.session_id.clone(),
                     enabled: t.enabled,
@@ -2219,11 +2501,9 @@ impl DshEngine {
                 s.messages.pop();
                 s.events.pop();
             }
-            lock_shared(&self.sessions_shared)
-                .get_mut(session_id)
-                .map(|s| {
-                    s.messages.pop();
-                });
+            if let Some(s) = lock_shared(&self.sessions_shared).get_mut(session_id) {
+                s.messages.pop();
+            }
             return Err(anyhow::anyhow!("插话消息持久化失败：{e:#}"));
         }
         let _ = self.tx.send(EngineEvent::Event {
@@ -2269,6 +2549,7 @@ impl SessionStore {
         SessionStore {
             dir: self.dir.clone(),
             tombstones: std::sync::Arc::clone(&self.tombstones),
+            write_lock: std::sync::Arc::clone(&self.write_lock),
         }
     }
 }
@@ -2456,6 +2737,117 @@ fn clamp_block(s: &mut String, label: &str) {
     }
 }
 
+/// 语义化压缩摘要：把被压缩的头部交给模型，产出"关键决策/重要事实/
+/// 未完成事项"三节结构化摘要。失败由调用方降级回机械摘要。
+async fn semantic_compaction_summary(llm: &LlmClient, head: &[Message]) -> Result<String> {
+    const BUDGET: usize = 24_000; // 输入字符预算（控制摘要成本）
+    let text = collect_head_text(head, BUDGET);
+    if text.trim().is_empty() {
+        anyhow::bail!("empty head");
+    }
+    let messages = vec![
+        LlmMessage {
+            role: crate::core::llm::LlmRole::System,
+            content: Some(
+                "You compress conversation history for an AI coding agent.                  Reply with the summary ONLY - no preamble."
+                    .into(),
+            ),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            images: None,
+        },
+        LlmMessage {
+            role: crate::core::llm::LlmRole::User,
+            content: Some(format!(
+                "请把以下对话历史压缩为结构化中文摘要（不超过 300 字），分三节：
+【关键决策与结论】
+【重要事实与数据】
+【未完成事项】
+
+{text}"
+            )),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            images: None,
+        },
+    ];
+    let full: std::sync::Arc<std::sync::Mutex<String>> =
+        std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = full.clone();
+    llm.stream(
+        &messages,
+        None,
+        move |evt| {
+            if let crate::core::llm::StreamEvent::Chunk(c) = evt {
+                sink.lock().unwrap_or_else(|p| p.into_inner()).push_str(&c);
+            }
+        },
+    )
+    .await?;
+    let out = full.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    if out.trim().is_empty() {
+        anyhow::bail!("empty summary");
+    }
+    Ok(out)
+}
+
+/// 纯收集：头部消息文本按预算截断（UTF-8 安全边界）。抽离以便单测。
+fn collect_head_text(head: &[Message], budget: usize) -> String {
+    let mut text = String::new();
+    for m in head {
+        let c = match m {
+            Message::User { content, .. }
+            | Message::Assistant { content, .. }
+            | Message::Tool { content, .. } => content.as_str(),
+        };
+        if text.len() >= budget {
+            break;
+        }
+        let remain = budget - text.len();
+        if c.len() <= remain {
+            text.push_str(c);
+            text.push('\n');
+        } else {
+            // 找不劈多字节字符的最大边界
+            let mut cut = remain;
+            while cut > 0 && !c.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.push_str(&c[..cut]);
+            break;
+        }
+    }
+    text
+}
+
+/// 待确认编辑（review_edits 门开启时,写入工具产生）。
+#[derive(Debug, Clone)]
+pub struct PendingEdit {
+    pub id: String,
+    pub path: String,
+    /// 修改前原内容（None = 新建文件）
+    pub original: Option<String>,
+    /// 摘要（工具/行数）
+    pub note: String,
+    pub session_id: String,
+}
+
+/// 回合线程侧记忆读取。
+fn memory_read_standalone() -> Option<String> {
+    let home = std::env::var_os("DSH_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(|p| std::path::PathBuf::from(p).join(".dsh"))
+        })
+        .unwrap_or_default();
+    let text = std::fs::read_to_string(home.join("memory.md")).ok()?;
+    let t = text.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
 /// 单个 subagent_fork 的完整执行（供 join_all 并发调用）：
 /// spawn(带任务) → running descriptor → 独立 LLM 回合 → 终态 descriptor
 /// （含完整 result，重放/卡片展开可见）→ ToolOutput（回喂主代理）。
@@ -2573,7 +2965,7 @@ async fn run_subagent_fork(
     let sys = format!(
         "You are a subagent of a coding agent running on DeepSeek          Harness. Your parent session is {session_id}. Complete the          task below and reply with a concise summary of what you did          and the result."
     );
-    let summary = match crate::engine::subagent::run_subagent_turn_counted(
+    let (summary, used_tokens) = match crate::engine::subagent::run_subagent_turn_counted(
         llm, &sys, &prompt, 8,
     )
     .await
@@ -2588,9 +2980,9 @@ async fn run_subagent_fork(
                 *map.entry(session_id.to_string()).or_default() += u;
                 usage_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            Ok(text)
+            (Ok(text), Some(u.total()))
         }
-        Err(e) => Err(e),
+        Err(e) => (Err(e), None),
     };
     let out = match &summary {
         Ok(text) => {
@@ -2600,6 +2992,9 @@ async fn run_subagent_fork(
                 let mut mgr = subagents.lock().unwrap();
                 mgr.set_summary(&sub_id, brief);
                 mgr.set_result(&sub_id, text.clone());
+                if let Some(t) = used_tokens {
+                    mgr.set_tokens(&sub_id, t);
+                }
                 mgr.mark(&sub_id, SubagentStatus::Done);
             }
             jobs.lock().unwrap().finish(&sjid, true, Some(text.clone()));
@@ -2642,6 +3037,7 @@ async fn run_turn_inner(
     session_id: &str,
     initial_messages: Vec<Message>,
     llm: Arc<LlmClient>,
+    sub_llm: Arc<LlmClient>, // 子代理专用客户端（分级模型；未配置时与主相同）
     tools: ToolRegistry,
     store: SessionStore,
     model: &str,
@@ -2796,10 +3192,28 @@ async fn run_turn_inner(
             let plan = crate::engine::compaction::plan_compaction(&messages, COMPACTION_KEEP_TAIL);
             if plan.removed > 0 {
                 compacted_baseline = Some(messages.len());
+                // 语义化压缩：模型产出结构化摘要（决策/事实/未竟事项）替代
+                // 机械统计摘要；任何失败降级回机械摘要——压缩绝不能因摘要
+                // 失败而中断回合
+                let summary = match semantic_compaction_summary(
+                    &llm,
+                    &messages[..plan.keep_from.min(messages.len())],
+                )
+                .await
+                {
+                    Ok(sem) => {
+                        info!("semantic compaction summary for {session_id}: {} chars", sem.chars().count());
+                        sem
+                    }
+                    Err(e) => {
+                        warn!("semantic compaction failed, fallback mechanical: {e:#}");
+                        plan.summary.clone()
+                    }
+                };
                 for ev in [
                     crate::engine::compaction::compaction_start_event(),
                     crate::engine::compaction::compaction_summary_event(
-                        &plan.summary,
+                        &summary,
                         plan.keep_from,
                     ),
                     crate::engine::compaction::compaction_end_event(),
@@ -2844,6 +3258,35 @@ async fn run_turn_inner(
             // AGENTS.md 项目记忆：工作区根的约定文件自动注入系统提示
             // （项目结构/编码规范/历史教训等，用户与 AI 均可维护——AI 用
             // write_file 修改走既有审批/沙箱通道）。
+            // 长期记忆注入（跨会话用户偏好/项目事实;每回合带上）
+            if let Some(mem) = memory_read_standalone() {
+                // 截断保护（记忆文件膨胀时只注入尾部 4KB——最近的最新）
+                let tail: String = mem
+                    .chars()
+                    .rev()
+                    .take(4096)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                persona.push_str(&format!(
+                    "
+
+=== Long-term memory (user preferences & facts; maintain via memory_write) ===
+{tail}
+=== end memory ===
+"
+                ));
+            }
+            // 编辑审批门开启时告知 AI（其改动会被用户审阅）
+            if tools.review_edits {
+                persona.push_str(
+                    "
+
+Edit review gate is ON: every file you modify is queued for user review (confirm keeps it, revert restores the original). After each write/create/edit, briefly note that the change awaits review.
+",
+                );
+            }
             if let Some(text) =
                 read_agents_md(session_cwd.as_ref().unwrap_or(&tools.cwd))
             {
@@ -3140,7 +3583,8 @@ async fn run_turn_inner(
                         let out = run_subagent_fork(
                             tc.id.clone(),
                             parsed,
-                            llm.clone(),
+                            // 分级模型：fork 的 LLM 回合走 sub_llm（便宜档）
+                            sub_llm.clone(),
                             subagents,
                             jobs,
                             &store,
@@ -3625,6 +4069,102 @@ mod tests {
         settings.plugins_dir = Some(td_plugins.join("plugins"));
         let engine = DshEngine::new(settings, tx).expect("engine");
         (engine, rx)
+    }
+
+    /// 长期记忆：写入→读取;归档过滤 list_sessions。
+    #[test]
+    fn memory_and_archive() {
+        // DSH_HOME 隔离
+        let td = tempfile::tempdir().unwrap();
+        std::env::set_var("DSH_HOME", td.path());
+        let (mut engine, _rx) = test_engine();
+        engine.memory_append("用户偏好深色主题").unwrap();
+        let mem = engine.memory_read().expect("应读到记忆");
+        assert!(mem.contains("用户偏好深色主题"), "{mem}");
+        assert!(mem.contains("- ["), "应带时间戳行格式");
+
+        // 归档：list 过滤 + 文件保留
+        let sid = engine.create_session(Some("待归档")).unwrap();
+        engine.archive_session(&sid).unwrap();
+        assert!(
+            !engine.list_sessions().iter().any(|s| s.session_id == sid),
+            "归档后不应在活动列表"
+        );
+        assert!(
+            engine.store.path_exists(&sid),
+            "归档不删文件（可恢复）"
+        );
+        engine.unarchive_session(&sid).unwrap();
+        assert!(
+            engine.list_sessions().iter().any(|s| s.session_id == sid),
+            "恢复后回到列表"
+        );
+        std::env::remove_var("DSH_HOME");
+    }
+
+    /// 导出 Markdown：含标题与用户消息。
+    #[test]
+    fn export_markdown_contains_dialog() {
+        let (mut engine, _rx) = test_engine();
+        let sid = engine.create_session(Some("导出测试")).unwrap();
+        engine.send_message(&sid, "你好，帮我做点事").unwrap();
+        let md = engine.export_session_markdown(&sid).unwrap();
+        assert!(md.contains("# 导出测试"), "{md}");
+        assert!(md.contains("帮我做点事"), "{md}");
+    }
+
+    /// 定时任务：添加即持久化、到期事件触发、删除同步清盘。
+    #[test]
+    fn scheduled_task_persists_and_fires() {
+        let (mut engine, rx) = test_engine();
+        let sid = engine.create_session(Some("sch-test")).unwrap();
+        engine.add_scheduled_task("巡检", 1, "跑一次检查", &sid);
+        assert_eq!(
+            engine.settings().scheduled_tasks.len(),
+            1,
+            "添加后应持久化镜像"
+        );
+        assert!(engine.settings().scheduled_tasks[0].enabled);
+        // 1s 间隔：5s 内应收到 ScheduledTaskDue
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut fired = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(ev) = rx.try_recv() {
+                if matches!(ev, EngineEvent::ScheduledTaskDue { .. }) {
+                    fired = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(fired, "1s 任务应在 5s 内触发到期事件");
+        let id = engine.scheduler_tasks()[0].id.clone();
+        engine.remove_scheduled_task(&id);
+        assert!(
+            engine.settings().scheduled_tasks.is_empty(),
+            "删除后持久化镜像应清空"
+        );
+    }
+
+    /// 语义化压缩的头部收集：预算截断 + UTF-8 边界安全。
+    #[test]
+    fn collect_head_text_truncates_utf8_safe() {
+        let msgs = vec![
+            Message::User { content: "a".repeat(100), images: None },
+            Message::Assistant {
+                content: "中文内容测试".repeat(50),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            Message::Tool { tool_call_id: "t".into(), content: "tail".into() },
+        ];
+        let t = collect_head_text(&msgs, 150);
+        assert!(t.len() <= 150, "len={}", t.len());
+        assert!(std::str::from_utf8(t.as_bytes()).is_ok(), "不得劈开多字节字符");
+        assert!(t.contains('a'));
+        let t2 = collect_head_text(&msgs, usize::MAX / 4);
+        assert!(t2.contains("tail"), "大预算应收全量");
+        assert!(collect_head_text(&[], 100).is_empty());
     }
 
     /// 删除本地插件：停进程 → 删目录 → 注册表清除；名称穿越/不存在
